@@ -4,3 +4,9 @@ nim-proxy
 nim-proxy-debug.log
 nim-proxy.log
 nim-usage.jsonl
+
+.DS_Store
+.idea/
+.vscode/
+*.swp
+.env
