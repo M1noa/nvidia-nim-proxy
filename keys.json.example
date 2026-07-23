@@ -1,0 +1,6 @@
+{
+  // each key gets a name for easier log tracking
+  "main": "nvapi-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+  "backup-1": "nvapi-yyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyy",
+  "backup-2": "nvapi-zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz"
+}
