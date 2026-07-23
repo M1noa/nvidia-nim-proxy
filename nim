@@ -3,8 +3,26 @@ PROXY_DIR="$(cd "$(dirname "$0")" && pwd)"
 PIDFILE="/tmp/nim-proxy.pid"
 LOGFILE="$PROXY_DIR/nim-proxy.log"
 BINARY="$PROXY_DIR/nim-proxy"
+PLIST="$HOME/Library/LaunchAgents/com.user.nvidia-nim-proxy.plist"
+SVC="com.user.nvidia-nim-proxy"
+
+launchd_pid() {
+  launchctl list "$SVC" 2>/dev/null | grep '"PID"' | sed 's/.*= \([0-9]*\).*/\1/'
+}
+
+launchd_status_text() {
+  PID=$(launchd_pid)
+  if [ -z "$PID" ] || [ "$PID" = "0" ]; then
+    return 1
+  fi
+  UPTIME=$(ps -o etime= -p "$PID" 2>/dev/null | tr -d ' ')
+  echo "nim-proxy: RUNNING  (PID $PID, up ${UPTIME:-?})"
+  rm -f "$PIDFILE"
+  return 0
+}
 
 status_text() {
+  launchd_status_text && return 0
   if [ ! -f "$PIDFILE" ] || ! kill -0 "$(cat "$PIDFILE")" 2>/dev/null; then
     echo "nim-proxy: STOPPED"
     [ -f "$PIDFILE" ] && rm -f "$PIDFILE"
@@ -58,58 +76,22 @@ EOF
 
 case "${1:-help}" in
   start)
-    if [ -f "$PIDFILE" ] && kill -0 "$(cat "$PIDFILE")" 2>/dev/null; then
-      echo "nim-proxy already running (PID $(cat "$PIDFILE"))"
-      exit 0
-    fi
-    rm -f "$PIDFILE"
-    cd "$PROXY_DIR" || exit 1
-    nohup "$BINARY" >> "$LOGFILE" 2>&1 &
-    PID=$!
-    echo "$PID" > "$PIDFILE"
-    sleep 1
-    if kill -0 "$PID" 2>/dev/null; then
-      echo "nim-proxy started (PID $PID, log: $LOGFILE)"
-    else
-      echo "nim-proxy failed to start"
-      tail -5 "$LOGFILE" 2>/dev/null
+    launchctl bootstrap gui/$(id -u) "$PLIST" 2>/dev/null || launchctl load "$PLIST" 2>/dev/null
+    sleep 2
+    PID=$(launchd_pid)
+    if [ -n "$PID" ] && [ "$PID" != "0" ]; then
+      echo "nim-proxy started (launchd, PID $PID, log: $LOGFILE)"
       rm -f "$PIDFILE"
+    else
+      echo "nim-proxy failed to start via launchd"
+      launchctl list "$SVC" 2>&1
       exit 1
     fi
     ;;
   stop)
-    if [ ! -f "$PIDFILE" ]; then
-      echo "nim-proxy not running"
-      exit 0
-    fi
-    PID=$(cat "$PIDFILE")
-    if ! kill -0 "$PID" 2>/dev/null; then
-      echo "nim-proxy not running (stale pidfile)"
-      rm -f "$PIDFILE"
-      exit 0
-    fi
-    echo "stopping nim-proxy (PID $PID)..."
-    kill "$PID" 2>/dev/null
-    i=0
-    while [ $i -lt 5 ]; do
-      if ! kill -0 "$PID" 2>/dev/null; then
-        echo "nim-proxy stopped"
-        rm -f "$PIDFILE"
-        exit 0
-      fi
-      sleep 1
-      i=$((i + 1))
-    done
-    echo "force killing..."
-    kill -9 "$PID" 2>/dev/null
-    sleep 1
-    if ! kill -0 "$PID" 2>/dev/null; then
-      echo "nim-proxy force killed"
-      rm -f "$PIDFILE"
-      exit 0
-    fi
-    echo "failed to stop nim-proxy"
-    exit 1
+    launchctl unload "$PLIST" 2>/dev/null
+    rm -f "$PIDFILE"
+    echo "nim-proxy stopped"
     ;;
   status)
     pretty_status
@@ -128,11 +110,11 @@ case "${1:-help}" in
   tail)
     echo "Usage: nim <command>"
     echo ""
-    echo "  start          Start the proxy (if not running)"
-    echo "  stop           Stop the proxy (force kill after 5s)"
-  echo "  status         Show pretty status with key pool info"
-  echo "  status-tail    Live status (updates every 1s)"
-  echo "  logs           Show status + last log lines"
+    echo "  start          Start the proxy via launchd"
+    echo "  stop           Stop the proxy via launchd"
+    echo "  status         Show pretty status with key pool info"
+    echo "  status-tail    Live status (updates every 1s)"
+    echo "  logs           Show status + last log lines"
     echo "  tail           Tail the access log (live)"
     exit 0
     ;;
