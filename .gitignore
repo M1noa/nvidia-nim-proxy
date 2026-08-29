@@ -1,12 +1,26 @@
+# secrets
 keys.json
 keys.jsonc
+.env
+
+# binaries
 nim-proxy
-nim-proxy-debug.log
+nvidia-nim-proxy
+nvidia-nim-proxy-*
+*.exe
+
+# logs / runtime
 nim-proxy.log
+nim-proxy.err.log
+nim-proxy-debug.log
 nim-usage.jsonl
 
+# os / editor
 .DS_Store
 .idea/
 .vscode/
 *.swp
-.env
+*.orig
+
+# tooling
+.opencode/

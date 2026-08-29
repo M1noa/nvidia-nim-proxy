@@ -21,13 +21,19 @@ import (
 
 const (
 	nvidiaBase    = "https://integrate.api.nvidia.com/v1"
+	opencodeBase  = "https://opencode.ai/zen/v1"
 	cooldown429   = 1 * time.Minute
+	maxBackoff    = 16 * time.Minute
+	failWindow    = 50 * time.Minute
+	idleScale     = 10 * time.Minute
 	modelLockout  = 30 * time.Second
 	burstCooldown = 5 * time.Second
 	bodyLimit     = 10 << 20
 	checkInterval = 5 * time.Second
-	versionStr    = "2.3.0"
 )
+
+// versionStr is overridden at build time via -ldflags "-X main.versionStr=x.y.z".
+var versionStr = "2.5.0"
 
 type Key struct {
 	Name           string
@@ -36,6 +42,8 @@ type Key struct {
 	CooldownReason string
 	LastUsed       time.Time
 	FailCount      int
+	Consec429      int
+	LastFail       time.Time
 }
 
 type ModelLock struct {
@@ -153,17 +161,72 @@ func (p *Pool) Pick(exclude map[string]bool, model string) *Key {
 	if len(avail) == 0 {
 		return nil
 	}
-	pick := avail[rand.Intn(len(avail))]
+	// weighted pick: favor idle keys, sink recently-failed/hot keys
+	total := 0.0
+	weights := make([]float64, len(avail))
+	for i, k := range avail {
+		w := idleWeight(k, now)
+		total += w
+		weights[i] = w
+	}
+	r := rand.Float64() * total
+	pick := avail[len(avail)-1]
+	for i, w := range weights {
+		r -= w
+		if r <= 0 {
+			pick = avail[i]
+			break
+		}
+	}
 	pick.LastUsed = now
 	return pick
 }
 
-func (p *Pool) Cooldown(k *Key, d time.Duration) {
+// idleWeight scores a key 0..1: more idle -> higher, failed within window -> crushed.
+func idleWeight(k *Key, now time.Time) float64 {
+	w := 1.0
+	if !k.LastUsed.IsZero() {
+		idle := now.Sub(k.LastUsed)
+		if idle < 0 {
+			idle = 0
+		}
+		// 0 at 0 idle, approach 1 as idle grows past idleScale
+		f := float64(idle) / float64(idleScale)
+		if f > 1 {
+			f = 1
+		}
+		// balanced: floor at 0.3 so never-idle keys still have a shot
+		w = 0.3 + 0.7*f
+	}
+	if !k.LastFail.IsZero() && now.Sub(k.LastFail) < failWindow {
+		// failed within the window: steep penalty, escalates with consecutive 429s
+		pen := 0.2
+		for i := 0; i < k.Consec429 && i < 4; i++ {
+			pen *= 0.5
+		}
+		w *= pen
+	}
+	return w
+}
+
+func (p *Pool) rateLimit(k *Key) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
+	k.Consec429++
+	k.FailCount++
+	k.LastFail = time.Now()
+	d := cooldown429 << (k.Consec429 - 1)
+	if d > maxBackoff {
+		d = maxBackoff
+	}
 	k.CooldownUntil = time.Now().Add(d)
 	k.CooldownReason = "rate_limited_429"
-	k.FailCount++
+}
+
+func (p *Pool) Clear429(k *Key) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	k.Consec429 = 0
 }
 
 func (p *Pool) Postpone(k *Key, d time.Duration) {
@@ -180,19 +243,27 @@ type KeyStatus struct {
 	CooldownReason string `json:"cooldown_reason,omitempty"`
 	LastUsed       string `json:"last_used,omitempty"`
 	FailCount      int    `json:"fail_count"`
+	Consec429      int    `json:"consec_429"`
 	Available      bool   `json:"available"`
 }
 
 type StatusResponse struct {
-	OK         bool        `json:"ok"`
-	Version    string      `json:"version"`
-	Uptime     string      `json:"uptime"`
-	Total      int         `json:"total"`
-	Available  int         `json:"available"`
-	Concurrent int         `json:"concurrent"`
-	SemLimit   int         `json:"sem_limit"`
-	Keys       []KeyStatus `json:"keys"`
-	Locks      interface{} `json:"model_locks,omitempty"`
+	OK         bool          `json:"ok"`
+	Version    string        `json:"version"`
+	Uptime     string        `json:"uptime"`
+	Total      int           `json:"total"`
+	Available  int           `json:"available"`
+	Concurrent int           `json:"concurrent"`
+	SemLimit   int           `json:"sem_limit"`
+	Keys       []KeyStatus   `json:"keys"`
+	Locks      interface{}   `json:"model_locks,omitempty"`
+	Opencode   *OpencodeInfo `json:"opencode,omitempty"`
+}
+
+type OpencodeInfo struct {
+	Enabled bool     `json:"enabled"`
+	Base    string   `json:"base"`
+	Models  []string `json:"models"`
 }
 
 func (p *Pool) Status() StatusResponse {
@@ -215,7 +286,7 @@ func (p *Pool) Status() StatusResponse {
 			sk = sk[len(sk)-8:]
 		}
 		avail := true
-		ks := KeyStatus{Name: k.Name, Suffix: sk, FailCount: k.FailCount}
+		ks := KeyStatus{Name: k.Name, Suffix: sk, FailCount: k.FailCount, Consec429: k.Consec429}
 		if now.Before(k.CooldownUntil) {
 			ks.Cooldown = k.CooldownUntil.Sub(now).Round(time.Second).String()
 			ks.CooldownReason = k.CooldownReason
@@ -236,6 +307,7 @@ func (p *Pool) Status() StatusResponse {
 	if len(locks) > 0 {
 		sr.Locks = locks
 	}
+	sr.Opencode = ocInfo.Load()
 	return sr
 }
 
@@ -244,6 +316,34 @@ var (
 	dbglog    *log.Logger
 	debugMode bool
 )
+
+// ocInfo caches the opencode zen free-model list fetched at startup.
+var ocInfo atomic.Pointer[OpencodeInfo]
+
+// refreshOpencodeModels pulls the free model list from opencode zen and caches it.
+func refreshOpencodeModels() {
+	info := &OpencodeInfo{Enabled: true, Base: opencodeBase}
+	cl := &http.Client{Timeout: 10 * time.Second}
+	resp, err := cl.Get(opencodeBase + "/models")
+	if err == nil {
+		var oc struct {
+			Data []struct {
+				ID string `json:"id"`
+			} `json:"data"`
+		}
+		if json.NewDecoder(resp.Body).Decode(&oc) == nil {
+			for _, m := range oc.Data {
+				if strings.HasSuffix(m.ID, "-free") {
+					info.Models = append(info.Models, "opencode/"+m.ID)
+				}
+			}
+		}
+		resp.Body.Close()
+	}
+	sort.Strings(info.Models)
+	ocInfo.Store(info)
+	log.Printf("  Opencode zen: %d free models", len(info.Models))
+}
 
 func initLogging() {
 	acclog = log.New(os.Stdout, "", log.LstdFlags)
@@ -413,13 +513,8 @@ func parseParamVal(s string) any {
 }
 
 func matchModelParams(model string) map[string]any {
-	modelMu.RLock()
-	defer modelMu.RUnlock()
-	ml := strings.ToLower(model)
-	for _, e := range modelParams {
-		if globMatch(e.pattern, ml) {
-			return e.params
-		}
+	if e := matchesModelParams(model); e != nil {
+		return e.params
 	}
 	return nil
 }
@@ -452,14 +547,14 @@ func matchesModelParams(model string) *modelParamEntry {
 }
 
 type openRouterModel struct {
-	ID               string                 `json:"id"`
-	Name             string                 `json:"name"`
-	Description      string                 `json:"description,omitempty"`
-	ContextLength    int                    `json:"context_length"`
-	Pricing          map[string]string      `json:"pricing"`
-	Architecture     map[string]any         `json:"architecture"`
-	TopProvider      map[string]any         `json:"top_provider"`
-	PerRequestLimits any                    `json:"per_request_limits"`
+	ID               string            `json:"id"`
+	Name             string            `json:"name"`
+	Description      string            `json:"description,omitempty"`
+	ContextLength    int               `json:"context_length"`
+	Pricing          map[string]string `json:"pricing"`
+	Architecture     map[string]any    `json:"architecture"`
+	TopProvider      map[string]any    `json:"top_provider"`
+	PerRequestLimits any               `json:"per_request_limits"`
 }
 
 func (p *Pool) handleModels(w http.ResponseWriter, r *http.Request) {
@@ -478,9 +573,10 @@ func (p *Pool) handleModels(w http.ResponseWriter, r *http.Request) {
 
 	var nvModels []string
 	if key != nil {
+		mc := &http.Client{Timeout: 10 * time.Second}
 		req, _ := http.NewRequest("GET", nvidiaBase+"/models", nil)
 		req.Header.Set("Authorization", "Bearer "+key.Key)
-		resp, err := http.DefaultClient.Do(req)
+		resp, err := mc.Do(req)
 		if err == nil && resp.StatusCode == 200 {
 			var nv struct {
 				Data []struct {
@@ -530,14 +626,14 @@ func (p *Pool) handleModels(w http.ResponseWriter, r *http.Request) {
 			ContextLength: cl,
 			Pricing:       map[string]string{"prompt": "0", "completion": "0", "request": "0"},
 			Architecture: map[string]any{
-				"modality":     "text->text",
-				"tokenizer":    "Other",
+				"modality":      "text->text",
+				"tokenizer":     "Other",
 				"instruct_type": nil,
 			},
 			TopProvider: map[string]any{
-				"context_length":       cl,
+				"context_length":        cl,
 				"max_completion_tokens": nil,
-				"is_moderated":         false,
+				"is_moderated":          false,
 			},
 			PerRequestLimits: nil,
 		})
@@ -560,18 +656,64 @@ func (p *Pool) handleModels(w http.ResponseWriter, r *http.Request) {
 			}
 			p := strings.ReplaceAll(e.pattern, "*", "")
 			out.Data = append(out.Data, openRouterModel{
-				ID:              p,
-				Name:            modelDisplayName(p),
-				Description:     desc,
-				ContextLength:   cl,
-				Pricing:         map[string]string{"prompt": "0", "completion": "0", "request": "0"},
-				Architecture:    map[string]any{"modality": "text->text", "tokenizer": "Other", "instruct_type": nil},
-				TopProvider:     map[string]any{"context_length": cl, "max_completion_tokens": nil, "is_moderated": false},
+				ID:               p,
+				Name:             modelDisplayName(p),
+				Description:      desc,
+				ContextLength:    cl,
+				Pricing:          map[string]string{"prompt": "0", "completion": "0", "request": "0"},
+				Architecture:     map[string]any{"modality": "text->text", "tokenizer": "Other", "instruct_type": nil},
+				TopProvider:      map[string]any{"context_length": cl, "max_completion_tokens": nil, "is_moderated": false},
 				PerRequestLimits: nil,
 			})
 		}
 		modelMu.RUnlock()
 	}
+
+	// opencode zen free models (no auth) -> opencode/<id>
+	ocClient := &http.Client{Timeout: 10 * time.Second}
+	if ocResp, err := ocClient.Get(opencodeBase + "/models"); err == nil {
+		var oc struct {
+			Data []struct {
+				ID string `json:"id"`
+			} `json:"data"`
+		}
+		if json.NewDecoder(ocResp.Body).Decode(&oc) == nil {
+			ocSeen := make(map[string]bool)
+			for _, m := range oc.Data {
+				if !strings.HasSuffix(m.ID, "-free") || ocSeen[m.ID] {
+					continue
+				}
+				ocSeen[m.ID] = true
+				cl := 131072
+				desc := ""
+				if e := matchesModelParams(m.ID); e != nil {
+					if v, ok := e.params["context_length"]; ok {
+						switch n := v.(type) {
+						case float64:
+							cl = int(n)
+						case int:
+							cl = n
+						}
+					}
+					if v, ok := e.params["description"]; ok {
+						desc, _ = v.(string)
+					}
+				}
+				ocID := "opencode/" + m.ID
+				out.Data = append(out.Data, openRouterModel{
+					ID:            ocID,
+					Name:          modelDisplayName(ocID),
+					Description:   desc,
+					ContextLength: cl,
+					Pricing:       map[string]string{"prompt": "0", "completion": "0", "request": "0"},
+					Architecture:  map[string]any{"modality": "text->text", "tokenizer": "Other", "instruct_type": nil},
+					TopProvider:   map[string]any{"context_length": cl, "max_completion_tokens": nil, "is_moderated": false},
+				})
+			}
+		}
+		ocResp.Body.Close()
+	}
+
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(out)
 }
@@ -590,12 +732,12 @@ func modelDisplayName(id string) string {
 var camelToSnake = map[string]string{
 	"topP": "top_p", "topK": "top_k",
 	"maxTokens": "max_tokens", "minP": "min_p",
-	"frequencyPenalty": "frequency_penalty",
-	"presencePenalty":  "presence_penalty",
+	"frequencyPenalty":  "frequency_penalty",
+	"presencePenalty":   "presence_penalty",
 	"repetitionPenalty": "repetition_penalty",
-	"stopSequences": "stop",
-	"reasoningEffort":  "reasoning_effort",
-	"reasoningBudget": "reasoning_budget",
+	"stopSequences":     "stop",
+	"reasoningEffort":   "reasoning_effort",
+	"reasoningBudget":   "reasoning_budget",
 }
 
 func injectParams(body *[]byte) {
@@ -719,6 +861,7 @@ func (p *Pool) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	body, err := io.ReadAll(io.LimitReader(r.Body, bodyLimit))
 	if err != nil {
+		acclog.Printf("!! 400 bad-request-body %s %s: %v", r.Method, r.URL.Path, err)
 		http.Error(w, fmt.Sprintf(`{"error":"%s"}`, err), http.StatusBadRequest)
 		return
 	}
@@ -728,7 +871,9 @@ func (p *Pool) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	isStream := contains(r.Header.Get("Accept"), "text/event-stream")
 	if !isStream && len(body) > 0 {
-		var j struct{ Stream bool `json:"stream"` }
+		var j struct {
+			Stream bool `json:"stream"`
+		}
 		if json.Unmarshal(body, &j) == nil {
 			isStream = j.Stream
 		}
@@ -736,6 +881,11 @@ func (p *Pool) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	model := reqModel(body)
 	acclog.Printf("-> %s %s model=%s stream=%v bytes=%d", r.Method, r.URL.Path, model, isStream, len(body))
+
+	if strings.HasPrefix(model, "opencode/") {
+		p.handleOpenCode(w, r, body, model, isStream, start)
+		return
+	}
 
 	if debugMode {
 		dbglog.Printf("=== REQUEST %s %s ===\nHeaders: %+v\nBody: %s", r.Method, r.URL.String(), r.Header, string(body))
@@ -772,12 +922,14 @@ func (p *Pool) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 				time.Sleep(200 * time.Millisecond)
 				continue
 			}
+			dbglog.Printf("no keys available at attempt %d (excluded=%d, model=%s)", attempt, len(exclude), model)
 			break
 		}
 		used = key
 
 		req, err := http.NewRequest(r.Method, target, bytes.NewReader(body))
 		if err != nil {
+			acclog.Printf("!! 500 internal NewRequest-failed %s %s: %v", r.Method, target, err)
 			http.Error(w, fmt.Sprintf(`{"error":"%s"}`, err), http.StatusInternalServerError)
 			return
 		}
@@ -793,18 +945,22 @@ func (p *Pool) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 		resp, err := cl.Do(req)
 		if err != nil {
-			acclog.Printf("!! upstream error: %v", err)
+			acclog.Printf("!! 502 upstream-error [%s] %s %s: %v", key.Name, r.Method, target, err)
 			http.Error(w, fmt.Sprintf(`{"error":"upstream: %s"}`, err), http.StatusBadGateway)
 			return
 		}
 
 		if resp.StatusCode == http.StatusTooManyRequests {
 			rateLimited = true
-			p.Cooldown(key, cooldown429)
+			p.rateLimit(key)
 			p.locks.lock(key.Name, model, modelLockout)
 			resp.Body.Close()
 			rh := rlHeaders(resp.Header)
-			acclog.Printf("!! 429 [%s] model=%s key-cooldown=%v model-lockout=%v headers=%v", key.Name, model, cooldown429, modelLockout, rh)
+			cd := cooldown429 << (key.Consec429 - 1)
+			if cd > maxBackoff {
+				cd = maxBackoff
+			}
+			acclog.Printf("!! 429 [%s] model=%s key-backoff=%v model-lockout=%v headers=%v", key.Name, model, cd, modelLockout, rh)
 			exclude[key.Name] = true
 			if attempt > 0 {
 				retries++
@@ -855,6 +1011,7 @@ func (p *Pool) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			record.KeyName = used.Name
 		}
 		logUsage(record)
+		acclog.Printf("<- 503 %s %s %v (all keys exhausted: excluded=%d, rate_limited=%v, model=%s)", r.Method, r.URL.Path, elapsed.Round(time.Millisecond), len(exclude), rateLimited, model)
 		http.Error(w, `{"error":"all keys exhausted or on cooldown"}`, http.StatusServiceUnavailable)
 		return
 	}
@@ -869,6 +1026,7 @@ func (p *Pool) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		if len(recErr) > 200 {
 			recErr = recErr[:200]
 		}
+		acclog.Printf("!! upstream %d [%s] model=%s err=%q", lastResp.StatusCode, used.Name, model, recErr)
 	} else {
 		bodyCopy, _ := io.ReadAll(lastResp.Body)
 		lastResp.Body.Close()
@@ -936,6 +1094,7 @@ func (p *Pool) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	lastResp.Body.Close()
 	if lastResp.StatusCode == http.StatusOK {
 		p.Postpone(used, 1500*time.Millisecond)
+		p.Clear429(used)
 	}
 
 	sk := ""
@@ -951,6 +1110,115 @@ func (p *Pool) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 		dbglog.Printf("=== RESPONSE %s ===\nStatus: %d Duration: %v Key: %s\nBody: %s", r.URL.Path, lastResp.StatusCode, time.Since(start), used.Name, respStr)
 	}
+}
+
+// handleOpenCode routes opencode/<model> requests to the opencode zen API
+// (OpenAI-compatible, no auth for -free models).
+func (p *Pool) handleOpenCode(w http.ResponseWriter, r *http.Request, body []byte, model string, isStream bool, start time.Time) {
+	realModel := strings.TrimPrefix(model, "opencode/")
+	var m map[string]any
+	if json.Unmarshal(body, &m) == nil {
+		m["model"] = realModel
+		if b, err := json.Marshal(m); err == nil {
+			body = b
+		}
+	}
+
+	target := opencodeBase + strings.TrimPrefix(r.URL.Path, "/v1")
+	if r.URL.RawQuery != "" {
+		target += "?" + r.URL.RawQuery
+	}
+
+	req, err := http.NewRequest(r.Method, target, bytes.NewReader(body))
+	if err != nil {
+		http.Error(w, fmt.Sprintf(`{"error":"%s"}`, err), http.StatusInternalServerError)
+		return
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer public")
+	req.Header.Set("x-opencode-client", "desktop")
+	req.Header.Set("Accept", "text/event-stream")
+	for k, v := range r.Header {
+		switch strings.ToLower(k) {
+		case "authorization", "host", "content-type", "accept", "x-opencode-client":
+			continue
+		default:
+			req.Header[k] = v
+		}
+	}
+
+	cl := &http.Client{Timeout: 300 * time.Second}
+	resp, err := cl.Do(req)
+	if err != nil {
+		acclog.Printf("!! 502 opencode upstream-error %s: %v", target, err)
+		http.Error(w, fmt.Sprintf(`{"error":"upstream: %s"}`, err), http.StatusBadGateway)
+		return
+	}
+
+	var prompT, compT, totalT int
+	var recErr string
+
+	if isStream && resp.StatusCode == http.StatusOK {
+		// true streaming — pipe through, no token capture
+	} else {
+		rb, _ := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		resp.Body = io.NopCloser(bytes.NewReader(rb))
+		if resp.StatusCode != http.StatusOK {
+			recErr = strings.TrimSpace(string(rb))
+			if len(recErr) > 200 {
+				recErr = recErr[:200]
+			}
+			acclog.Printf("!! opencode upstream %d model=%s err=%q", resp.StatusCode, model, recErr)
+		} else {
+			prompT, compT, totalT = respTokens(rb)
+		}
+	}
+
+	logUsage(UsageRecord{
+		Ts:               time.Now().UTC().Format(time.RFC3339Nano),
+		Model:            model,
+		KeyName:          "opencode",
+		Method:           r.Method,
+		Path:             r.URL.Path,
+		StatusCode:       resp.StatusCode,
+		DurationMs:       time.Since(start).Milliseconds(),
+		PromptTokens:     prompT,
+		CompletionTokens: compT,
+		TotalTokens:      totalT,
+		Stream:           isStream,
+		Error:            recErr,
+		ContentBytes:     int64(len(body)),
+	})
+
+	for k, v := range resp.Header {
+		w.Header()[k] = v
+	}
+	w.WriteHeader(resp.StatusCode)
+
+	var written int64
+	if isStream && resp.StatusCode == http.StatusOK {
+		if fl, ok := w.(http.Flusher); ok {
+			buf := make([]byte, 4096)
+			for {
+				n, err := resp.Body.Read(buf)
+				if n > 0 {
+					w.Write(buf[:n])
+					fl.Flush()
+					written += int64(n)
+				}
+				if err != nil {
+					break
+				}
+			}
+		} else {
+			written, _ = io.Copy(w, resp.Body)
+		}
+	} else {
+		written, _ = io.Copy(w, resp.Body)
+	}
+	resp.Body.Close()
+	acclog.Printf("<- %d %s %s %v %d bytes [opencode]", resp.StatusCode, r.Method, r.URL.Path, time.Since(start).Round(time.Millisecond), written)
 }
 
 func contains(s, substr string) bool {
@@ -1029,6 +1297,7 @@ func serverMain() {
 	initLogging()
 	initUsageLog()
 	loadModelParams("model_params.md")
+	refreshOpencodeModels()
 
 	kf := "keys.jsonc"
 	if e := os.Getenv("KEY_FILE"); e != "" {
@@ -1065,7 +1334,8 @@ func serverMain() {
 	}
 	sort.Strings(names)
 	log.Printf("NVIDIA NIM Proxy v%s — %d keys: %s", versionStr, stat.Total, strings.Join(names, ", "))
-	log.Printf("  429 cooldown=%v, model-lockout=%v, burst-backoff=%v", cooldown429, modelLockout, burstCooldown)
+	log.Printf("  429 backoff=%v..%v (exp, reset on success), model-lockout=%v, burst-backoff=%v", cooldown429, maxBackoff, modelLockout, burstCooldown)
+	log.Printf("  weighted key pick: idle-preference + 50m failure window")
 	log.Printf("  Effective ~%d RPM (40 RPM/key × %d keys)", 40*stat.Total, stat.Total)
 	log.Printf("  Usage tracking -> nim-usage.jsonl")
 	log.Printf("  Keys hot-reload enabled (JSONC)")
@@ -1107,14 +1377,13 @@ func serverMain() {
 // probe mode
 
 var probeModels = []string{
-	"deepseek-ai/deepseek-v4-flash",
-	"deepseek-ai/deepseek-v4-pro",
 	"minimaxai/minimax-m3",
 	"moonshotai/kimi-k2.6",
 	"nvidia/nemotron-3-ultra-550b-a55b",
+	"nvidia/nemotron-3.5-lightning-30b-a3b",
 	"poolside/laguna-xs-2.1",
 	"stepfun-ai/step-3.7-flash",
-	"z-ai/glm-5.2",
+	"deepseek-ai/deepseek-v4-flash-0731",
 }
 
 func runProbe() {

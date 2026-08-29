@@ -56,14 +56,27 @@ try:
     cd = k.get('cooldown', '')
     cr = k.get('cooldown_reason', '')
     lu = k.get('last_used', '')
-    fc = k['fail_count']
+    fc = k.get('fail_count', 0)
+    c429 = k.get('consec_429', 0)
     icon = '\033[32m\u2713\033[0m' if a else '\033[31m\u2717\033[0m'
     bits = []
     if cd: bits.append(f'{cr}:{cd}')
     if lu: bits.append(f'{lu} ago')
     if fc: bits.append(f'{fc} fails')
+    if c429: bits.append(f'{c429}x429')
     info = ' (' + ', '.join(bits) + ')' if bits else ''
     print(f'    {icon}  {n:12s} ...{s}{info}')
+  oc = data.get('opencode') or {}
+  if oc.get('enabled'):
+    ocm = oc.get('models') or []
+    print()
+    print(f"  Opencode:  {len(ocm)} free models \033[2m{oc.get('base','')}\033[0m")
+    if ocm:
+      half = (len(ocm) + 1) // 2
+      for i in range(half):
+        left = ocm[i]
+        right = ocm[i+half] if i+half < len(ocm) else ''
+        print(f"    {left:38s} {right}")
   print()
 except Exception as e:
   print(f'  (status fetch failed: {e})')
@@ -93,6 +106,21 @@ case "${1:-help}" in
     rm -f "$PIDFILE"
     echo "nim-proxy stopped"
     ;;
+  restart)
+    launchctl unload "$PLIST" 2>/dev/null
+    rm -f "$PIDFILE"
+    sleep 1
+    launchctl bootstrap gui/$(id -u) "$PLIST" 2>/dev/null || launchctl load "$PLIST" 2>/dev/null
+    sleep 2
+    PID=$(launchd_pid)
+    if [ -n "$PID" ] && [ "$PID" != "0" ]; then
+      echo "nim-proxy restarted (launchd, PID $PID)"
+    else
+      echo "nim-proxy failed to restart via launchd"
+      launchctl list "$SVC" 2>&1
+      exit 1
+    fi
+    ;;
   status)
     pretty_status
     ;;
@@ -108,10 +136,14 @@ case "${1:-help}" in
     while clear && pretty_status; do sleep 1; done
     ;;
   tail)
+    tail -f "$LOGFILE"
+    ;;
+  help|*)
     echo "Usage: nim <command>"
     echo ""
     echo "  start          Start the proxy via launchd"
     echo "  stop           Stop the proxy via launchd"
+    echo "  restart        Restart the proxy via launchd"
     echo "  status         Show pretty status with key pool info"
     echo "  status-tail    Live status (updates every 1s)"
     echo "  logs           Show status + last log lines"

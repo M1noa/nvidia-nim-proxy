@@ -3,50 +3,47 @@
 # Pattern is checked against the model string (case-insensitive)
 # First match wins
 
-## *deepseek*flash*
-  temperature: 0.7
+## *kimi-k3*
+  temperature: 1.0
   top_p: 0.95
-  max_tokens: 8192
+  max_tokens: 131072
   context_length: 1048576
-  description: DeepSeek V4 Flash is a 284B MoE model with 1M-token context optimized for fast coding and agents.
+  description: Moonshot AI Kimi K3 — 2.8T-param MoE (16/896 experts, hybrid linear attention) with native vision and a 1M-token context for long-horizon coding, agentic tool use, and reasoning.
 
-## *deepseek*pro*
-  temperature: 0.7
+## *deepseek-v4-flash*
+  temperature: 1.0
   top_p: 0.95
-  max_tokens: 8192
+  max_tokens: 131072
   context_length: 1048576
-  description: DeepSeek V4 scales to 1M-token context windows with efficient MoE architecture for coding tasks.
+  description: DeepSeek V4 Flash 0731 — 284B MoE (13B active) for fast coding, reasoning, tool use, and long-context agentic workflows.
 
-## *deepseek*v4*
-  temperature: 0.7
+## *deepseek-v4-pro*
+  temperature: 1.0
   top_p: 0.95
-  max_tokens: 8192
+  max_tokens: 131072
   context_length: 1048576
-  description: DeepSeek V4 series model with MoE architecture.
+  description: DeepSeek V4 Pro 0813 — 1.6T MoE (49B active) for advanced coding, tool use, and long-horizon agentic work.
 
-## *deepseek*
-  temperature: 0.7
+## *muse-glimmer*
+  temperature: 1.0
+  top_p: 0.95
+  top_k: 64
   max_tokens: 4096
   context_length: 131072
-  description: DeepSeek series model.
-
-## *kimi*
-  temperature: 0.3
-  max_tokens: 4096
-  context_length: 1048576
-  description: 1T multimodal MoE for long-horizon coding, agentic tool use, and image/video understanding.
-
-## *glm*
-  temperature: 0.3
-  max_tokens: 4096
-  context_length: 131072
-  description: GLM flagship LLM for agentic workflows, coding, and long-horizon reasoning tasks.
+  description: Meta Muse Glimmer 30B — ~29.6B dense multimodal (text+image) model with native tool-calling and reasoning, built for local agentic tasks.
 
 ## *llama*
   temperature: 0.7
   max_tokens: 2048
   context_length: 131072
   description: Meta Llama series model.
+
+## *nemotron*3.5*lightning*
+  temperature: 1.0
+  top_p: 0.95
+  max_tokens: 65536
+  context_length: 1000000
+  description: NVIDIA Nemotron 3.5 Lightning 30B A3B — fast lightweight model optimized for agentic workflows, tool use, and function calling.
 
 ## *nemotron*
   temperature: 0.5
@@ -60,9 +57,9 @@
   context_length: 262144
   description: Mistral series model.
 
-## *inkling*
-  temperature: 0.7
-  top_p: 0.9
-  max_tokens: 8192
-  context_length: 262144
-  description: Inkling model series.
+## *deepseek*
+  temperature: 1.0
+  top_p: 0.95
+  max_tokens: 131072
+  context_length: 1048576
+  description: DeepSeek model for coding, reasoning, and agentic workflows.
