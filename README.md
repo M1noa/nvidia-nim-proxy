@@ -54,7 +54,3 @@ curl http://localhost:5419/v1/chat/completions \
 ```
 
 `./nim-proxy probe` hits a few models with test requests and reports per-model rate limits.
-
-## Versioning
-
-Tags follow semver (`vX.Y.Z`). Pushing a tag builds all six binaries and attaches them to a GitHub Release with checksums. The binary reports its version via `versionStr` (injected at build time with `-ldflags -X`).
