@@ -65,10 +65,13 @@
     "pattern": "*minimax-m3*",
     "params": {
       "context_length": 1048576,
-      "description": "MiniMax M3 - ~428B MoE (23B active), 1M ctx, multimodal, top_k 40",
+      "description": "MiniMax M3 - ~428B MoE (23B active), 1M ctx, multimodal, top_k 40, thinking_mode enabled",
       "temperature": 1.0,
       "top_p": 0.95,
-      "top_k": 40
+      "top_k": 40,
+      "chat_template_kwargs": {
+        "thinking_mode": "enabled"
+      }
     }
   },
   {
