@@ -1,0 +1,85 @@
+[
+  {
+    "pattern": "*kimi-k3*",
+    "params": {
+      "context_length": 1048576,
+      "description": "Kimi K3 - 2.8T MoE (16/896 experts), 1M ctx, native vision, thinking always on, reasoning-effort max",
+      "temperature": 1.0,
+      "top_p": 0.95,
+      "reasoning_effort": "max"
+    }
+  },
+  {
+    "pattern": "*deepseek-v4-pro-0813*",
+    "params": {
+      "context_length": 1048576,
+      "description": "DeepSeek V4 Pro - 1.6T MoE (49B active), 1M ctx, reasoning-effort max",
+      "temperature": 1.0,
+      "top_p": 0.95,
+      "reasoning_effort": "max"
+    }
+  },
+  {
+    "pattern": "*deepseek-v4-flash-0731*",
+    "params": {
+      "context_length": 1048576,
+      "description": "DeepSeek V4 Flash - 284B MoE (13B active), 1M ctx, reasoning-effort max",
+      "temperature": 1.0,
+      "top_p": 0.95,
+      "reasoning_effort": "max"
+    }
+  },
+  {
+    "pattern": "*nemotron-3.5-lightning-30b-a3b*",
+    "params": {
+      "context_length": 1000000,
+      "description": "Nemotron 3.5 Lightning 30B-A3B-NVFP4 - MoE, optimal sampling temp 1.0 top_p 0.95",
+      "temperature": 1.0,
+      "top_p": 0.95
+    }
+  },
+  {
+    "pattern": "*muse-glimmer-30b*",
+    "params": {
+      "context_length": 131072,
+      "description": "Muse Glimmer 30B - dense vision model, reasoning-strength xhigh, top_k 64",
+      "temperature": 1.0,
+      "top_p": 0.95,
+      "top_k": 64,
+      "reasoning_effort": "xhigh"
+    }
+  },
+  {
+    "pattern": "*laguna-xs-2.1*",
+    "params": {
+      "context_length": 262144,
+      "description": "Laguna XS 2.1 - poolside reasoning model, thinking on, top_k 20, top_p 1.0",
+      "temperature": 1.0,
+      "top_p": 1.0,
+      "min_p": 0.0,
+      "top_k": 20,
+      "reasoning_effort": "max"
+    }
+  },
+  {
+    "pattern": "*minimax-m3*",
+    "params": {
+      "context_length": 1048576,
+      "description": "MiniMax M3 - ~428B MoE (23B active), 1M ctx, multimodal, top_k 40",
+      "temperature": 1.0,
+      "top_p": 0.95,
+      "top_k": 40
+    }
+  },
+  {
+    "pattern": "*nemotron-3-ultra-550b-a55b*",
+    "params": {
+      "context_length": 1048576,
+      "description": "Nemotron 3 Ultra 550B-A55B - frontier reasoning model (55B active), 1M ctx, reasoning-effort max",
+      "temperature": 1.0,
+      "top_p": 0.95,
+      "min_p": 0.01,
+      "reasoning_effort": "max"
+    }
+  }
+]

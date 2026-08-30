@@ -14,7 +14,7 @@ OpenAI-compatible. Point any client at it with `base_url=http://localhost:5419/v
 
 - Keys live in `keys.jsonc` (JSON with comments). Edits hot-reload; no restart needed.
 - Key picking is weighted: idle keys score higher, keys that failed a 429 in the last 50 minutes get crushed. On a 429 the key gets an exponential backoff (1m → 16m cap) and the (key, model) pair is locked out for 30s.
-- `model_params.md` sets per-model default parameters (temperature, max_tokens, ...) with glob patterns. First match wins; a client-sent value always wins over the default.
+- `model_params.jsonc` sets per-model default parameters (temperature, top_p, top_k, min_p, reasoning_effort, ...) with glob patterns. First match wins; a client-sent value always wins over the default. Edits hot-reload.
 - Every request is logged to `nim-usage.jsonl` (tokens, latency, retries, rate-limit headers).
 - `/status` returns pool health as JSON. `/v1/models` lists whitelisted models.
 

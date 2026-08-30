@@ -11,7 +11,6 @@ import (
 	"os"
 	"os/signal"
 	"sort"
-	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -33,7 +32,7 @@ const (
 )
 
 // versionStr is overridden at build time via -ldflags "-X main.versionStr=x.y.z".
-var versionStr = "2.5.0"
+var versionStr = "2.6.0"
 
 type Key struct {
 	Name           string
@@ -472,44 +471,25 @@ func loadModelParams(path string) {
 		log.Printf("WARN: no %s, skipping default params", path)
 		return
 	}
-	for _, line := range strings.Split(string(raw), "\n") {
-		tr := strings.TrimSpace(line)
-		if tr == "" {
+	clean := stripComments(raw)
+	var entries []struct {
+		Pattern string         `json:"pattern"`
+		Params  map[string]any `json:"params"`
+	}
+	if err := json.Unmarshal(clean, &entries); err != nil {
+		log.Printf("WARN: %s: %v", path, err)
+		return
+	}
+	for _, e := range entries {
+		if e.Pattern == "" {
 			continue
 		}
-		if strings.HasPrefix(tr, "##") {
-			pat := strings.TrimSpace(strings.TrimPrefix(tr, "##"))
-			if pat != "" {
-				modelParams = append(modelParams, &modelParamEntry{pattern: strings.ToLower(pat), params: make(map[string]any)})
-			}
-			continue
+		if e.Params == nil {
+			e.Params = make(map[string]any)
 		}
-		if strings.HasPrefix(tr, "#") {
-			continue
-		}
-		if len(modelParams) > 0 && strings.Contains(tr, ":") {
-			kv := strings.SplitN(tr, ":", 2)
-			k := strings.TrimSpace(kv[0])
-			v := strings.TrimSpace(kv[1])
-			if k != "" && v != "" {
-				modelParams[len(modelParams)-1].params[k] = parseParamVal(v)
-			}
-		}
+		modelParams = append(modelParams, &modelParamEntry{pattern: strings.ToLower(e.Pattern), params: e.Params})
 	}
 	log.Printf("  Loaded %d model param entries from %s", len(modelParams), path)
-}
-
-func parseParamVal(s string) any {
-	if s == "true" || s == "false" {
-		return s == "true"
-	}
-	if f, err := strconv.ParseFloat(s, 64); err == nil {
-		if f == float64(int(f)) {
-			return int(f)
-		}
-		return f
-	}
-	return s
 }
 
 func matchModelParams(model string) map[string]any {
@@ -1274,7 +1254,7 @@ func watchModelParams(path string) {
 		if err == nil {
 			mod := fi.ModTime()
 			if !mod.Equal(lastMod) && !lastMod.IsZero() {
-				log.Printf("  model_params.md changed, reloading")
+				log.Printf("  model_params.jsonc changed, reloading")
 				loadModelParams(path)
 			}
 			lastMod = mod
@@ -1296,7 +1276,7 @@ func initUsageLog() {
 func serverMain() {
 	initLogging()
 	initUsageLog()
-	loadModelParams("model_params.md")
+	loadModelParams("model_params.jsonc")
 	refreshOpencodeModels()
 
 	kf := "keys.jsonc"
@@ -1319,7 +1299,7 @@ func serverMain() {
 
 	pool := newPool(entries)
 	go watchKeys(pool, kf)
-	go watchModelParams("model_params.md")
+	go watchModelParams("model_params.jsonc")
 
 	port := os.Getenv("PORT")
 	if port == "" {
