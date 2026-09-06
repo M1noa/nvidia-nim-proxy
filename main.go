@@ -235,6 +235,92 @@ func (p *Pool) Postpone(k *Key, d time.Duration) {
 	k.CooldownReason = "post_request"
 }
 
+// callUpstream runs the retry loop against NIM and returns the result.
+// Returns (nil, nil) when all keys exhausted, (nil, error) on hard error.
+func (p *Pool) callUpstream(method, target string, body []byte, fwd http.Header, model, remoteAddr string) (*upstreamResult, error) {
+	exclude := make(map[string]bool)
+	cl := &http.Client{Timeout: 300 * time.Second}
+	var retries int
+	var rateLimited bool
+	var used *Key
+
+	for attempt := 0; attempt < max(len(p.keys)*2+2, 4); attempt++ {
+		key := p.Pick(exclude, model)
+		if key == nil {
+			if attempt < 3 {
+				time.Sleep(200 * time.Millisecond)
+				continue
+			}
+			dbglog.Printf("no keys available at attempt %d (excluded=%d, model=%s)", attempt, len(exclude), model)
+			break
+		}
+		used = key
+
+		req, err := http.NewRequest(method, target, bytes.NewReader(body))
+		if err != nil {
+			return nil, fmt.Errorf("NewRequest: %w", err)
+		}
+		req.Header.Set("Authorization", "Bearer "+key.Key)
+		req.Header.Set("Host", "integrate.api.nvidia.com")
+		req.Header.Set("X-Forwarded-For", remoteAddr)
+		for k, v := range fwd {
+			req.Header[k] = v
+		}
+
+		resp, err := cl.Do(req)
+		if err != nil {
+			return nil, fmt.Errorf("upstream: %w", err)
+		}
+
+		if resp.StatusCode == http.StatusTooManyRequests {
+			rateLimited = true
+			p.rateLimit(key)
+			p.locks.lock(key.Name, model, modelLockout)
+			resp.Body.Close()
+			rh := rlHeaders(resp.Header)
+			cd := cooldown429 << (key.Consec429 - 1)
+			if cd > maxBackoff {
+				cd = maxBackoff
+			}
+			acclog.Printf("!! 429 [%s] model=%s key-backoff=%v model-lockout=%v headers=%v", key.Name, model, cd, modelLockout, rh)
+			exclude[key.Name] = true
+			if attempt > 0 {
+				retries++
+			}
+			continue
+		}
+
+		rb, _ := io.ReadAll(resp.Body)
+		resp.Body.Close()
+
+		bodyStr := string(rb)
+		if resp.StatusCode == http.StatusForbidden || strings.Contains(bodyStr, "ResourceExhausted") {
+			p.locks.lock(key.Name, model, burstCooldown)
+			acclog.Printf("!! 403/ResourceExhausted [%s] model=%s burst-backoff=%v", key.Name, model, burstCooldown)
+			exclude[key.Name] = true
+			if attempt > 0 {
+				retries++
+			}
+			continue
+		}
+
+		if attempt > 0 {
+			retries++
+		}
+		return &upstreamResult{
+			StatusCode:  resp.StatusCode,
+			Header:      resp.Header.Clone(),
+			Body:        rb,
+			Key:         used.Name,
+			KeyObj:      used,
+			Retries:     retries,
+			RateLimited: rateLimited,
+		}, nil
+	}
+
+	return nil, nil
+}
+
 type KeyStatus struct {
 	Name           string `json:"name"`
 	Suffix         string `json:"suffix"`
@@ -263,6 +349,17 @@ type OpencodeInfo struct {
 	Enabled bool     `json:"enabled"`
 	Base    string   `json:"base"`
 	Models  []string `json:"models"`
+}
+
+// upstreamResult holds the outcome of a callUpstream attempt.
+type upstreamResult struct {
+	StatusCode  int
+	Header      http.Header
+	Body        []byte
+	Key         string
+	KeyObj      *Key
+	Retries     int
+	RateLimited bool
 }
 
 func (p *Pool) Status() StatusResponse {
@@ -832,6 +929,12 @@ func (p *Pool) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Anthropic Messages API — route to anthropic.go handler
+	if r.URL.Path == "/v1/messages" || r.URL.Path == "/v1/messages/count_tokens" {
+		p.handleAnthropic(w, r, start)
+		return
+	}
+
 	p.sem <- struct{}{}
 	p.concurrent.Add(1)
 	defer func() {
@@ -1277,6 +1380,7 @@ func serverMain() {
 	initLogging()
 	initUsageLog()
 	loadModelParams("model_params.jsonc")
+	loadClaudeModels("claude_models.jsonc")
 	refreshOpencodeModels()
 
 	kf := "keys.jsonc"
@@ -1300,6 +1404,7 @@ func serverMain() {
 	pool := newPool(entries)
 	go watchKeys(pool, kf)
 	go watchModelParams("model_params.jsonc")
+	go watchClaudeModels("claude_models.jsonc")
 
 	port := os.Getenv("PORT")
 	if port == "" {

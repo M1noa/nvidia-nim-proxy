@@ -54,3 +54,28 @@ curl http://localhost:5419/v1/chat/completions \
 ```
 
 `./nim-proxy probe` hits a few models with test requests and reports per-model rate limits.
+
+`./bench.py [runs] [max_tokens]` measures TTFT and throughput for every model in `model_params.jsonc` through the proxy and prints a table sorted by TTFT.
+
+## Claude Code
+
+The proxy supports the Anthropic Messages API, so you can use it as a base URL for Claude Code:
+
+```sh
+ANTHROPIC_BASE_URL=http://localhost:5419 claude
+```
+
+Models are mapped via `claude_models.jsonc` (glob patterns, first match wins, hot-reloaded). Example:
+
+```jsonc
+[
+  {"pattern": "claude-sonnet-*", "model": "moonshotai/kimi-k3"},
+  {"pattern": "claude-haiku-*",  "model": "moonshotai/kimi-k3"}
+]
+```
+
+Endpoints exposed for Claude Code:
+- `POST /v1/messages` — full Anthropic Messages API (stream + non-stream, tools)
+- `POST /v1/messages/count_tokens` — crude token estimate (chars / 4)
+
+Auth headers are accepted but ignored. Backend API keys come from `keys.jsonc` as usual.

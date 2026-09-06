@@ -1,0 +1,876 @@
+package main
+
+import (
+	"crypto/rand"
+	"encoding/json"
+	"fmt"
+	"io"
+	"log"
+	"net/http"
+	"os"
+	"strings"
+	"sync"
+	"time"
+)
+
+// --- Types ---
+
+type anthropicRequest struct {
+	Model         string           `json:"model"`
+	System        json.RawMessage  `json:"system,omitempty"`
+	Messages      []anthropicMsg   `json:"messages"`
+	Tools         []anthropicTool  `json:"tools,omitempty"`
+	ToolChoice    any              `json:"tool_choice,omitempty"`
+	MaxTokens     int              `json:"max_tokens"`
+	Temperature   *float64         `json:"temperature,omitempty"`
+	TopP          *float64         `json:"top_p,omitempty"`
+	TopK          *int             `json:"top_k,omitempty"`
+	StopSequences []string         `json:"stop_sequences,omitempty"`
+	Stream        bool             `json:"stream,omitempty"`
+}
+
+type anthropicMsg struct {
+	Role    string          `json:"role"`
+	Content json.RawMessage `json:"content"`
+}
+
+type anthropicBlock struct {
+	Type      string          `json:"type"`
+	Text      string          `json:"text,omitempty"`
+	ID        string          `json:"id,omitempty"`
+	Name      string          `json:"name,omitempty"`
+	Input     json.RawMessage `json:"input,omitempty"`
+	Content   json.RawMessage `json:"content,omitempty"`
+	ToolUseID string          `json:"tool_use_id,omitempty"`
+	IsError   bool            `json:"is_error,omitempty"`
+	Source    *struct {
+		Type      string `json:"type"`
+		MediaType string `json:"media_type"`
+		Data      string `json:"data"`
+	} `json:"source,omitempty"`
+}
+
+type anthropicTool struct {
+	Name        string          `json:"name"`
+	Description string          `json:"description,omitempty"`
+	InputSchema json.RawMessage `json:"input_schema"`
+}
+
+// --- Config ---
+
+type claudeModelEntry struct {
+	Pattern string `json:"pattern"`
+	Model   string `json:"model"`
+}
+
+var (
+	claudeModels   []*claudeModelEntry
+	claudeModelsMu sync.RWMutex
+)
+
+func loadClaudeModels(path string) {
+	claudeModelsMu.Lock()
+	defer claudeModelsMu.Unlock()
+	claudeModels = nil
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		log.Printf("  No %s, Claude model passthrough enabled", path)
+		return
+	}
+	clean := stripComments(raw)
+	var entries []claudeModelEntry
+	if err := json.Unmarshal(clean, &entries); err != nil {
+		log.Printf("  WARN: %s: %v", path, err)
+		return
+	}
+	for _, e := range entries {
+		if e.Pattern == "" || e.Model == "" {
+			continue
+		}
+		claudeModels = append(claudeModels, &claudeModelEntry{
+			Pattern: strings.ToLower(e.Pattern),
+			Model:   e.Model,
+		})
+	}
+	log.Printf("  Loaded %d Claude model mappings from %s", len(claudeModels), path)
+}
+
+func watchClaudeModels(path string) {
+	var lastMod time.Time
+	for {
+		fi, err := os.Stat(path)
+		if err == nil {
+			mod := fi.ModTime()
+			if !mod.Equal(lastMod) && !lastMod.IsZero() {
+				log.Printf("  %s changed, reloading", path)
+				loadClaudeModels(path)
+			}
+			lastMod = mod
+		}
+		time.Sleep(checkInterval)
+	}
+}
+
+func mapClaudeModel(model string) string {
+	claudeModelsMu.RLock()
+	defer claudeModelsMu.RUnlock()
+	ml := strings.ToLower(model)
+	for _, e := range claudeModels {
+		if globMatch(e.Pattern, ml) {
+			return e.Model
+		}
+	}
+	return model
+}
+
+// --- Request Conversion ---
+
+func anthropicRequestToOpenAI(body []byte) (oai []byte, clientModel, upstreamModel string, isStream bool, err error) {
+	var req anthropicRequest
+	if err = json.Unmarshal(body, &req); err != nil {
+		return nil, "", "", false, fmt.Errorf("invalid JSON: %w", err)
+	}
+
+	clientModel = req.Model
+	upstreamModel = mapClaudeModel(clientModel)
+	isStream = req.Stream
+
+	messages := make([]map[string]any, 0)
+
+	if sysText := extractSystemText(req.System); sysText != "" {
+		messages = append(messages, map[string]any{"role": "system", "content": sysText})
+	}
+
+	for _, msg := range req.Messages {
+		switch msg.Role {
+		case "user":
+			messages = append(messages, convertUserMessage(msg.Content)...)
+		case "assistant":
+			messages = append(messages, convertAssistantMessage(msg.Content)...)
+		}
+	}
+
+	out := map[string]any{
+		"model":      upstreamModel,
+		"messages":   messages,
+		"max_tokens": req.MaxTokens,
+	}
+
+	if req.MaxTokens == 0 {
+		out["max_tokens"] = 4096
+	}
+
+	if req.Temperature != nil {
+		out["temperature"] = *req.Temperature
+	}
+	if req.TopP != nil {
+		out["top_p"] = *req.TopP
+	}
+	if len(req.StopSequences) > 0 {
+		out["stop"] = req.StopSequences
+	}
+
+	if len(req.Tools) > 0 {
+		tools := make([]map[string]any, len(req.Tools))
+		for i, t := range req.Tools {
+			tools[i] = map[string]any{
+				"type": "function",
+				"function": map[string]any{
+					"name":        t.Name,
+					"description": t.Description,
+					"parameters":  json.RawMessage(t.InputSchema),
+				},
+			}
+		}
+		out["tools"] = tools
+	}
+
+	if req.ToolChoice != nil {
+		out["tool_choice"] = convertToolChoice(req.ToolChoice)
+	}
+
+	if isStream {
+		out["stream"] = true
+		out["stream_options"] = map[string]any{"include_usage": true}
+	}
+
+	ob, _ := json.Marshal(out)
+	injectParams(&ob)
+
+	return ob, clientModel, upstreamModel, isStream, nil
+}
+
+func extractSystemText(raw json.RawMessage) string {
+	if len(raw) == 0 {
+		return ""
+	}
+	var s string
+	if json.Unmarshal(raw, &s) == nil {
+		return s
+	}
+	var blocks []anthropicBlock
+	if json.Unmarshal(raw, &blocks) != nil {
+		return ""
+	}
+	var parts []string
+	for _, b := range blocks {
+		if b.Type == "text" && b.Text != "" {
+			parts = append(parts, b.Text)
+		}
+	}
+	return strings.Join(parts, "\n")
+}
+
+func convertUserMessage(raw json.RawMessage) []map[string]any {
+	var s string
+	if json.Unmarshal(raw, &s) == nil {
+		return []map[string]any{{"role": "user", "content": s}}
+	}
+	var blocks []anthropicBlock
+	if json.Unmarshal(raw, &blocks) != nil {
+		return []map[string]any{{"role": "user", "content": ""}}
+	}
+
+	var result []map[string]any
+	var textParts []string
+
+	for _, b := range blocks {
+		switch b.Type {
+		case "text":
+			textParts = append(textParts, b.Text)
+		case "tool_result":
+			content := toolResultText(b.Content)
+			if b.IsError {
+				content = "Error: " + content
+			}
+			result = append(result, map[string]any{
+				"role":         "tool",
+				"tool_call_id": b.ToolUseID,
+				"content":      content,
+			})
+		case "image":
+			if b.Source != nil {
+				textParts = append(textParts, fmt.Sprintf("[Image: %s]", b.Source.MediaType))
+			}
+		}
+	}
+
+	if len(textParts) > 0 {
+		userMsg := map[string]any{"role": "user", "content": strings.Join(textParts, "\n")}
+		result = append([]map[string]any{userMsg}, result...)
+	}
+
+	if len(result) == 0 {
+		return []map[string]any{{"role": "user", "content": ""}}
+	}
+	return result
+}
+
+func convertAssistantMessage(raw json.RawMessage) []map[string]any {
+	var s string
+	if json.Unmarshal(raw, &s) == nil {
+		return []map[string]any{{"role": "assistant", "content": s}}
+	}
+	var blocks []anthropicBlock
+	if json.Unmarshal(raw, &blocks) != nil {
+		return []map[string]any{{"role": "assistant", "content": ""}}
+	}
+
+	var textParts []string
+	var toolCalls []map[string]any
+
+	for _, b := range blocks {
+		switch b.Type {
+		case "text":
+			textParts = append(textParts, b.Text)
+		case "tool_use":
+			input := "{}"
+			if len(b.Input) > 0 && string(b.Input) != "null" {
+				input = string(b.Input)
+			}
+			toolCalls = append(toolCalls, map[string]any{
+				"id":   b.ID,
+				"type": "function",
+				"function": map[string]any{
+					"name":      b.Name,
+					"arguments": input,
+				},
+			})
+		}
+	}
+
+	msg := map[string]any{"role": "assistant"}
+	if len(textParts) > 0 {
+		msg["content"] = strings.Join(textParts, "\n")
+	} else {
+		msg["content"] = nil
+	}
+	if len(toolCalls) > 0 {
+		msg["tool_calls"] = toolCalls
+	}
+	return []map[string]any{msg}
+}
+
+func toolResultText(raw json.RawMessage) string {
+	if len(raw) == 0 {
+		return ""
+	}
+	var s string
+	if json.Unmarshal(raw, &s) == nil {
+		return s
+	}
+	var blocks []anthropicBlock
+	if json.Unmarshal(raw, &blocks) != nil {
+		return string(raw)
+	}
+	var parts []string
+	for _, b := range blocks {
+		if b.Type == "text" {
+			parts = append(parts, b.Text)
+		}
+	}
+	if len(parts) > 0 {
+		return strings.Join(parts, "\n")
+	}
+	return string(raw)
+}
+
+func convertToolChoice(tc any) any {
+	switch v := tc.(type) {
+	case string:
+		switch v {
+		case "auto", "none":
+			return v
+		case "any":
+			return "required"
+		default:
+			return v
+		}
+	case map[string]any:
+		typ, _ := v["type"].(string)
+		switch typ {
+		case "auto", "none":
+			return typ
+		case "any":
+			return "required"
+		case "tool":
+			name, _ := v["name"].(string)
+			if name != "" {
+				return map[string]any{
+					"type":     "function",
+					"function": map[string]any{"name": name},
+				}
+			}
+			return "auto"
+		}
+	}
+	return "auto"
+}
+
+// --- Response Conversion (non-stream) ---
+
+func openAIToAnthropic(body []byte, clientModel string) (out []byte, errMsg string, msgID string) {
+	msgID = "msg_" + randHex(24)
+
+	var oaiResp struct {
+		ID      string `json:"id"`
+		Model   string `json:"model"`
+		Choices []struct {
+			Message struct {
+				Content   *string `json:"content"`
+				ToolCalls []struct {
+					ID       string `json:"id"`
+					Type     string `json:"type"`
+					Function struct {
+						Name      string `json:"name"`
+						Arguments string `json:"arguments"`
+					} `json:"function"`
+				} `json:"tool_calls"`
+			} `json:"message"`
+			FinishReason *string `json:"finish_reason"`
+		} `json:"choices"`
+		Usage *struct {
+			PromptTokens     int `json:"prompt_tokens"`
+			CompletionTokens int `json:"completion_tokens"`
+		} `json:"usage"`
+		Error *struct {
+			Message string `json:"message"`
+			Type    string `json:"type"`
+		} `json:"error"`
+	}
+
+	if err := json.Unmarshal(body, &oaiResp); err != nil {
+		return nil, "failed to parse upstream response: " + err.Error(), msgID
+	}
+
+	if oaiResp.Error != nil {
+		return nil, oaiResp.Error.Message, msgID
+	}
+
+	content := make([]map[string]any, 0)
+
+	if oaiResp.Choices != nil && len(oaiResp.Choices) > 0 {
+		msg := oaiResp.Choices[0].Message
+
+		if msg.Content != nil && *msg.Content != "" {
+			content = append(content, map[string]any{"type": "text", "text": *msg.Content})
+		}
+
+		for _, tc := range msg.ToolCalls {
+			input := map[string]any{}
+			if tc.Function.Arguments != "" {
+				if err := json.Unmarshal([]byte(tc.Function.Arguments), &input); err != nil {
+					input = map[string]any{"_raw": tc.Function.Arguments}
+				}
+			}
+			content = append(content, map[string]any{
+				"type":  "tool_use",
+				"id":    tc.ID,
+				"name":  tc.Function.Name,
+				"input": input,
+			})
+		}
+	}
+
+	if len(content) == 0 {
+		content = []map[string]any{{"type": "text", "text": ""}}
+	}
+
+	stopReason := "end_turn"
+	if oaiResp.Choices != nil && len(oaiResp.Choices) > 0 && oaiResp.Choices[0].FinishReason != nil {
+		switch *oaiResp.Choices[0].FinishReason {
+		case "stop":
+			stopReason = "end_turn"
+		case "length":
+			stopReason = "max_tokens"
+		case "tool_calls":
+			stopReason = "tool_use"
+		}
+	}
+
+	inputTokens, outputTokens := 0, 0
+	if oaiResp.Usage != nil {
+		inputTokens = oaiResp.Usage.PromptTokens
+		outputTokens = oaiResp.Usage.CompletionTokens
+	}
+
+	result := map[string]any{
+		"id":            msgID,
+		"type":          "message",
+		"role":          "assistant",
+		"model":         clientModel,
+		"content":       content,
+		"stop_reason":   stopReason,
+		"stop_sequence": nil,
+		"usage": map[string]any{
+			"input_tokens":  inputTokens,
+			"output_tokens": outputTokens,
+		},
+	}
+
+	out, err := json.Marshal(result)
+	if err != nil {
+		return nil, "failed to marshal response: " + err.Error(), msgID
+	}
+	return out, "", msgID
+}
+
+// --- Streaming Conversion ---
+
+func streamAnthropic(w http.ResponseWriter, body []byte, clientModel string) (written int64, promptT, compT int) {
+	fl, _ := w.(http.Flusher)
+
+	msgID := "msg_" + randHex(24)
+	preamble := fmt.Sprintf(`{"type":"message_start","message":{"id":"%s","type":"message","role":"assistant","model":"%s","content":[],"stop_reason":null,"stop_sequence":null,"usage":{"input_tokens":0,"cache_creation_input_tokens":0,"cache_read_input_tokens":0,"output_tokens":0}}}`, msgID, clientModel)
+	written += writeSSE(w, "message_start", preamble)
+	written += writeSSE(w, "content_block_start", `{"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}`)
+	written += writeSSE(w, "ping", `{"type":"ping"}`)
+	if fl != nil {
+		fl.Flush()
+	}
+
+	textClosed := false
+	hasToolCalls := false
+	toolIndex := -1
+	lastToolIdx := 0
+	hasSentStopReason := false
+
+	lines := strings.Split(string(body), "\n")
+	for _, line := range lines {
+		line = strings.TrimSpace(line)
+		if !strings.HasPrefix(line, "data: ") {
+			continue
+		}
+		data := strings.TrimPrefix(line, "data: ")
+		if data == "[DONE]" {
+			break
+		}
+
+		var chunk struct {
+			Choices []struct {
+				Delta struct {
+					Content   string `json:"content"`
+					ToolCalls []struct {
+						Index    int    `json:"index"`
+						ID       string `json:"id"`
+						Type     string `json:"type"`
+						Function struct {
+							Name      string `json:"name"`
+							Arguments string `json:"arguments"`
+						} `json:"function"`
+					} `json:"tool_calls"`
+				} `json:"delta"`
+				FinishReason *string `json:"finish_reason"`
+			} `json:"choices"`
+			Usage *struct {
+				PromptTokens     int `json:"prompt_tokens"`
+				CompletionTokens int `json:"completion_tokens"`
+			} `json:"usage"`
+		}
+
+		if err := json.Unmarshal([]byte(data), &chunk); err != nil {
+			continue
+		}
+
+		if chunk.Usage != nil {
+			if chunk.Usage.PromptTokens > 0 {
+				promptT = chunk.Usage.PromptTokens
+			}
+			if chunk.Usage.CompletionTokens > 0 {
+				compT = chunk.Usage.CompletionTokens
+			}
+		}
+
+		if len(chunk.Choices) == 0 {
+			continue
+		}
+		choice := chunk.Choices[0]
+
+		// text delta
+		if choice.Delta.Content != "" && !hasToolCalls && !textClosed {
+			written += writeSSE(w, "content_block_delta", fmt.Sprintf(`{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":%s}}`, jsonStr(choice.Delta.Content)))
+		}
+
+		// tool call deltas
+		if len(choice.Delta.ToolCalls) > 0 {
+			if !hasToolCalls {
+				hasToolCalls = true
+				if !textClosed {
+					written += writeSSE(w, "content_block_stop", `{"type":"content_block_stop","index":0}`)
+					textClosed = true
+				}
+			}
+
+			for _, tc := range choice.Delta.ToolCalls {
+				if toolIndex < 0 || tc.Index != toolIndex {
+					toolIndex = tc.Index
+					lastToolIdx++
+					toolID := tc.ID
+					if toolID == "" {
+						toolID = "toolu_" + randHex(24)
+					}
+					written += writeSSE(w, "content_block_start", fmt.Sprintf(`{"type":"content_block_start","index":%d,"content_block":{"type":"tool_use","id":"%s","name":"%s","input":{}}}`, lastToolIdx, toolID, tc.Function.Name))
+				}
+				if tc.Function.Arguments != "" {
+					written += writeSSE(w, "content_block_delta", fmt.Sprintf(`{"type":"content_block_delta","index":%d,"delta":{"type":"input_json_delta","partial_json":%s}}`, lastToolIdx, jsonStr(tc.Function.Arguments)))
+				}
+			}
+		}
+
+		// finish reason
+		if choice.FinishReason != nil && !hasSentStopReason {
+			hasSentStopReason = true
+
+			for i := 1; i <= lastToolIdx; i++ {
+				written += writeSSE(w, "content_block_stop", fmt.Sprintf(`{"type":"content_block_stop","index":%d}`, i))
+			}
+
+			if !textClosed {
+				written += writeSSE(w, "content_block_stop", `{"type":"content_block_stop","index":0}`)
+				textClosed = true
+			}
+
+			stopReason := "end_turn"
+			switch *choice.FinishReason {
+			case "length":
+				stopReason = "max_tokens"
+			case "tool_calls":
+				stopReason = "tool_use"
+			}
+
+			written += writeSSE(w, "message_delta", fmt.Sprintf(`{"type":"message_delta","delta":{"stop_reason":"%s","stop_sequence":null},"usage":{"output_tokens":%d}}`, stopReason, compT))
+			written += writeSSE(w, "message_stop", `{"type":"message_stop"}`)
+			n, _ := w.Write([]byte("data: [DONE]\n\n"))
+			written += int64(n)
+			if fl != nil {
+				fl.Flush()
+			}
+			return
+		}
+	}
+
+	// stream ended without finish_reason
+	if !hasSentStopReason {
+		for i := 1; i <= lastToolIdx; i++ {
+			written += writeSSE(w, "content_block_stop", fmt.Sprintf(`{"type":"content_block_stop","index":%d}`, i))
+		}
+		if !textClosed {
+			written += writeSSE(w, "content_block_stop", `{"type":"content_block_stop","index":0}`)
+		}
+		written += writeSSE(w, "message_delta", fmt.Sprintf(`{"type":"message_delta","delta":{"stop_reason":"end_turn","stop_sequence":null},"usage":{"output_tokens":%d}}`, compT))
+		written += writeSSE(w, "message_stop", `{"type":"message_stop"}`)
+		n, _ := w.Write([]byte("data: [DONE]\n\n"))
+		written += int64(n)
+		if fl != nil {
+			fl.Flush()
+		}
+	}
+
+	return
+}
+
+// --- Handlers ---
+
+func (p *Pool) handleAnthropic(w http.ResponseWriter, r *http.Request, start time.Time) {
+	w.Header().Set("Access-Control-Allow-Origin", "*")
+	w.Header().Set("Access-Control-Allow-Headers", "*")
+	w.Header().Set("Access-Control-Allow-Methods", "*")
+	if r.Method == http.MethodOptions {
+		w.WriteHeader(http.StatusNoContent)
+		return
+	}
+
+	if r.Method != http.MethodPost {
+		writeAnthropicError(w, http.StatusMethodNotAllowed, "method_not_allowed", "only POST is supported")
+		return
+	}
+
+	body, err := io.ReadAll(io.LimitReader(r.Body, bodyLimit))
+	if err != nil {
+		writeAnthropicError(w, http.StatusBadRequest, "invalid_request_error", err.Error())
+		return
+	}
+	r.Body.Close()
+
+	if r.URL.Path == "/v1/messages/count_tokens" {
+		handleCountTokens(w, body)
+		return
+	}
+
+	p.sem <- struct{}{}
+	p.concurrent.Add(1)
+	defer func() {
+		p.concurrent.Add(-1)
+		<-p.sem
+	}()
+
+	oaiBody, clientModel, upstreamModel, isStream, err := anthropicRequestToOpenAI(body)
+	if err != nil {
+		writeAnthropicError(w, http.StatusBadRequest, "invalid_request_error", err.Error())
+		return
+	}
+
+	acclog.Printf("-> POST /v1/messages model=%s upstream=%s stream=%v bytes=%d", clientModel, upstreamModel, isStream, len(oaiBody))
+
+	target := nvidiaBase + "/chat/completions"
+	fwd := http.Header{
+		"Content-Type": {"application/json"},
+		"Accept":       {"application/json"},
+	}
+	if isStream {
+		fwd.Set("Accept", "text/event-stream")
+	}
+
+	u, upErr := p.callUpstream(r.Method, target, oaiBody, fwd, upstreamModel, r.RemoteAddr)
+	elapsed := time.Since(start)
+
+	if u == nil {
+		errMsg := "all keys exhausted or on cooldown"
+		if upErr != nil {
+			errMsg = upErr.Error()
+		}
+		logUsage(UsageRecord{
+			Ts:         time.Now().UTC().Format(time.RFC3339Nano),
+			Model:      clientModel,
+			Method:     "POST",
+			Path:       "/v1/messages",
+			StatusCode: 503,
+			DurationMs: elapsed.Milliseconds(),
+			Stream:     isStream,
+			Error:      errMsg,
+		})
+		writeAnthropicError(w, http.StatusServiceUnavailable, "api_error", errMsg)
+		return
+	}
+
+	if u.StatusCode != http.StatusOK {
+		errMsg := extractErrMessage(string(u.Body))
+		acclog.Printf("!! upstream %d [%s] model=%s err=%q", u.StatusCode, u.Key, clientModel, errMsg)
+
+		logUsage(UsageRecord{
+			Ts:          time.Now().UTC().Format(time.RFC3339Nano),
+			Model:       clientModel,
+			KeyName:     u.Key,
+			Method:      "POST",
+			Path:        "/v1/messages",
+			StatusCode:  u.StatusCode,
+			DurationMs:  elapsed.Milliseconds(),
+			Stream:      isStream,
+			Error:       errMsg,
+			RateLimited: u.RateLimited,
+		})
+
+		writeAnthropicError(w, u.StatusCode, "api_error", errMsg)
+		return
+	}
+
+	if isStream {
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.Header().Set("Cache-Control", "no-cache")
+		w.Header().Set("Connection", "keep-alive")
+		w.WriteHeader(http.StatusOK)
+		written, promptT, compT := streamAnthropic(w, u.Body, clientModel)
+
+		p.Postpone(u.KeyObj, 1500*time.Millisecond)
+		p.Clear429(u.KeyObj)
+
+		logUsage(UsageRecord{
+			Ts:               time.Now().UTC().Format(time.RFC3339Nano),
+			Model:            clientModel,
+			KeyName:          u.Key,
+			Method:           "POST",
+			Path:             "/v1/messages",
+			StatusCode:       200,
+			DurationMs:       elapsed.Milliseconds(),
+			PromptTokens:     promptT,
+			CompletionTokens: compT,
+			TotalTokens:      promptT + compT,
+			Stream:           true,
+			RetryAttempt:     u.Retries,
+			RateLimited:      u.RateLimited,
+			ContentBytes:     int64(len(body)),
+		})
+
+		acclog.Printf("<- 200 POST /v1/messages %v %d bytes [%s]", elapsed.Round(time.Millisecond), written, u.Key)
+	} else {
+		out, errMsg, _ := openAIToAnthropic(u.Body, clientModel)
+		if errMsg != "" {
+			writeAnthropicError(w, http.StatusInternalServerError, "api_error", errMsg)
+			return
+		}
+
+		prompT, compT, _ := respTokens(u.Body)
+
+		p.Postpone(u.KeyObj, 1500*time.Millisecond)
+		p.Clear429(u.KeyObj)
+
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		w.Write(out)
+
+		logUsage(UsageRecord{
+			Ts:               time.Now().UTC().Format(time.RFC3339Nano),
+			Model:            clientModel,
+			KeyName:          u.Key,
+			Method:           "POST",
+			Path:             "/v1/messages",
+			StatusCode:       200,
+			DurationMs:       elapsed.Milliseconds(),
+			PromptTokens:     prompT,
+			CompletionTokens: compT,
+			TotalTokens:      prompT + compT,
+			Stream:           false,
+			RetryAttempt:     u.Retries,
+			RateLimited:      u.RateLimited,
+			ContentBytes:     int64(len(body)),
+		})
+
+		acclog.Printf("<- 200 POST /v1/messages %v %d bytes [%s]", elapsed.Round(time.Millisecond), len(out), u.Key)
+	}
+}
+
+func handleCountTokens(w http.ResponseWriter, body []byte) {
+	tokens := estimateTokens(body)
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]any{"input_tokens": tokens})
+}
+
+// --- Helpers ---
+
+func writeSSE(w io.Writer, event, data string) int64 {
+	var n int
+	if event != "" {
+		n, _ = fmt.Fprintf(w, "event: %s\n", event)
+	}
+	m, _ := fmt.Fprintf(w, "data: %s\n\n", data)
+	return int64(n + m)
+}
+
+func jsonStr(s string) string {
+	b, _ := json.Marshal(s)
+	return string(b)
+}
+
+func writeAnthropicError(w http.ResponseWriter, status int, errType, msg string) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(status)
+	json.NewEncoder(w).Encode(map[string]any{
+		"type": "error",
+		"error": map[string]string{
+			"type":    errType,
+			"message": msg,
+		},
+	})
+}
+
+func extractErrMessage(body string) string {
+	var errResp struct {
+		Error struct {
+			Message string `json:"message"`
+		} `json:"error"`
+	}
+	if json.Unmarshal([]byte(body), &errResp) == nil && errResp.Error.Message != "" {
+		return errResp.Error.Message
+	}
+	var errStr struct {
+		Error string `json:"error"`
+	}
+	if json.Unmarshal([]byte(body), &errStr) == nil && errStr.Error != "" {
+		return errStr.Error
+	}
+	msg := strings.TrimSpace(body)
+	if len(msg) > 200 {
+		msg = msg[:200]
+	}
+	return msg
+}
+
+func randHex(n int) string {
+	b := make([]byte, n/2+1)
+	rand.Read(b)
+	return fmt.Sprintf("%x", b)[:n]
+}
+
+func estimateTokens(body []byte) int {
+	var req anthropicRequest
+	if err := json.Unmarshal(body, &req); err != nil {
+		return 1000
+	}
+
+	chars := 0
+	if len(req.System) > 0 {
+		chars += len(req.System)
+	}
+	for _, msg := range req.Messages {
+		chars += len(msg.Content)
+	}
+	for _, tool := range req.Tools {
+		chars += len(tool.Name) + len(tool.Description) + len(tool.InputSchema)
+	}
+
+	tokens := chars / 4
+	if tokens < 10 {
+		tokens = 10
+	}
+	return tokens
+}

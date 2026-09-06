@@ -1,0 +1,7 @@
+[
+  // Map claude-* model names to NIM models.
+  // Glob patterns, first match wins. Copy to claude_models.jsonc and edit.
+  {"pattern": "claude-sonnet-*", "model": "moonshotai/kimi-k3"},
+  {"pattern": "claude-haiku-*",  "model": "moonshotai/kimi-k3"},
+  {"pattern": "claude-*",       "model": "moonshotai/kimi-k3"}
+]
