@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"log"
 	"math/rand"
+	"net"
 	"net/http"
 	"net/url"
 	"sort"
@@ -81,7 +82,7 @@ func refreshZenProxies() {
 	log.Printf("  zen proxies: %d fast proxies loaded", len(out))
 }
 
-// testProxy verifies a proxy is fast enough (<60ms) by fetching a lightweight URL.
+// testProxy quickly verifies a proxy is reachable via TCP dial.
 func testProxy(proxyURL string) bool {
 	if proxyURL == "" {
 		return true
@@ -90,16 +91,12 @@ func testProxy(proxyURL string) bool {
 	if err != nil {
 		return false
 	}
-	tr := http.DefaultTransport.(*http.Transport).Clone()
-	tr.Proxy = http.ProxyURL(pu)
-	client := &http.Client{Timeout: 8 * time.Second, Transport: tr}
-	start := time.Now()
-	resp, err := client.Get("https://integrate.api.nvidia.com/v1/models")
+	conn, err := net.DialTimeout("tcp", pu.Host, 3*time.Second)
 	if err != nil {
 		return false
 	}
-	resp.Body.Close()
-	return time.Since(start) < 60*time.Millisecond
+	conn.Close()
+	return true
 }
 
 // pickFastProxy returns the first proxy that passes testProxy, or "" if none.
