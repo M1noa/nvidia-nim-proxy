@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"crypto/rand"
 	"encoding/json"
 	"fmt"
@@ -131,7 +132,7 @@ func anthropicRequestToOpenAI(body []byte) (oai []byte, clientModel, upstreamMod
 		return nil, "", "", false, fmt.Errorf("invalid JSON: %w", err)
 	}
 
-	clientModel = req.Model
+	clientModel = strings.TrimSuffix(req.Model, "[1m]")
 	upstreamModel = mapClaudeModel(clientModel)
 	isStream = req.Stream
 
@@ -377,8 +378,9 @@ func openAIToAnthropic(body []byte, clientModel string) (out []byte, errMsg stri
 		Model   string `json:"model"`
 		Choices []struct {
 			Message struct {
-				Content   *string `json:"content"`
-				ToolCalls []struct {
+				Content          *string `json:"content"`
+				ReasoningContent *string `json:"reasoning_content"`
+				ToolCalls        []struct {
 					ID       string `json:"id"`
 					Type     string `json:"type"`
 					Function struct {
@@ -412,8 +414,14 @@ func openAIToAnthropic(body []byte, clientModel string) (out []byte, errMsg stri
 	if oaiResp.Choices != nil && len(oaiResp.Choices) > 0 {
 		msg := oaiResp.Choices[0].Message
 
+		text := ""
 		if msg.Content != nil && *msg.Content != "" {
-			content = append(content, map[string]any{"type": "text", "text": *msg.Content})
+			text = *msg.Content
+		} else if msg.ReasoningContent != nil && *msg.ReasoningContent != "" {
+			text = *msg.ReasoningContent
+		}
+		if text != "" {
+			content = append(content, map[string]any{"type": "text", "text": text})
 		}
 
 		for _, tc := range msg.ToolCalls {
@@ -509,7 +517,8 @@ func streamAnthropic(w http.ResponseWriter, body []byte, clientModel string) (wr
 		var chunk struct {
 			Choices []struct {
 				Delta struct {
-					Content   string `json:"content"`
+					Content          string `json:"content"`
+					ReasoningContent string `json:"reasoning_content"`
 					ToolCalls []struct {
 						Index    int    `json:"index"`
 						ID       string `json:"id"`
@@ -631,6 +640,30 @@ func streamAnthropic(w http.ResponseWriter, body []byte, clientModel string) (wr
 
 // --- Handlers ---
 
+// handleClassifier answers Claude Code's permission-classifier endpoint.
+// Claude Code POSTs a permission_request to {base}/v1/messages/classifier when a
+// tool needs approval; the gateway returns a decision. We always approve so the
+// session never blocks on an interactive prompt. The request body is ignored.
+func handleClassifier(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Access-Control-Allow-Origin", "*")
+	w.Header().Set("Content-Type", "application/json")
+	if r.Method == http.MethodOptions {
+		w.WriteHeader(http.StatusNoContent)
+		return
+	}
+	if r.Method != http.MethodPost {
+		writeAnthropicError(w, http.StatusMethodNotAllowed, "method_not_allowed", "only POST is supported")
+		return
+	}
+	json.NewEncoder(w).Encode(map[string]any{
+		"result": "decision",
+		"decision": map[string]any{
+			"allow":  true,
+			"reason": "auto-approved by proxy",
+		},
+	})
+}
+
 func (p *Pool) handleAnthropic(w http.ResponseWriter, r *http.Request, start time.Time) {
 	w.Header().Set("Access-Control-Allow-Origin", "*")
 	w.Header().Set("Access-Control-Allow-Headers", "*")
@@ -671,6 +704,12 @@ func (p *Pool) handleAnthropic(w http.ResponseWriter, r *http.Request, start tim
 	}
 
 	acclog.Printf("-> POST /v1/messages model=%s upstream=%s stream=%v bytes=%d", clientModel, upstreamModel, isStream, len(oaiBody))
+
+	// Route opencode/* models to zen endpoint
+	if strings.HasPrefix(upstreamModel, "opencode/") {
+		p.handleOpenCodeAnthropic(w, r, body, oaiBody, clientModel, upstreamModel, isStream, start)
+		return
+	}
 
 	target := nvidiaBase + "/chat/completions"
 	fwd := http.Header{
@@ -873,4 +912,110 @@ func estimateTokens(body []byte) int {
 		tokens = 10
 	}
 	return tokens
+}
+
+// handleOpenCodeAnthropic routes opencode/* models through the zen endpoint.
+func (p *Pool) handleOpenCodeAnthropic(w http.ResponseWriter, r *http.Request, origBody, oaiBody []byte, clientModel, upstreamModel string, isStream bool, start time.Time) {
+	zenModel := strings.TrimPrefix(upstreamModel, "opencode/")
+
+	var m map[string]any
+	if json.Unmarshal(oaiBody, &m) == nil {
+		m["model"] = zenModel
+		if b, err := json.Marshal(m); err == nil {
+			oaiBody = b
+		}
+	}
+
+	target := OpencodeBase + "/chat/completions"
+	req, err := http.NewRequest(r.Method, target, bytes.NewReader(oaiBody))
+	if err != nil {
+		writeAnthropicError(w, http.StatusInternalServerError, "api_error", err.Error())
+		return
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer public")
+	req.Header.Set("x-opencode-client", "desktop")
+	if s := r.Header.Get("x-session-id"); s != "" {
+		req.Header.Set("x-opencode-session", s)
+	} else {
+		req.Header.Set("x-opencode-session", "ses_"+randHex(20))
+	}
+	req.Header.Set("User-Agent", "opencode/1.18.25")
+	if isStream {
+		req.Header.Set("Accept", "text/event-stream")
+	} else {
+		req.Header.Set("Accept", "application/json")
+	}
+
+	cl := &http.Client{Timeout: 300 * time.Second}
+	resp, err := cl.Do(req)
+	if err != nil {
+		acclog.Printf("!! opencode zen error %s: %v", target, err)
+		writeAnthropicError(w, http.StatusBadGateway, "api_error", "opencode zen: "+err.Error())
+		return
+	}
+	defer resp.Body.Close()
+
+	elapsed := time.Since(start)
+
+	if resp.StatusCode != http.StatusOK {
+		rb, _ := io.ReadAll(resp.Body)
+		errMsg := extractErrMessage(string(rb))
+		acclog.Printf("!! opencode zen %d model=%s err=%q", resp.StatusCode, clientModel, errMsg)
+		writeAnthropicError(w, resp.StatusCode, "api_error", errMsg)
+		return
+	}
+
+	if isStream {
+		rb, _ := io.ReadAll(resp.Body)
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.Header().Set("Cache-Control", "no-cache")
+		w.Header().Set("Connection", "keep-alive")
+		w.WriteHeader(http.StatusOK)
+		written, promptT, compT := streamAnthropic(w, rb, clientModel)
+
+		logUsage(UsageRecord{
+			Ts:               time.Now().UTC().Format(time.RFC3339Nano),
+			Model:            clientModel,
+			KeyName:          "opencode",
+			Method:           "POST",
+			Path:             "/v1/messages",
+			StatusCode:       200,
+			DurationMs:       elapsed.Milliseconds(),
+			PromptTokens:     promptT,
+			CompletionTokens: compT,
+			TotalTokens:      promptT + compT,
+			Stream:           true,
+			ContentBytes:     int64(len(origBody)),
+		})
+		acclog.Printf("<- 200 POST /v1/messages %v %d bytes [opencode]", elapsed.Round(time.Millisecond), written)
+	} else {
+		rb, _ := io.ReadAll(resp.Body)
+		out, errMsg, _ := openAIToAnthropic(rb, clientModel)
+		if errMsg != "" {
+			writeAnthropicError(w, http.StatusInternalServerError, "api_error", errMsg)
+			return
+		}
+		prompT, compT, _ := respTokens(rb)
+
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		w.Write(out)
+
+		logUsage(UsageRecord{
+			Ts:               time.Now().UTC().Format(time.RFC3339Nano),
+			Model:            clientModel,
+			KeyName:          "opencode",
+			Method:           "POST",
+			Path:             "/v1/messages",
+			StatusCode:       200,
+			DurationMs:       elapsed.Milliseconds(),
+			PromptTokens:     prompT,
+			CompletionTokens: compT,
+			TotalTokens:      prompT + compT,
+			Stream:           false,
+			ContentBytes:     int64(len(origBody)),
+		})
+		acclog.Printf("<- 200 POST /v1/messages %v %d bytes [opencode]", elapsed.Round(time.Millisecond), len(out))
+	}
 }

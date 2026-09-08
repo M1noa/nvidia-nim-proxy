@@ -1,7 +1,11 @@
 package main
 
 import (
+	"encoding/json"
 	"math"
+	"net/http"
+	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 )
@@ -87,6 +91,77 @@ func TestClear429(t *testing.T) {
 	p.Clear429(k)
 	if k.Consec429 != 0 {
 		t.Fatalf("after clear Consec429 = %d, want 0", k.Consec429)
+	}
+}
+
+func TestPickSticky(t *testing.T) {
+	now := time.Now()
+	a := &Key{Name: "a", LastUsed: now.Add(-30 * time.Minute)}
+	b := &Key{Name: "b", LastUsed: now.Add(-30 * time.Minute)}
+	p := &Pool{keys: []*Key{a, b}, lastKey: make(map[string]string)}
+
+	// no sticky: weighted pick returns one of them
+	if k := p.PickSticky(nil, "m", ""); k == nil {
+		t.Fatal("no key picked")
+	}
+
+	// sticky set to a: always picks a
+	p.lastKey["m"] = "a"
+	for i := 0; i < 100; i++ {
+		if k := p.PickSticky(nil, "m", p.stickyKey("m")); k.Name != "a" {
+			t.Fatalf("sticky pick = %s, want a", k.Name)
+		}
+	}
+
+	// sticky key on cooldown: falls back to the other available key
+	b.CooldownUntil = now.Add(time.Minute)
+	p.lastKey["m"] = "b"
+	for i := 0; i < 100; i++ {
+		k := p.PickSticky(nil, "m", p.stickyKey("m"))
+		if k == nil {
+			t.Fatal("no fallback when sticky key is on cooldown")
+		}
+		if k.Name == "b" {
+			t.Fatal("picked on-cooldown sticky key b")
+		}
+	}
+
+	// all on cooldown: nil
+	b.CooldownUntil = now.Add(time.Minute)
+	a.CooldownUntil = now.Add(time.Minute)
+	if k := p.PickSticky(nil, "m", p.stickyKey("m")); k != nil {
+		t.Fatalf("expected nil when all keys on cooldown, got %s", k.Name)
+	}
+}
+
+func TestHandleClassifier(t *testing.T) {
+	// POST -> auto-approve JSON
+	req := httptest.NewRequest("POST", "/v1/messages/classifier", strings.NewReader(`{"type":"permission_request"}`))
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	handleClassifier(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200", rec.Code)
+	}
+	var resp struct {
+		Result   string `json:"result"`
+		Decision struct {
+			Allow bool `json:"allow"`
+		} `json:"decision"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("bad response JSON: %v", err)
+	}
+	if resp.Result != "decision" || !resp.Decision.Allow {
+		t.Fatalf("response = %s, want result=decision allow=true", rec.Body.String())
+	}
+
+	// GET -> 405
+	req = httptest.NewRequest("GET", "/v1/messages/classifier", nil)
+	rec = httptest.NewRecorder()
+	handleClassifier(rec, req)
+	if rec.Code != http.StatusMethodNotAllowed {
+		t.Fatalf("GET status = %d, want 405", rec.Code)
 	}
 }
 

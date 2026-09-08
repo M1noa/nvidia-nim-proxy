@@ -1,7 +1,8 @@
 [
   // Map claude-* model names to NIM models.
-  // Glob patterns, first match wins. Copy to claude_models.jsonc and edit.
-  {"pattern": "claude-sonnet-*", "model": "moonshotai/kimi-k3"},
-  {"pattern": "claude-haiku-*",  "model": "moonshotai/kimi-k3"},
-  {"pattern": "claude-*",       "model": "moonshotai/kimi-k3"}
+  // Glob patterns, first match wins.
+  {"pattern": "claude-opus-*",   "model": "moonshotai/kimi-k3"},
+  {"pattern": "claude-sonnet-*", "model": "deepseek-ai/deepseek-v4-flash-0731"},
+  {"pattern": "claude-haiku-*",  "model": "opencode/nemotron-3.5-lightning-free"},
+  {"pattern": "claude-*",        "model": "moonshotai/kimi-k3"}
 ]

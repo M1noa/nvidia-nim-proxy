@@ -19,8 +19,8 @@ import (
 )
 
 const (
-	nvidiaBase    = "https://integrate.api.nvidia.com/v1"
-	opencodeBase  = "https://opencode.ai/zen/v1"
+	nvidiaBase   = "https://integrate.api.nvidia.com/v1"
+	OpencodeBase = "https://opencode.ai/zen/v1"
 	cooldown429   = 1 * time.Minute
 	maxBackoff    = 16 * time.Minute
 	failWindow    = 50 * time.Minute
@@ -97,10 +97,13 @@ type Pool struct {
 	locks      ModelLock
 	sem        chan struct{}
 	concurrent atomic.Int64
+	// lastKey pins a model to the key that last served it, so a conversation
+	// stays on one key and NIM's per-key prompt cache stays warm.
+	lastKey map[string]string
 }
 
 func newPool(entries map[string]string) *Pool {
-	p := &Pool{start: time.Now()}
+	p := &Pool{start: time.Now(), lastKey: make(map[string]string)}
 	for name, k := range entries {
 		p.keys = append(p.keys, &Key{Name: name, Key: k})
 	}
@@ -141,10 +144,18 @@ func (p *Pool) Reload(entries map[string]string) (added, removed int) {
 }
 
 func (p *Pool) Pick(exclude map[string]bool, model string) *Key {
+	return p.PickSticky(exclude, model, "")
+}
+
+// PickSticky picks a key, preferring the last key that served model (sticky)
+// when it is still available, so prompt caches stay warm. Sticky keys only win
+// if usable; otherwise fall back to the normal weighted pick.
+func (p *Pool) PickSticky(exclude map[string]bool, model, sticky string) *Key {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	now := time.Now()
 	var avail []*Key
+	var stickyKey *Key
 	for _, k := range p.keys {
 		if exclude[k.Name] {
 			continue
@@ -156,9 +167,16 @@ func (p *Pool) Pick(exclude map[string]bool, model string) *Key {
 			continue
 		}
 		avail = append(avail, k)
+		if k.Name == sticky {
+			stickyKey = k
+		}
 	}
 	if len(avail) == 0 {
 		return nil
+	}
+	if stickyKey != nil {
+		stickyKey.LastUsed = now
+		return stickyKey
 	}
 	// weighted pick: favor idle keys, sink recently-failed/hot keys
 	total := 0.0
@@ -179,6 +197,20 @@ func (p *Pool) Pick(exclude map[string]bool, model string) *Key {
 	}
 	pick.LastUsed = now
 	return pick
+}
+
+// noteKey records that model was last served by key name, pinning stickiness.
+func (p *Pool) noteKey(model, name string) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.lastKey[model] = name
+}
+
+// stickyKey returns the name of the key that last served model, if any.
+func (p *Pool) stickyKey(model string) string {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	return p.lastKey[model]
 }
 
 // idleWeight scores a key 0..1: more idle -> higher, failed within window -> crushed.
@@ -244,8 +276,9 @@ func (p *Pool) callUpstream(method, target string, body []byte, fwd http.Header,
 	var rateLimited bool
 	var used *Key
 
+	sticky := p.stickyKey(model)
 	for attempt := 0; attempt < max(len(p.keys)*2+2, 4); attempt++ {
-		key := p.Pick(exclude, model)
+		key := p.PickSticky(exclude, model, sticky)
 		if key == nil {
 			if attempt < 3 {
 				time.Sleep(200 * time.Millisecond)
@@ -272,7 +305,7 @@ func (p *Pool) callUpstream(method, target string, body []byte, fwd http.Header,
 			return nil, fmt.Errorf("upstream: %w", err)
 		}
 
-		if resp.StatusCode == http.StatusTooManyRequests {
+		if resp.StatusCode == http.StatusTooManyRequests || resp.StatusCode == 529 {
 			rateLimited = true
 			p.rateLimit(key)
 			p.locks.lock(key.Name, model, modelLockout)
@@ -282,7 +315,7 @@ func (p *Pool) callUpstream(method, target string, body []byte, fwd http.Header,
 			if cd > maxBackoff {
 				cd = maxBackoff
 			}
-			acclog.Printf("!! 429 [%s] model=%s key-backoff=%v model-lockout=%v headers=%v", key.Name, model, cd, modelLockout, rh)
+			acclog.Printf("!! %d [%s] model=%s key-backoff=%v model-lockout=%v headers=%v", resp.StatusCode, key.Name, model, cd, modelLockout, rh)
 			exclude[key.Name] = true
 			if attempt > 0 {
 				retries++
@@ -307,6 +340,7 @@ func (p *Pool) callUpstream(method, target string, body []byte, fwd http.Header,
 		if attempt > 0 {
 			retries++
 		}
+		p.noteKey(model, used.Name)
 		return &upstreamResult{
 			StatusCode:  resp.StatusCode,
 			Header:      resp.Header.Clone(),
@@ -418,9 +452,9 @@ var ocInfo atomic.Pointer[OpencodeInfo]
 
 // refreshOpencodeModels pulls the free model list from opencode zen and caches it.
 func refreshOpencodeModels() {
-	info := &OpencodeInfo{Enabled: true, Base: opencodeBase}
+	info := &OpencodeInfo{Enabled: true, Base: OpencodeBase}
 	cl := &http.Client{Timeout: 10 * time.Second}
-	resp, err := cl.Get(opencodeBase + "/models")
+	resp, err := cl.Get(OpencodeBase + "/models")
 	if err == nil {
 		var oc struct {
 			Data []struct {
@@ -748,7 +782,7 @@ func (p *Pool) handleModels(w http.ResponseWriter, r *http.Request) {
 
 	// opencode zen free models (no auth) -> opencode/<id>
 	ocClient := &http.Client{Timeout: 10 * time.Second}
-	if ocResp, err := ocClient.Get(opencodeBase + "/models"); err == nil {
+	if ocResp, err := ocClient.Get(OpencodeBase + "/models"); err == nil {
 		var oc struct {
 			Data []struct {
 				ID string `json:"id"`
@@ -934,6 +968,12 @@ func (p *Pool) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		p.handleAnthropic(w, r, start)
 		return
 	}
+	// Permission classifier — Claude Code asks the gateway to classify tool-use
+	// permission requests; always approve so sessions never stall on a prompt.
+	if r.URL.Path == "/v1/messages/classifier" {
+		handleClassifier(w, r)
+		return
+	}
 
 	p.sem <- struct{}{}
 	p.concurrent.Add(1)
@@ -997,9 +1037,10 @@ func (p *Pool) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	var used *Key
 	var retries int
 	var rateLimited bool
+	sticky := p.stickyKey(model)
 
 	for attempt := 0; attempt < max(len(p.keys)*2+2, 4); attempt++ {
-		key := p.Pick(exclude, model)
+		key := p.PickSticky(exclude, model, sticky)
 		if key == nil {
 			if attempt < 3 {
 				time.Sleep(200 * time.Millisecond)
@@ -1033,7 +1074,7 @@ func (p *Pool) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 
-		if resp.StatusCode == http.StatusTooManyRequests {
+		if resp.StatusCode == http.StatusTooManyRequests || resp.StatusCode == 529 {
 			rateLimited = true
 			p.rateLimit(key)
 			p.locks.lock(key.Name, model, modelLockout)
@@ -1043,7 +1084,7 @@ func (p *Pool) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			if cd > maxBackoff {
 				cd = maxBackoff
 			}
-			acclog.Printf("!! 429 [%s] model=%s key-backoff=%v model-lockout=%v headers=%v", key.Name, model, cd, modelLockout, rh)
+			acclog.Printf("!! %d [%s] model=%s key-backoff=%v model-lockout=%v headers=%v", resp.StatusCode, key.Name, model, cd, modelLockout, rh)
 			exclude[key.Name] = true
 			if attempt > 0 {
 				retries++
@@ -1067,6 +1108,9 @@ func (p *Pool) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 		if attempt > 0 {
 			retries++
+		}
+		if resp.StatusCode == http.StatusOK {
+			p.noteKey(model, key.Name)
 		}
 		lastResp = &http.Response{
 			StatusCode: resp.StatusCode,
@@ -1207,7 +1251,7 @@ func (p *Pool) handleOpenCode(w http.ResponseWriter, r *http.Request, body []byt
 		}
 	}
 
-	target := opencodeBase + strings.TrimPrefix(r.URL.Path, "/v1")
+	target := OpencodeBase + strings.TrimPrefix(r.URL.Path, "/v1")
 	if r.URL.RawQuery != "" {
 		target += "?" + r.URL.RawQuery
 	}
@@ -1220,6 +1264,12 @@ func (p *Pool) handleOpenCode(w http.ResponseWriter, r *http.Request, body []byt
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Authorization", "Bearer public")
 	req.Header.Set("x-opencode-client", "desktop")
+	if s := r.Header.Get("x-session-id"); s != "" {
+		req.Header.Set("x-opencode-session", s)
+	} else {
+		req.Header.Set("x-opencode-session", "ses_"+randHex(20))
+	}
+	req.Header.Set("User-Agent", "opencode/1.18.25")
 	req.Header.Set("Accept", "text/event-stream")
 	for k, v := range r.Header {
 		switch strings.ToLower(k) {
