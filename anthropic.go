@@ -927,32 +927,48 @@ func (p *Pool) handleOpenCodeAnthropic(w http.ResponseWriter, r *http.Request, o
 	}
 
 	target := OpencodeBase + "/chat/completions"
-	req, err := http.NewRequest(r.Method, target, bytes.NewReader(oaiBody))
-	if err != nil {
-		writeAnthropicError(w, http.StatusInternalServerError, "api_error", err.Error())
-		return
-	}
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("Authorization", "Bearer public")
-	req.Header.Set("x-opencode-client", "desktop")
-	if s := r.Header.Get("x-session-id"); s != "" {
-		req.Header.Set("x-opencode-session", s)
-	} else {
-		req.Header.Set("x-opencode-session", "ses_"+randHex(20))
-	}
-	req.Header.Set("User-Agent", "opencode/1.18.25")
-	if isStream {
-		req.Header.Set("Accept", "text/event-stream")
-	} else {
-		req.Header.Set("Accept", "application/json")
-	}
-
 	cl := &http.Client{Timeout: 300 * time.Second}
-	resp, err := cl.Do(req)
-	if err != nil {
-		acclog.Printf("!! opencode zen error %s: %v", target, err)
-		writeAnthropicError(w, http.StatusBadGateway, "api_error", "opencode zen: "+err.Error())
-		return
+	var resp *http.Response
+
+	for zenRetries := 0; zenRetries < 5; zenRetries++ {
+		req, err := http.NewRequest(r.Method, target, bytes.NewReader(oaiBody))
+		if err != nil {
+			writeAnthropicError(w, http.StatusInternalServerError, "api_error", err.Error())
+			return
+		}
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("Authorization", "Bearer public")
+		req.Header.Set("x-opencode-client", "desktop")
+		if zenRetries == 0 {
+			if s := r.Header.Get("x-session-id"); s != "" {
+				req.Header.Set("x-opencode-session", s)
+			} else {
+				req.Header.Set("x-opencode-session", "ses_"+randHex(20))
+			}
+		} else {
+			req.Header.Set("x-opencode-session", "ses_"+randHex(20))
+			acclog.Printf("  opencode retry %d/4 rotating session", zenRetries)
+		}
+		req.Header.Set("User-Agent", "opencode/1.18.25")
+		if isStream {
+			req.Header.Set("Accept", "text/event-stream")
+		} else {
+			req.Header.Set("Accept", "application/json")
+		}
+
+		resp, err = cl.Do(req)
+		if err != nil {
+			acclog.Printf("!! opencode zen error %s: %v", target, err)
+			writeAnthropicError(w, http.StatusBadGateway, "api_error", "opencode zen: "+err.Error())
+			return
+		}
+
+		if resp.StatusCode == http.StatusTooManyRequests || resp.StatusCode == 529 {
+			resp.Body.Close()
+			time.Sleep(time.Duration(zenRetries+1) * time.Second)
+			continue
+		}
+		break
 	}
 	defer resp.Body.Close()
 

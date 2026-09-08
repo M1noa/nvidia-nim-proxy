@@ -1256,40 +1256,55 @@ func (p *Pool) handleOpenCode(w http.ResponseWriter, r *http.Request, body []byt
 		target += "?" + r.URL.RawQuery
 	}
 
-	req, err := http.NewRequest(r.Method, target, bytes.NewReader(body))
-	if err != nil {
-		http.Error(w, fmt.Sprintf(`{"error":"%s"}`, err), http.StatusInternalServerError)
-		return
-	}
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("Authorization", "Bearer public")
-	req.Header.Set("x-opencode-client", "desktop")
-	if s := r.Header.Get("x-session-id"); s != "" {
-		req.Header.Set("x-opencode-session", s)
-	} else {
-		req.Header.Set("x-opencode-session", "ses_"+randHex(20))
-	}
-	req.Header.Set("User-Agent", "opencode/1.18.25")
-	req.Header.Set("Accept", "text/event-stream")
-	for k, v := range r.Header {
-		switch strings.ToLower(k) {
-		case "authorization", "host", "content-type", "accept", "x-opencode-client":
-			continue
-		default:
-			req.Header[k] = v
-		}
-	}
-
 	cl := &http.Client{Timeout: 300 * time.Second}
-	resp, err := cl.Do(req)
-	if err != nil {
-		acclog.Printf("!! 502 opencode upstream-error %s: %v", target, err)
-		http.Error(w, fmt.Sprintf(`{"error":"upstream: %s"}`, err), http.StatusBadGateway)
-		return
-	}
-
+	var resp *http.Response
 	var prompT, compT, totalT int
 	var recErr string
+
+	for zenRetries := 0; zenRetries < 5; zenRetries++ {
+		req, err := http.NewRequest(r.Method, target, bytes.NewReader(body))
+		if err != nil {
+			http.Error(w, fmt.Sprintf(`{"error":"%s"}`, err), http.StatusInternalServerError)
+			return
+		}
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("Authorization", "Bearer public")
+		req.Header.Set("x-opencode-client", "desktop")
+		if zenRetries == 0 {
+			if s := r.Header.Get("x-session-id"); s != "" {
+				req.Header.Set("x-opencode-session", s)
+			} else {
+				req.Header.Set("x-opencode-session", "ses_"+randHex(20))
+			}
+		} else {
+			req.Header.Set("x-opencode-session", "ses_"+randHex(20))
+			acclog.Printf("  opencode retry %d/4 rotating session", zenRetries)
+		}
+		req.Header.Set("User-Agent", "opencode/1.18.25")
+		req.Header.Set("Accept", "text/event-stream")
+		for k, v := range r.Header {
+			switch strings.ToLower(k) {
+			case "authorization", "host", "content-type", "accept", "x-opencode-client":
+				continue
+			default:
+				req.Header[k] = v
+			}
+		}
+
+		resp, err = cl.Do(req)
+		if err != nil {
+			acclog.Printf("!! 502 opencode upstream-error %s: %v", target, err)
+			http.Error(w, fmt.Sprintf(`{"error":"upstream: %s"}`, err), http.StatusBadGateway)
+			return
+		}
+
+		if resp.StatusCode == http.StatusTooManyRequests || resp.StatusCode == 529 {
+			resp.Body.Close()
+			time.Sleep(time.Duration(zenRetries+1) * time.Second)
+			continue
+		}
+		break
+	}
 
 	if isStream && resp.StatusCode == http.StatusOK {
 		// true streaming — pipe through, no token capture
