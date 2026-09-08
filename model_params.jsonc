@@ -84,5 +84,61 @@
       "min_p": 0.01,
       "reasoning_effort": "max"
     }
+  },
+  {
+    "pattern": "*big-pickle*",
+    "params": {
+      "context_length": 131072,
+      "description": "Big Pickle - free stealth model, limited time offer",
+      "temperature": 1.0,
+      "top_p": 0.95
+    }
+  },
+  {
+    "pattern": "*muse-spark*",
+    "params": {
+      "context_length": 131072,
+      "description": "Muse Spark - Meta AI coding model",
+      "temperature": 1.0,
+      "top_p": 0.95
+    }
+  },
+  {
+    "pattern": "*mimo-v2.5-free*",
+    "params": {
+      "context_length": 131072,
+      "description": "MiMo-V2.5 Free - free limited-time model",
+      "temperature": 1.0,
+      "top_p": 0.95
+    }
+  },
+  {
+    "pattern": "*ling-3.0-flash-fin-free*",
+    "params": {
+      "context_length": 131072,
+      "description": "Ling 3.0 Flash Fin Free - free limited-time model",
+      "temperature": 1.0,
+      "top_p": 0.95
+    }
+  },
+  {
+    "pattern": "*nemotron-3-ultra-free*",
+    "params": {
+      "context_length": 1048576,
+      "description": "Nemotron 3 Ultra Free - free NVIDIA trial model",
+      "temperature": 1.0,
+      "top_p": 0.95,
+      "min_p": 0.01,
+      "reasoning_effort": "max"
+    }
+  },
+  {
+    "pattern": "*nemotron-3.5-lightning-free*",
+    "params": {
+      "context_length": 1000000,
+      "description": "Nemotron 3.5 Lightning Free - free NVIDIA trial model",
+      "temperature": 1.0,
+      "top_p": 0.95
+    }
   }
 ]

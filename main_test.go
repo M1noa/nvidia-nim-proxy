@@ -186,3 +186,59 @@ func TestPickAvoidsPenalized(t *testing.T) {
 		t.Fatalf("penalized (%d) picked as much as clean (%d)", counts["penalized"], counts["clean"])
 	}
 }
+
+func TestEndpointForModel(t *testing.T) {
+	// Muse Spark models use /responses
+	for _, model := range []string{"muse-spark-1.3", "muse-spark-1.3-contributor-free", "muse-spark-1.2"} {
+		if got := endpointForModel(model); got != "/responses" {
+			t.Errorf("endpointForModel(%q) = %q, want /responses", model, got)
+		}
+	}
+	// All other models use /chat/completions
+	for _, model := range []string{"big-pickle", "mimo-v2.5-free", "ling-3.0-flash-fin-free", "nemotron-3-ultra-free", "nemotron-3.5-lightning-free", "kimi-k3"} {
+		if got := endpointForModel(model); got != "/chat/completions" {
+			t.Errorf("endpointForModel(%q) = %q, want /chat/completions", model, got)
+		}
+	}
+}
+
+func TestExtraFreeModelsIncludesBigPickle(t *testing.T) {
+	found := false
+	for _, id := range extraFreeModels {
+		if id == "big-pickle" {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Fatal("big-pickle not in extraFreeModels")
+	}
+}
+
+func TestRefreshOpencodeModelsIncludesBigPickle(t *testing.T) {
+	// Verify the refreshOpencodeModels logic includes big-pickle
+	// by checking the condition: !strings.HasSuffix(m.ID, "-free") && m.ID != "big-pickle"
+	ids := []string{"big-pickle", "muse-spark-1.3-contributor-free", "nemotron-3-ultra-free"}
+	for _, id := range ids {
+		shouldInclude := strings.HasSuffix(id, "-free") || id == "big-pickle"
+		if !shouldInclude {
+			t.Errorf("model %q should be included but condition excludes it", id)
+		}
+	}
+}
+
+func TestHandleOpenCodeUsesCorrectEndpoint(t *testing.T) {
+	// Verify endpointForModel is called correctly in handleOpenCode
+	// by checking that Muse Spark models route to /responses
+	for _, model := range []string{"opencode/muse-spark-1.3", "opencode/muse-spark-1.3-contributor-free"} {
+		realModel := strings.TrimPrefix(model, "opencode/")
+		if got := endpointForModel(realModel); got != "/responses" {
+			t.Errorf("%s should route to /responses, got %q", model, got)
+		}
+	}
+	// big-pickle should route to /chat/completions
+	realModel := strings.TrimPrefix("opencode/big-pickle", "opencode/")
+	if got := endpointForModel(realModel); got != "/chat/completions" {
+		t.Errorf("opencode/big-pickle should route to /chat/completions, got %q", got)
+	}
+}

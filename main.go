@@ -463,9 +463,10 @@ func refreshOpencodeModels() {
 		}
 		if json.NewDecoder(resp.Body).Decode(&oc) == nil {
 			for _, m := range oc.Data {
-				if strings.HasSuffix(m.ID, "-free") {
-					info.Models = append(info.Models, "opencode/"+m.ID)
+				if !strings.HasSuffix(m.ID, "-free") && m.ID != "big-pickle" {
+					continue
 				}
+				info.Models = append(info.Models, "opencode/"+m.ID)
 			}
 		}
 		resp.Body.Close()
@@ -668,6 +669,18 @@ type openRouterModel struct {
 	PerRequestLimits any               `json:"per_request_limits"`
 }
 
+// hard-coded free models that don't end in "-free"
+var extraFreeModels = []string{"big-pickle"}
+
+// endpointForModel returns the Zen API endpoint path for a model.
+// Muse Spark models use /responses; all others use /chat/completions.
+func endpointForModel(model string) string {
+	if strings.HasPrefix(model, "muse-spark") {
+		return "/responses"
+	}
+	return "/chat/completions"
+}
+
 func (p *Pool) handleModels(w http.ResponseWriter, r *http.Request) {
 	var key *Key
 	p.mu.RLock()
@@ -823,6 +836,40 @@ func (p *Pool) handleModels(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 		ocResp.Body.Close()
+	}
+
+	// hard-coded extra free models (don't end in "-free", not in /models list)
+	ocSeen := make(map[string]bool)
+	for _, id := range extraFreeModels {
+		if ocSeen[id] {
+			continue
+		}
+		ocSeen[id] = true
+		cl := 131072
+		desc := ""
+		if e := matchesModelParams(id); e != nil {
+			if v, ok := e.params["context_length"]; ok {
+				switch n := v.(type) {
+				case float64:
+					cl = int(n)
+				case int:
+					cl = n
+				}
+			}
+			if v, ok := e.params["description"]; ok {
+				desc, _ = v.(string)
+			}
+		}
+		ocID := "opencode/" + id
+		out.Data = append(out.Data, openRouterModel{
+			ID:            ocID,
+			Name:          modelDisplayName(ocID),
+			Description:   desc,
+			ContextLength: cl,
+			Pricing:       map[string]string{"prompt": "0", "completion": "0", "request": "0"},
+			Architecture:  map[string]any{"modality": "text->text", "tokenizer": "Other", "instruct_type": nil},
+			TopProvider:   map[string]any{"context_length": cl, "max_completion_tokens": nil, "is_moderated": false},
+		})
 	}
 
 	w.Header().Set("Content-Type", "application/json")
@@ -1241,6 +1288,7 @@ func (p *Pool) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 // handleOpenCode routes opencode/<model> requests to the opencode zen API
 // (OpenAI-compatible, no auth for -free models).
+// Muse Spark models use /responses endpoint; all others use /chat/completions.
 func (p *Pool) handleOpenCode(w http.ResponseWriter, r *http.Request, body []byte, model string, isStream bool, start time.Time) {
 	realModel := strings.TrimPrefix(model, "opencode/")
 	var m map[string]any
@@ -1251,7 +1299,11 @@ func (p *Pool) handleOpenCode(w http.ResponseWriter, r *http.Request, body []byt
 		}
 	}
 
-	target := OpencodeBase + strings.TrimPrefix(r.URL.Path, "/v1")
+	endpoint := endpointForModel(realModel)
+	target := OpencodeBase + endpoint
+	if !strings.HasPrefix(r.URL.Path, "/v1/chat/completions") && !strings.HasPrefix(r.URL.Path, "/v1/responses") {
+		target += strings.TrimPrefix(r.URL.Path, "/v1")
+	}
 	if r.URL.RawQuery != "" {
 		target += "?" + r.URL.RawQuery
 	}
@@ -1261,7 +1313,25 @@ func (p *Pool) handleOpenCode(w http.ResponseWriter, r *http.Request, body []byt
 	var prompT, compT, totalT int
 	var recErr string
 
+	sessionID := ""
+	if s := r.Header.Get("x-session-id"); s != "" {
+		sessionID = s
+	} else {
+		sessionID = "ses_" + randHex(20)
+	}
+	var usedProxy string
 	for zenRetries := 0; zenRetries < 5; zenRetries++ {
+		proxy := ""
+		if zenRetries == 0 {
+			cl = &http.Client{Timeout: 300 * time.Second}
+		} else {
+			proxy = pickFastProxy()
+			if proxy == "" {
+				continue
+			}
+			cl = zenClient(proxy)
+			usedProxy = proxy
+		}
 		req, err := http.NewRequest(r.Method, target, bytes.NewReader(body))
 		if err != nil {
 			http.Error(w, fmt.Sprintf(`{"error":"%s"}`, err), http.StatusInternalServerError)
@@ -1270,15 +1340,9 @@ func (p *Pool) handleOpenCode(w http.ResponseWriter, r *http.Request, body []byt
 		req.Header.Set("Content-Type", "application/json")
 		req.Header.Set("Authorization", "Bearer public")
 		req.Header.Set("x-opencode-client", "desktop")
-		if zenRetries == 0 {
-			if s := r.Header.Get("x-session-id"); s != "" {
-				req.Header.Set("x-opencode-session", s)
-			} else {
-				req.Header.Set("x-opencode-session", "ses_"+randHex(20))
-			}
-		} else {
-			req.Header.Set("x-opencode-session", "ses_"+randHex(20))
-			acclog.Printf("  opencode retry %d/4 rotating session", zenRetries)
+		req.Header.Set("x-opencode-session", sessionID)
+		if zenRetries > 0 {
+			acclog.Printf("  opencode retry %d/4 session=%s proxy=%s", zenRetries, sessionID, proxy)
 		}
 		req.Header.Set("User-Agent", "opencode/1.18.25")
 		req.Header.Set("Accept", "text/event-stream")
@@ -1304,6 +1368,10 @@ func (p *Pool) handleOpenCode(w http.ResponseWriter, r *http.Request, body []byt
 			continue
 		}
 		break
+	}
+
+	if usedProxy != "" {
+		acclog.Printf("  opencode session=%s proxy=%s", sessionID, usedProxy)
 	}
 
 	if isStream && resp.StatusCode == http.StatusOK {
@@ -1447,6 +1515,7 @@ func serverMain() {
 	loadModelParams("model_params.jsonc")
 	loadClaudeModels("claude_models.jsonc")
 	refreshOpencodeModels()
+	go watchZenProxies()
 
 	kf := "keys.jsonc"
 	if e := os.Getenv("KEY_FILE"); e != "" {

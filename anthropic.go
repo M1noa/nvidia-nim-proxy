@@ -930,7 +930,24 @@ func (p *Pool) handleOpenCodeAnthropic(w http.ResponseWriter, r *http.Request, o
 	cl := &http.Client{Timeout: 300 * time.Second}
 	var resp *http.Response
 
+	sessionID := ""
+	if s := r.Header.Get("x-session-id"); s != "" {
+		sessionID = s
+	} else {
+		sessionID = "ses_" + randHex(20)
+	}
+
 	for zenRetries := 0; zenRetries < 5; zenRetries++ {
+		proxy := ""
+		if zenRetries == 0 {
+			cl = &http.Client{Timeout: 300 * time.Second}
+		} else {
+			proxy = pickFastProxy()
+			if proxy == "" {
+				continue
+			}
+			cl = zenClient(proxy)
+		}
 		req, err := http.NewRequest(r.Method, target, bytes.NewReader(oaiBody))
 		if err != nil {
 			writeAnthropicError(w, http.StatusInternalServerError, "api_error", err.Error())
@@ -939,15 +956,9 @@ func (p *Pool) handleOpenCodeAnthropic(w http.ResponseWriter, r *http.Request, o
 		req.Header.Set("Content-Type", "application/json")
 		req.Header.Set("Authorization", "Bearer public")
 		req.Header.Set("x-opencode-client", "desktop")
-		if zenRetries == 0 {
-			if s := r.Header.Get("x-session-id"); s != "" {
-				req.Header.Set("x-opencode-session", s)
-			} else {
-				req.Header.Set("x-opencode-session", "ses_"+randHex(20))
-			}
-		} else {
-			req.Header.Set("x-opencode-session", "ses_"+randHex(20))
-			acclog.Printf("  opencode retry %d/4 rotating session", zenRetries)
+		req.Header.Set("x-opencode-session", sessionID)
+		if zenRetries > 0 {
+			acclog.Printf("  opencode retry %d/4 session=%s proxy=%s", zenRetries, sessionID, proxy)
 		}
 		req.Header.Set("User-Agent", "opencode/1.18.25")
 		if isStream {
