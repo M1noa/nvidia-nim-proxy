@@ -947,6 +947,7 @@ func (p *Pool) handleOpenCodeAnthropic(w http.ResponseWriter, r *http.Request, o
 				continue
 			}
 			cl = zenClient(proxy)
+			sessionID = "ses_" + randHex(20)
 		}
 		req, err := http.NewRequest(r.Method, target, bytes.NewReader(oaiBody))
 		if err != nil {

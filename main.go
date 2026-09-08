@@ -1331,6 +1331,7 @@ func (p *Pool) handleOpenCode(w http.ResponseWriter, r *http.Request, body []byt
 			}
 			cl = zenClient(proxy)
 			usedProxy = proxy
+			sessionID = "ses_" + randHex(20)
 		}
 		req, err := http.NewRequest(r.Method, target, bytes.NewReader(body))
 		if err != nil {
