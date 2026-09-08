@@ -12,7 +12,7 @@ import (
 	"time"
 )
 
-const proxyListURL = "https://proxies.minoa.cat/list"
+const proxyListURL = "https://proxies.minoa.cat/list?format=json&sort=response&limit=0&country=us&response_max=120&ip_type=isp&ip_type=education_research&ip_type=government_admin"
 
 var (
 	zenProxiesMu sync.RWMutex
@@ -63,7 +63,7 @@ func refreshZenProxies() {
 		if e.Reliability < 1.0 || e.Quality < 1.0 {
 			continue
 		}
-		if e.ResponseTimeMs > 100 {
+		if e.ResponseTimeMs > 120 {
 			continue
 		}
 		fast = append(fast, e)
