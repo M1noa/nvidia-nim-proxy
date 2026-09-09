@@ -681,6 +681,287 @@ func endpointForModel(model string) string {
 	return "/chat/completions"
 }
 
+// convertToResponses rewrites a chat.completions body into the /responses shape.
+func convertToResponses(m map[string]any) {
+	if msgs, ok := m["messages"].([]any); ok {
+		input := make([]any, 0, len(msgs))
+		var pending []any
+		openCalls := 0
+		for _, ms := range msgs {
+			mm, ok := ms.(map[string]any)
+			if !ok {
+				continue
+			}
+			role, _ := mm["role"].(string)
+			switch role {
+			case "tool":
+				out, _ := mm["content"].(string)
+				cid, _ := mm["tool_call_id"].(string)
+				input = append(input, map[string]any{
+					"type":    "function_call_output",
+					"call_id": cid,
+					"output":  out,
+				})
+				openCalls--
+				if openCalls <= 0 {
+					openCalls = 0
+					input = append(input, pending...)
+					pending = nil
+				}
+			case "assistant":
+				tc, hasTools := mm["tool_calls"].([]any)
+				if hasTools {
+					if c, ok := mm["content"].(string); ok && c != "" {
+						input = append(input, map[string]any{"role": "assistant", "content": c})
+					}
+					for _, t := range tc {
+						tm, ok := t.(map[string]any)
+						if !ok {
+							continue
+						}
+						fn, _ := tm["function"].(map[string]any)
+						name, _ := fn["name"].(string)
+						if len(name) > 64 {
+							name = name[:64]
+						}
+						args, _ := fn["arguments"].(string)
+						input = append(input, map[string]any{
+							"type":      "function_call",
+							"call_id":   tm["id"],
+							"name":      name,
+							"arguments": args,
+						})
+						openCalls++
+					}
+				} else {
+					delete(mm, "name")
+					if openCalls > 0 {
+						pending = append(pending, mm)
+					} else {
+						input = append(input, mm)
+					}
+				}
+			default:
+				delete(mm, "name")
+				if openCalls > 0 {
+					pending = append(pending, mm)
+				} else {
+					input = append(input, mm)
+				}
+			}
+		}
+		m["input"] = input
+		delete(m, "messages")
+	}
+	if mt, ok := m["max_tokens"]; ok {
+		m["max_output_tokens"] = mt
+		delete(m, "max_tokens")
+	}
+	if re, ok := m["reasoning_effort"].(string); ok {
+		m["reasoning"] = map[string]any{"effort": re}
+		delete(m, "reasoning_effort")
+	}
+	if tools, ok := m["tools"].([]any); ok {
+		for _, t := range tools {
+			tm, ok := t.(map[string]any)
+			if !ok {
+				continue
+			}
+			if fn, ok := tm["function"].(map[string]any); ok {
+				if name, ok := fn["name"].(string); ok {
+					if len(name) > 64 {
+						name = name[:64]
+					}
+					tm["name"] = name
+				}
+				if desc, ok := fn["description"]; ok {
+					tm["description"] = desc
+				}
+				if params, ok := fn["parameters"]; ok {
+					tm["parameters"] = params
+				}
+				delete(tm, "function")
+			}
+		}
+	}
+}
+
+// responsesToChat converts an OpenAI /responses body to /chat/completions shape.
+func responsesToChat(rb []byte) []byte {
+	var r struct {
+		ID      string `json:"id"`
+		Created int64  `json:"created_at"`
+		Model   string `json:"model"`
+		Output  []struct {
+			Type    string `json:"type"`
+			Role    string `json:"role"`
+			Content []struct {
+				Type string `json:"type"`
+				Text string `json:"text"`
+			} `json:"content"`
+			CallID    string `json:"call_id"`
+			Name      string `json:"name"`
+			Arguments string `json:"arguments"`
+		} `json:"output"`
+		Usage struct {
+			InputTokens  int `json:"input_tokens"`
+			OutputTokens int `json:"output_tokens"`
+			TotalTokens  int `json:"total_tokens"`
+		} `json:"usage"`
+	}
+	if err := json.Unmarshal(rb, &r); err != nil {
+		return rb
+	}
+	var text strings.Builder
+	var toolCalls []map[string]any
+	for _, item := range r.Output {
+		switch item.Type {
+		case "message":
+			for _, c := range item.Content {
+				if c.Type == "output_text" {
+					text.WriteString(c.Text)
+				}
+			}
+		case "function_call":
+			toolCalls = append(toolCalls, map[string]any{
+				"id":   item.CallID,
+				"type": "function",
+				"function": map[string]any{
+					"name":      item.Name,
+					"arguments": item.Arguments,
+				},
+			})
+		}
+	}
+	msg := map[string]any{"role": "assistant", "content": text.String()}
+	finish := "stop"
+	if len(toolCalls) > 0 {
+		msg["tool_calls"] = toolCalls
+		finish = "tool_calls"
+	}
+	out := map[string]any{
+		"id":      r.ID,
+		"object":  "chat.completion",
+		"created": r.Created,
+		"model":   r.Model,
+		"choices": []map[string]any{{
+			"index":         0,
+			"message":       msg,
+			"finish_reason": finish,
+		}},
+		"usage": map[string]any{
+			"prompt_tokens":     r.Usage.InputTokens,
+			"completion_tokens": r.Usage.OutputTokens,
+			"total_tokens":      r.Usage.TotalTokens,
+		},
+	}
+	if b, err := json.Marshal(out); err == nil {
+		return b
+	}
+	return rb
+}
+
+// streamResponsesToChat converts a Responses API SSE stream to chat/completions SSE.
+func streamResponsesToChat(w http.ResponseWriter, body []byte) (written int64, promptT, compT int) {
+	fl, _ := w.(http.Flusher)
+
+	lines := strings.Split(string(body), "\n")
+	for _, line := range lines {
+		line = strings.TrimSpace(line)
+		if strings.HasPrefix(line, "event: ") || line == "" {
+			continue
+		}
+		if !strings.HasPrefix(line, "data: ") {
+			continue
+		}
+		data := strings.TrimPrefix(line, "data: ")
+		if data == "[DONE]" {
+			n, _ := w.Write([]byte("data: [DONE]\n\n"))
+			written += int64(n)
+			if fl != nil {
+				fl.Flush()
+			}
+			return
+		}
+
+		var evt struct {
+			Type  string `json:"type"`
+			Delta string `json:"delta"`
+			Item  *struct {
+				Type      string `json:"type"`
+				CallID    string `json:"call_id"`
+				Name      string `json:"name"`
+				Arguments string `json:"arguments"`
+			} `json:"item"`
+			Response *struct {
+				Usage *struct {
+					InputTokens  int `json:"input_tokens"`
+					OutputTokens int `json:"output_tokens"`
+				} `json:"usage"`
+			} `json:"response"`
+		}
+		if err := json.Unmarshal([]byte(data), &evt); err != nil {
+			continue
+		}
+
+		switch evt.Type {
+		case "response.output_text.delta":
+			if evt.Delta != "" {
+				chunk := fmt.Sprintf(`{"choices":[{"index":0,"delta":{"content":%s},"finish_reason":null}],"usage":null}`, jsonStr(evt.Delta))
+				n, _ := fmt.Fprintf(w, "data: %s\n\n", chunk)
+				written += int64(n)
+				if fl != nil {
+					fl.Flush()
+				}
+			}
+		case "response.output_item.added":
+			if evt.Item != nil && evt.Item.Type == "function_call" {
+				tid := evt.Item.CallID
+				if tid == "" {
+					tid = "toolu_" + randHex(24)
+				}
+				chunk := fmt.Sprintf(`{"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":%s,"type":"function","function":{"name":%s,"arguments":""}}]},"finish_reason":null}],"usage":null}`, jsonStr(tid), jsonStr(evt.Item.Name))
+				n, _ := fmt.Fprintf(w, "data: %s\n\n", chunk)
+				written += int64(n)
+				if fl != nil {
+					fl.Flush()
+				}
+			}
+		case "response.function_call_arguments.delta":
+			if evt.Delta != "" {
+				chunk := fmt.Sprintf(`{"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"arguments":%s}}]},"finish_reason":null}],"usage":null}`, jsonStr(evt.Delta))
+				n, _ := fmt.Fprintf(w, "data: %s\n\n", chunk)
+				written += int64(n)
+				if fl != nil {
+					fl.Flush()
+				}
+			}
+		case "response.completed":
+			if evt.Response != nil && evt.Response.Usage != nil {
+				promptT = evt.Response.Usage.InputTokens
+				compT = evt.Response.Usage.OutputTokens
+				totalT := promptT + compT
+				chunk := fmt.Sprintf(`{"choices":[],"usage":{"prompt_tokens":%d,"completion_tokens":%d,"total_tokens":%d}}`, promptT, compT, totalT)
+				n, _ := fmt.Fprintf(w, "data: %s\n\n", chunk)
+				written += int64(n)
+			}
+			n, _ := w.Write([]byte("data: [DONE]\n\n"))
+			written += int64(n)
+			if fl != nil {
+				fl.Flush()
+			}
+			return
+		}
+	}
+	// stream ended without response.completed
+	n, _ := w.Write([]byte("data: [DONE]\n\n"))
+	written += int64(n)
+	if fl != nil {
+		fl.Flush()
+	}
+	return
+}
+
 func (p *Pool) handleModels(w http.ResponseWriter, r *http.Request) {
 	var key *Key
 	p.mu.RLock()
@@ -1294,6 +1575,10 @@ func (p *Pool) handleOpenCode(w http.ResponseWriter, r *http.Request, body []byt
 	var m map[string]any
 	if json.Unmarshal(body, &m) == nil {
 		m["model"] = realModel
+		stripCacheFields(m)
+		if endpointForModel(realModel) == "/responses" {
+			convertToResponses(m)
+		}
 		if b, err := json.Marshal(m); err == nil {
 			body = b
 		}
@@ -1358,7 +1643,11 @@ func (p *Pool) handleOpenCode(w http.ResponseWriter, r *http.Request, body []byt
 
 		resp, err = cl.Do(req)
 		if err != nil {
-			acclog.Printf("!! 502 opencode upstream-error %s: %v", target, err)
+			acclog.Printf("!! opencode zen error (retry %d/4) %s: %v", zenRetries, target, err)
+			if zenRetries < 4 {
+				time.Sleep(time.Duration(zenRetries+1) * time.Second)
+				continue
+			}
 			http.Error(w, fmt.Sprintf(`{"error":"upstream: %s"}`, err), http.StatusBadGateway)
 			return
 		}
@@ -1380,6 +1669,9 @@ func (p *Pool) handleOpenCode(w http.ResponseWriter, r *http.Request, body []byt
 	} else {
 		rb, _ := io.ReadAll(resp.Body)
 		resp.Body.Close()
+		if endpoint == "/responses" && resp.StatusCode == http.StatusOK {
+			rb = responsesToChat(rb)
+		}
 		resp.Body = io.NopCloser(bytes.NewReader(rb))
 		if resp.StatusCode != http.StatusOK {
 			recErr = strings.TrimSpace(string(rb))
@@ -1415,7 +1707,11 @@ func (p *Pool) handleOpenCode(w http.ResponseWriter, r *http.Request, body []byt
 
 	var written int64
 	if isStream && resp.StatusCode == http.StatusOK {
-		if fl, ok := w.(http.Flusher); ok {
+		if endpoint == "/responses" {
+			rb, _ := io.ReadAll(resp.Body)
+			resp.Body.Close()
+			written, prompT, compT = streamResponsesToChat(w, rb)
+		} else if fl, ok := w.(http.Flusher); ok {
 			buf := make([]byte, 4096)
 			for {
 				n, err := resp.Body.Read(buf)
@@ -1440,6 +1736,28 @@ func (p *Pool) handleOpenCode(w http.ResponseWriter, r *http.Request, body []byt
 
 func contains(s, substr string) bool {
 	return strings.Contains(strings.ToLower(s), strings.ToLower(substr))
+}
+
+// stripCacheFields removes anthropic cache fields recursively so zen never
+// sees prompt_cache_key/cache_control, which NV/NIM rejects as unrecognized.
+func stripCacheFields(v any) any {
+	switch t := v.(type) {
+	case map[string]any:
+		for k := range t {
+			if k == "prompt_cache_key" || k == "cache_control" {
+				delete(t, k)
+				continue
+			}
+			t[k] = stripCacheFields(t[k])
+		}
+		return t
+	case []any:
+		for i, e := range t {
+			t[i] = stripCacheFields(e)
+		}
+		return t
+	}
+	return v
 }
 
 func loadKeys(raw []byte) (map[string]string, error) {

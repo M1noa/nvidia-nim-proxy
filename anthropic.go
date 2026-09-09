@@ -638,6 +638,153 @@ func streamAnthropic(w http.ResponseWriter, body []byte, clientModel string) (wr
 	return
 }
 
+// streamResponses converts an OpenAI /responses SSE stream to Anthropic messages SSE.
+func streamResponses(w http.ResponseWriter, body []byte, clientModel string) (written int64, promptT, compT int) {
+	fl, _ := w.(http.Flusher)
+
+	msgID := "msg_" + randHex(24)
+	preamble := fmt.Sprintf(`{"type":"message_start","message":{"id":"%s","type":"message","role":"assistant","model":"%s","content":[],"stop_reason":null,"stop_sequence":null,"usage":{"input_tokens":0,"cache_creation_input_tokens":0,"cache_read_input_tokens":0,"output_tokens":0}}}`, msgID, clientModel)
+	written += writeSSE(w, "message_start", preamble)
+	written += writeSSE(w, "ping", `{"type":"ping"}`)
+	if fl != nil {
+		fl.Flush()
+	}
+
+	blockIdx := 0
+	textIdx := -1
+	textOpen := false
+	toolIdx := map[string]int{}
+	hasToolUse := false
+	hasSentStopReason := false
+
+	openText := func() {
+		if textOpen {
+			return
+		}
+		textIdx = blockIdx
+		blockIdx++
+		textOpen = true
+		written += writeSSE(w, "content_block_start", fmt.Sprintf(`{"type":"content_block_start","index":%d,"content_block":{"type":"text","text":""}}`, textIdx))
+	}
+	closeText := func() {
+		if !textOpen {
+			return
+		}
+		textOpen = false
+		written += writeSSE(w, "content_block_stop", fmt.Sprintf(`{"type":"content_block_stop","index":%d}`, textIdx))
+	}
+	openTool := func(id, callID, name string) {
+		if _, ok := toolIdx[id]; ok {
+			return
+		}
+		toolIdx[id] = blockIdx
+		blockIdx++
+		hasToolUse = true
+		written += writeSSE(w, "content_block_start", fmt.Sprintf(`{"type":"content_block_start","index":%d,"content_block":{"type":"tool_use","id":%s,"name":%s,"input":{}}}`, toolIdx[id], jsonStr(callID), jsonStr(name)))
+	}
+	closeTool := func(id string) {
+		if _, ok := toolIdx[id]; !ok {
+			return
+		}
+		written += writeSSE(w, "content_block_stop", fmt.Sprintf(`{"type":"content_block_stop","index":%d}`, toolIdx[id]))
+		delete(toolIdx, id)
+	}
+	finish := func() {
+		if hasSentStopReason {
+			return
+		}
+		hasSentStopReason = true
+		closeText()
+		for id, idx := range toolIdx {
+			written += writeSSE(w, "content_block_stop", fmt.Sprintf(`{"type":"content_block_stop","index":%d}`, idx))
+			delete(toolIdx, id)
+		}
+		stopReason := "end_turn"
+		if hasToolUse {
+			stopReason = "tool_use"
+		}
+		written += writeSSE(w, "message_delta", fmt.Sprintf(`{"type":"message_delta","delta":{"stop_reason":%s,"stop_sequence":null},"usage":{"output_tokens":%d}}`, jsonStr(stopReason), compT))
+		written += writeSSE(w, "message_stop", `{"type":"message_stop"}`)
+		n, _ := w.Write([]byte("data: [DONE]\n\n"))
+		written += int64(n)
+		if fl != nil {
+			fl.Flush()
+		}
+	}
+
+	lines := strings.Split(string(body), "\n")
+	for _, line := range lines {
+		line = strings.TrimSpace(line)
+		if !strings.HasPrefix(line, "data: ") {
+			continue
+		}
+		data := strings.TrimPrefix(line, "data: ")
+		if data == "[DONE]" {
+			break
+		}
+
+		var evt struct {
+			Type      string `json:"type"`
+			Delta     string `json:"delta"`
+			Arguments string `json:"arguments"`
+			ItemID    string `json:"item_id"`
+			Item      *struct {
+				ID        string `json:"id"`
+				Type      string `json:"type"`
+				CallID    string `json:"call_id"`
+				Name      string `json:"name"`
+				Arguments string `json:"arguments"`
+			} `json:"item"`
+			Response *struct {
+				Usage *struct {
+					InputTokens  int `json:"input_tokens"`
+					OutputTokens int `json:"output_tokens"`
+					TotalTokens  int `json:"total_tokens"`
+				} `json:"usage"`
+			} `json:"response"`
+		}
+		if err := json.Unmarshal([]byte(data), &evt); err != nil {
+			continue
+		}
+
+		switch evt.Type {
+		case "response.output_item.added":
+			if evt.Item != nil && evt.Item.Type == "function_call" {
+				id := evt.ItemID
+				if id == "" {
+					id = evt.Item.ID
+				}
+				openTool(id, evt.Item.CallID, evt.Item.Name)
+			}
+		case "response.function_call_arguments.delta":
+			if _, ok := toolIdx[evt.ItemID]; ok && evt.Delta != "" {
+				written += writeSSE(w, "content_block_delta", fmt.Sprintf(`{"type":"content_block_delta","index":%d,"delta":{"type":"input_json_delta","partial_json":%s}}`, toolIdx[evt.ItemID], jsonStr(evt.Delta)))
+			}
+		case "response.output_item.done":
+			if evt.Item != nil && evt.Item.Type == "function_call" {
+				closeTool(evt.ItemID)
+			}
+		case "response.output_text.delta":
+			openText()
+			if evt.Delta != "" {
+				written += writeSSE(w, "content_block_delta", fmt.Sprintf(`{"type":"content_block_delta","index":%d,"delta":{"type":"text_delta","text":%s}}`, textIdx, jsonStr(evt.Delta)))
+			}
+		case "response.output_text.done", "response.content_part.done":
+			closeText()
+		case "response.completed":
+			if evt.Response != nil && evt.Response.Usage != nil {
+				compT = evt.Response.Usage.OutputTokens
+				promptT = evt.Response.Usage.InputTokens
+			}
+			finish()
+			return
+		}
+	}
+
+	finish()
+	return
+}
+
 // --- Handlers ---
 
 // handleClassifier answers Claude Code's permission-classifier endpoint.
@@ -917,18 +1064,33 @@ func estimateTokens(body []byte) int {
 // handleOpenCodeAnthropic routes opencode/* models through the zen endpoint.
 func (p *Pool) handleOpenCodeAnthropic(w http.ResponseWriter, r *http.Request, origBody, oaiBody []byte, clientModel, upstreamModel string, isStream bool, start time.Time) {
 	zenModel := strings.TrimPrefix(upstreamModel, "opencode/")
+	isResponses := endpointForModel(zenModel) == "/responses"
 
 	var m map[string]any
 	if json.Unmarshal(oaiBody, &m) == nil {
 		m["model"] = zenModel
+		stripCacheFields(m)
+		if isResponses {
+			convertToResponses(m)
+		}
 		if b, err := json.Marshal(m); err == nil {
 			oaiBody = b
 		}
 	}
 
-	target := OpencodeBase + "/chat/completions"
+	target := OpencodeBase + endpointForModel(zenModel)
 	cl := &http.Client{Timeout: 300 * time.Second}
 	var resp *http.Response
+
+	if os.Getenv("ZEN_DUMP") != "" {
+		t := time.Now().UnixNano()
+		p := fmt.Sprintf("/tmp/zenreq_%d.json", t)
+		os.WriteFile(p, oaiBody, 0o644)
+		acclog.Printf("ZEN_DUMP request %d bytes -> %s", len(oaiBody), p)
+		pi := fmt.Sprintf("/tmp/zenin_%d.json", t)
+		os.WriteFile(pi, origBody, 0o644)
+		acclog.Printf("ZEN_DUMP inbound %d bytes -> %s", len(origBody), pi)
+	}
 
 	sessionID := ""
 	if s := r.Header.Get("x-session-id"); s != "" {
@@ -970,7 +1132,11 @@ func (p *Pool) handleOpenCodeAnthropic(w http.ResponseWriter, r *http.Request, o
 
 		resp, err = cl.Do(req)
 		if err != nil {
-			acclog.Printf("!! opencode zen error %s: %v", target, err)
+			acclog.Printf("!! opencode zen error (retry %d/4) %s: %v", zenRetries, target, err)
+			if zenRetries < 4 {
+				time.Sleep(time.Duration(zenRetries+1) * time.Second)
+				continue
+			}
 			writeAnthropicError(w, http.StatusBadGateway, "api_error", "opencode zen: "+err.Error())
 			return
 		}
@@ -988,6 +1154,11 @@ func (p *Pool) handleOpenCodeAnthropic(w http.ResponseWriter, r *http.Request, o
 
 	if resp.StatusCode != http.StatusOK {
 		rb, _ := io.ReadAll(resp.Body)
+		if os.Getenv("ZEN_DUMP") != "" {
+			p := fmt.Sprintf("/tmp/zenresp_%d.json", time.Now().UnixNano())
+			os.WriteFile(p, rb, 0o644)
+			acclog.Printf("ZEN_DUMP response %d bytes -> %s", len(rb), p)
+		}
 		errMsg := extractErrMessage(string(rb))
 		acclog.Printf("!! opencode zen %d model=%s err=%q", resp.StatusCode, clientModel, errMsg)
 		writeAnthropicError(w, resp.StatusCode, "api_error", errMsg)
@@ -1000,7 +1171,13 @@ func (p *Pool) handleOpenCodeAnthropic(w http.ResponseWriter, r *http.Request, o
 		w.Header().Set("Cache-Control", "no-cache")
 		w.Header().Set("Connection", "keep-alive")
 		w.WriteHeader(http.StatusOK)
-		written, promptT, compT := streamAnthropic(w, rb, clientModel)
+		var written int64
+		var promptT, compT int
+		if isResponses {
+			written, promptT, compT = streamResponses(w, rb, clientModel)
+		} else {
+			written, promptT, compT = streamAnthropic(w, rb, clientModel)
+		}
 
 		logUsage(UsageRecord{
 			Ts:               time.Now().UTC().Format(time.RFC3339Nano),
@@ -1019,6 +1196,9 @@ func (p *Pool) handleOpenCodeAnthropic(w http.ResponseWriter, r *http.Request, o
 		acclog.Printf("<- 200 POST /v1/messages %v %d bytes [opencode]", elapsed.Round(time.Millisecond), written)
 	} else {
 		rb, _ := io.ReadAll(resp.Body)
+		if isResponses {
+			rb = responsesToChat(rb)
+		}
 		out, errMsg, _ := openAIToAnthropic(rb, clientModel)
 		if errMsg != "" {
 			writeAnthropicError(w, http.StatusInternalServerError, "api_error", errMsg)

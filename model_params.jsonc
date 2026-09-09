@@ -98,9 +98,10 @@
     "pattern": "*muse-spark*",
     "params": {
       "context_length": 131072,
-      "description": "Muse Spark - Meta AI coding model",
+      "description": "Muse Spark - Meta AI coding model, reasoning-effort high",
       "temperature": 1.0,
-      "top_p": 0.95
+      "top_p": 0.95,
+      "reasoning_effort": "high"
     }
   },
   {
@@ -116,9 +117,10 @@
     "pattern": "*ling-3.0-flash-fin-free*",
     "params": {
       "context_length": 131072,
-      "description": "Ling 3.0 Flash Fin Free - free limited-time model",
+      "description": "Ling 3.0 Flash Fin Free - free limited-time model, reasoning-effort high",
       "temperature": 1.0,
-      "top_p": 0.95
+      "top_p": 0.95,
+      "reasoning_effort": "high"
     }
   },
   {

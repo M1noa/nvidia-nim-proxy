@@ -242,3 +242,74 @@ func TestHandleOpenCodeUsesCorrectEndpoint(t *testing.T) {
 		t.Errorf("opencode/big-pickle should route to /chat/completions, got %q", got)
 	}
 }
+
+func TestConvertToResponsesReasoningEffort(t *testing.T) {
+	m := map[string]any{
+		"model":           "muse-spark-1.3-contributor-free",
+		"messages":        []any{map[string]any{"role": "user", "content": "hi"}},
+		"max_tokens":      100,
+		"reasoning_effort": "high",
+	}
+	convertToResponses(m)
+
+	// reasoning_effort should be moved to reasoning.effort
+	if _, ok := m["reasoning_effort"]; ok {
+		t.Error("reasoning_effort should be deleted from top level")
+	}
+	reasoning, ok := m["reasoning"].(map[string]any)
+	if !ok {
+		t.Fatalf("reasoning should be a map, got %T", m["reasoning"])
+	}
+	if reasoning["effort"] != "high" {
+		t.Errorf("reasoning.effort = %v, want high", reasoning["effort"])
+	}
+
+	// max_tokens → max_output_tokens
+	if _, ok := m["max_tokens"]; ok {
+		t.Error("max_tokens should be deleted")
+	}
+	if m["max_output_tokens"] != 100 {
+		t.Errorf("max_output_tokens = %v, want 100", m["max_output_tokens"])
+	}
+
+	// messages → input
+	if _, ok := m["messages"]; ok {
+		t.Error("messages should be deleted")
+	}
+	if _, ok := m["input"]; !ok {
+		t.Error("input should be present")
+	}
+}
+
+func TestStreamResponsesToChat(t *testing.T) {
+	// Simulate a Responses API SSE stream
+	stream := "event: response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"delta\":\"Hello\"}\n\n" +
+		"event: response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"delta\":\" world\"}\n\n" +
+		"event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"usage\":{\"input_tokens\":10,\"output_tokens\":5}}}\n\n" +
+		"data: [DONE]\n\n"
+
+	var buf strings.Builder
+	w := httptest.NewRecorder()
+	_, promptT, compT := streamResponsesToChat(w, []byte(stream))
+
+	body := w.Body.String()
+	if !strings.Contains(body, "\"content\":\"Hello\"") {
+		t.Error("missing first delta content")
+	}
+	if !strings.Contains(body, "\"content\":\" world\"") {
+		t.Error("missing second delta content")
+	}
+	if !strings.Contains(body, "\"prompt_tokens\":10") {
+		t.Error("missing prompt_tokens in usage")
+	}
+	if !strings.Contains(body, "data: [DONE]") {
+		t.Error("missing [DONE]")
+	}
+	if promptT != 10 {
+		t.Errorf("promptT = %d, want 10", promptT)
+	}
+	if compT != 5 {
+		t.Errorf("compT = %d, want 5", compT)
+	}
+	_ = buf
+}
