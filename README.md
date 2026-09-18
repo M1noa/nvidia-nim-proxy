@@ -1,5 +1,4 @@
 # nvidia-nim-proxy
-
 > THIS PROJECT WAS MADE PARTIALLY USING AGENTIC AI CODING TOOLS
 
 ![build](https://github.com/M1noa/nvidia-nim-proxy/actions/workflows/build.yml/badge.svg)
