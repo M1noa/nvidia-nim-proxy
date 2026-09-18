@@ -77,6 +77,12 @@ try:
         left = ocm[i]
         right = ocm[i+half] if i+half < len(ocm) else ''
         print(f"    {left:38s} {right}")
+  zs = data.get('zen_session') or ''
+  zp = data.get('zen_proxy') or ''
+  za = data.get('zen_ago') or ''
+  if zs or zp:
+    print()
+    print(f"  Zen last:  session={zs or '-'} proxy={zp or 'direct'} {za + ' ago' if za else ''}".rstrip())
   print()
 except Exception as e:
   print(f'  (status fetch failed: {e})')

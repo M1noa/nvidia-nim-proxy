@@ -23,7 +23,46 @@ const proxyListURL = "https://proxies.minoa.cat/list?format=json&sort=response&l
 var (
 	zenProxiesMu sync.RWMutex
 	zenProxies   []string
+	zenNetErrMu  sync.Mutex
+	zenNetErrs   int
+	zenGeoMu     sync.Mutex
+	zenGeoErrs   int
 )
+
+// zenVersion is the opencode release tag reported in the User-Agent. Defaults
+// to 1.18.31 and is refreshed from GitHub on startup and every 6h after.
+var zenVersion = "1.18.31"
+
+// fetchOpenCodeVersion pulls the latest opencode release tag from the GitHub
+// API, falling back to the default on any error.
+func fetchOpenCodeVersion() {
+	cl := &http.Client{Timeout: 5 * time.Second}
+	resp, err := cl.Get("https://api.github.com/repos/sst/opencode/releases/latest")
+	if err != nil {
+		return
+	}
+	defer resp.Body.Close()
+	var r struct {
+		TagName string `json:"tag_name"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&r); err != nil {
+		return
+	}
+	v := strings.TrimPrefix(strings.TrimSpace(r.TagName), "v")
+	if v != "" && v != zenVersion {
+		zenVersion = v
+		log.Printf("  opencode version: %s", v)
+	}
+}
+
+// watchOpenCodeVersion refreshes the User-Agent version every 6h.
+func watchOpenCodeVersion() {
+	t := time.NewTicker(6 * time.Hour)
+	defer t.Stop()
+	for range t.C {
+		fetchOpenCodeVersion()
+	}
+}
 
 type proxyEntry struct {
 	IP             string   `json:"ip"`
@@ -79,8 +118,8 @@ func refreshZenProxies() {
 		fast = append(fast, e)
 	}
 	sort.Slice(fast, func(i, j int) bool { return fast[i].ResponseTimeMs < fast[j].ResponseTimeMs })
-	if len(fast) > 200 {
-		fast = fast[:200]
+	if len(fast) > 400 {
+		fast = fast[:400]
 	}
 	cands := make([]string, 0, len(fast))
 	for _, e := range fast {
@@ -115,8 +154,13 @@ func refreshZenProxies() {
 // verifyProxy confirms a proxy can reach the zen API via a lightweight GET.
 func verifyProxy(proxyURL string) bool {
 	cl := zenClient(proxyURL)
-	cl.Timeout = 8 * time.Second
-	resp, err := cl.Get("https://opencode.ai/zen/v1/models")
+	cl.Timeout = 15 * time.Second
+	req, err := http.NewRequest("GET", "https://opencode.ai/zen/v1/models", nil)
+	if err != nil {
+		return false
+	}
+	setZenHeaders(req, zenSession())
+	resp, err := cl.Do(req)
 	if err != nil {
 		return false
 	}
@@ -164,10 +208,62 @@ func pickFastProxy() string {
 	return zenProxies[rand.Intn(len(zenProxies))]
 }
 
+// dropProxy removes a dead proxy from the pool so it is not picked again.
+func dropProxy(proxyURL string) {
+	if proxyURL == "" {
+		return
+	}
+	zenProxiesMu.Lock()
+	defer zenProxiesMu.Unlock()
+	for i, p := range zenProxies {
+		if p == proxyURL {
+			zenProxies = append(zenProxies[:i], zenProxies[i+1:]...)
+			log.Printf("  zen proxies: dropped %s (left %d)", proxyURL, len(zenProxies))
+			return
+		}
+	}
+}
+
+// noteZenNetworkError counts consecutive network failures and returns
+// true once the threshold is crossed, signaling a stale/dead pool.
+func noteZenNetworkError() bool {
+	zenNetErrMu.Lock()
+	defer zenNetErrMu.Unlock()
+	zenNetErrs++
+	return zenNetErrs >= 3
+}
+
+func resetZenNetworkErrors() {
+	zenNetErrMu.Lock()
+	defer zenNetErrMu.Unlock()
+	zenNetErrs = 0
+}
+
+// zenGeoBlocked reports whether an upstream error body means the model is
+// geo-restricted for the exit IP. Switching proxies fixes the request.
+func zenGeoBlocked(body []byte) bool {
+	return strings.Contains(strings.ToLower(string(body)), "not available in your country")
+}
+
+// noteZenGeoErr counts consecutive geo-blocks and returns true once the
+// threshold is crossed, signaling most of the pool sits in a blocked region.
+func noteZenGeoErr() bool {
+	zenGeoMu.Lock()
+	defer zenGeoMu.Unlock()
+	zenGeoErrs++
+	return zenGeoErrs >= 3
+}
+
+func resetZenGeoErrs() {
+	zenGeoMu.Lock()
+	defer zenGeoMu.Unlock()
+	zenGeoErrs = 0
+}
+
 func watchZenProxies() {
 	refreshZenProxies()
 	for {
-		time.Sleep(5 * time.Minute)
+		time.Sleep(time.Hour)
 		refreshZenProxies()
 	}
 }

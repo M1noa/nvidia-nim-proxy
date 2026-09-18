@@ -25,3 +25,8 @@ nim-usage.jsonl
 # tooling
 .opencode/
 nim
+
+# local research data (58M, nested repos)
+system-prompts/
+cctest.py
+opencode_prompt.py
