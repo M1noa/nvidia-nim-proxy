@@ -6,6 +6,12 @@ BINARY="$PROXY_DIR/nim-proxy"
 PLIST="$HOME/Library/LaunchAgents/com.user.nvidia-nim-proxy.plist"
 SVC="com.user.nvidia-nim-proxy"
 
+# /usr/bin/python3 is a broken xcode shim here (exit 69) — pick one that runs
+PY=""
+for _py in /opt/homebrew/bin/python3 /usr/local/bin/python3 python3; do
+  if "$_py" -c 'pass' >/dev/null 2>&1; then PY="$_py"; break; fi
+done
+
 launchd_pid() {
   launchctl list "$SVC" 2>/dev/null | grep '"PID"' | sed 's/.*= \([0-9]*\).*/\1/'
 }
@@ -36,8 +42,8 @@ status_text() {
 
 pretty_status() {
   status_text || return
-  if command -v curl >/dev/null 2>&1 && command -v python3 >/dev/null 2>&1; then
-    python3 << EOF 2>/dev/null
+  if [ -n "$PY" ] && command -v curl >/dev/null 2>&1; then
+    "$PY" << EOF 2>/dev/null
 import json, urllib.request
 try:
   data = json.loads(urllib.request.urlopen('http://localhost:${PORT:-5419}/status', timeout=3).read())
@@ -89,7 +95,11 @@ except Exception as e:
 EOF
   elif command -v curl >/dev/null; then
     echo ""
-    curl -s "http://localhost:${PORT:-5419}/status" | python3 -m json.tool 2>/dev/null || curl -s "http://localhost:${PORT:-5419}/status"
+    if [ -n "$PY" ]; then
+      curl -s "http://localhost:${PORT:-5419}/status" | "$PY" -m json.tool 2>/dev/null || curl -s "http://localhost:${PORT:-5419}/status"
+    else
+      curl -s "http://localhost:${PORT:-5419}/status"
+    fi
   fi
 }
 

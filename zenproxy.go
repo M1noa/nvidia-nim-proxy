@@ -245,6 +245,12 @@ func zenGeoBlocked(body []byte) bool {
 	return strings.Contains(strings.ToLower(string(body)), "not available in your country")
 }
 
+// zenServiceOverloaded reports whether zen returned a transient overload
+// error. Those are retried on the same proxy and session, not rotated.
+func zenServiceOverloaded(body []byte) bool {
+	return strings.Contains(string(body), "[service_overloaded]")
+}
+
 // noteZenGeoErr counts consecutive geo-blocks and returns true once the
 // threshold is crossed, signaling most of the pool sits in a blocked region.
 func noteZenGeoErr() bool {

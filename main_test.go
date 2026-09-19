@@ -386,6 +386,164 @@ func TestFoldAnthropicSSE(t *testing.T) {
 	}
 }
 
+func TestZenServiceOverloaded(t *testing.T) {
+	over := []byte(`{"type":"error","error":{"type":"api_error","message":"Upstream request failed: [service_overloaded] The backend is temporarily overloaded. Please retry."}}`)
+	if !zenServiceOverloaded(over) {
+		t.Errorf("expected overloaded body to match")
+	}
+	if zenServiceOverloaded([]byte(`{"error":"rate limit"}`)) {
+		t.Errorf("plain error must not match")
+	}
+}
+
+func TestOAIRequestToAnthropic(t *testing.T) {
+	in := `{"model":"opencode/union-alpha","messages":[{"role":"system","content":"be brief"},{"role":"user","content":"hi"},{"role":"assistant","content":"","tool_calls":[{"id":"call_1","type":"function","function":{"name":"bash","arguments":"{\"cmd\":\"ls\"}"}}]},{"role":"tool","tool_call_id":"call_1","content":"ok"}],"tools":[{"type":"function","function":{"name":"bash","description":"run","parameters":{"type":"object"}}}]}`
+
+	out, err := oaiRequestToAnthropic([]byte(in), "union-alpha")
+	if err != nil {
+		t.Fatalf("convert: %v", err)
+	}
+	var m struct {
+		Model      string `json:"model"`
+		System     string `json:"system"`
+		MaxTokens  int    `json:"max_tokens"`
+		Stream     bool   `json:"stream"`
+		Messages   []struct {
+			Role    string `json:"role"`
+			Content []struct {
+				Type      string `json:"type"`
+				Text      string `json:"text"`
+				ToolUseID string `json:"tool_use_id"`
+				Name      string `json:"name"`
+			} `json:"content"`
+		} `json:"messages"`
+		Tools []struct {
+			Name        string `json:"name"`
+			InputSchema any    `json:"input_schema"`
+		} `json:"tools"`
+	}
+	if err := json.Unmarshal(out, &m); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if m.Model != "union-alpha" || !m.Stream || m.MaxTokens != 4096 {
+		t.Errorf("bad envelope: model=%q stream=%v max=%d", m.Model, m.Stream, m.MaxTokens)
+	}
+	if m.System != "be brief" {
+		t.Errorf("bad system: %q", m.System)
+	}
+	if len(m.Messages) != 3 {
+		t.Fatalf("want 3 messages, got %d: %s", len(m.Messages), out)
+	}
+	if m.Messages[0].Content[0].Text != "hi" {
+		t.Errorf("bad user content: %s", out)
+	}
+	if len(m.Messages[1].Content) != 1 || m.Messages[1].Content[0].Name != "bash" {
+		t.Errorf("bad assistant tool_use: %s", out)
+	}
+	if m.Messages[1].Content[0].Type != "tool_use" {
+		t.Errorf("assistant block type = %q, want tool_use", m.Messages[1].Content[0].Type)
+	}
+	if len(m.Messages) < 3 || len(m.Messages[1].Content) == 0 {
+		t.Fatalf("missing assistant blocks: %s", out)
+	}
+	if len(m.Tools) != 1 || m.Tools[0].Name != "bash" || m.Tools[0].InputSchema == nil {
+		t.Errorf("bad tools: %s", out)
+	}
+}
+
+func TestAnthropicToOpenAI(t *testing.T) {
+	folded := []byte(`{"id":"msg_x","type":"message","role":"assistant","model":"union-alpha","content":[{"type":"text","text":"hello"},{"type":"tool_use","id":"toolu_1","name":"read","input":{"path":"/x"}}],"stop_reason":"tool_use","usage":{"input_tokens":10,"output_tokens":4}}`)
+	out := anthropicToOpenAI(folded, "opencode/union-alpha")
+	var m struct {
+		Object  string `json:"object"`
+		Model   string `json:"model"`
+		Choices []struct {
+			Message struct {
+				Role      string `json:"role"`
+				Content   string `json:"content"`
+				ToolCalls []struct {
+					ID       string `json:"id"`
+					Function struct {
+						Name      string `json:"name"`
+						Arguments string `json:"arguments"`
+					} `json:"function"`
+				} `json:"tool_calls"`
+			} `json:"message"`
+			FinishReason string `json:"finish_reason"`
+		} `json:"choices"`
+		Usage struct {
+			PromptTokens     int `json:"prompt_tokens"`
+			CompletionTokens int `json:"completion_tokens"`
+			TotalTokens      int `json:"total_tokens"`
+		} `json:"usage"`
+	}
+	if err := json.Unmarshal(out, &m); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if m.Object != "chat.completion" || m.Model != "opencode/union-alpha" {
+		t.Errorf("bad envelope: %s", out)
+	}
+	if len(m.Choices) != 1 || m.Choices[0].FinishReason != "tool_calls" {
+		t.Errorf("bad finish: %s", out)
+	}
+	if m.Choices[0].Message.Content != "hello" {
+		t.Errorf("bad content: %s", out)
+	}
+	tc := m.Choices[0].Message.ToolCalls
+	if len(tc) != 1 || tc[0].ID != "toolu_1" || tc[0].Function.Name != "read" {
+		t.Errorf("bad tool_calls: %s", out)
+	}
+	if tc[0].Function.Arguments != `{"path":"/x"}` {
+		t.Errorf("bad arguments: %q", tc[0].Function.Arguments)
+	}
+	if m.Usage.PromptTokens != 10 || m.Usage.CompletionTokens != 4 || m.Usage.TotalTokens != 14 {
+		t.Errorf("bad usage: %s", out)
+	}
+}
+
+func TestStreamAnthropicToOpenAI(t *testing.T) {
+	stream := "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":7}}}\n\n" +
+		"event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\"}}\n\n" +
+		"event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"yo\"}}\n\n" +
+		"event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":2}}\n\n"
+	rec := httptest.NewRecorder()
+	written, p, c := streamAnthropicToOpenAI(rec, []byte(stream), "opencode/union-alpha")
+	if p != 7 || c != 2 {
+		t.Errorf("tokens = %d,%d want 7,2", p, c)
+	}
+	if written <= 0 {
+		t.Errorf("written = %d", written)
+	}
+	body := rec.Body.String()
+	if !strings.Contains(body, `"content":"yo"`) {
+		t.Errorf("missing content delta: %s", body)
+	}
+	if !strings.Contains(body, `"finish_reason":"stop"`) {
+		t.Errorf("missing stop chunk: %s", body)
+	}
+	if !strings.HasSuffix(strings.TrimSpace(body), "data: [DONE]") {
+		t.Errorf("missing [DONE] trailer: %s", body)
+	}
+}
+
+func TestAnthropicErrToOAI(t *testing.T) {
+	ae := []byte(`{"type":"error","error":{"type":"api_error","message":"Upstream request failed: Model union-alpha is not supported"}}`)
+	out := anthropicErrToOAI(ae, 400)
+	var m map[string]any
+	if err := json.Unmarshal(out, &m); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	errObj, ok := m["error"].(map[string]any)
+	if !ok {
+		t.Fatalf("no error envelope: %s", out)
+	}
+	if !strings.Contains(errObj["message"].(string), "not supported") {
+		t.Errorf("message lost: %s", out)
+	}
+	if errObj["code"].(float64) != 400 {
+		t.Errorf("code = %v want 400", errObj["code"])
+	}
+}
 func TestConvertResponsesFlatToolsPreserved(t *testing.T) {
 	body, err := os.ReadFile("/tmp/zenin_1789086077017333000.json")
 	if err != nil {

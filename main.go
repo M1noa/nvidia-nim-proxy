@@ -2127,14 +2127,16 @@ func (p *Pool) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 // /chat/completions.
 func (p *Pool) handleOpenCode(w http.ResponseWriter, r *http.Request, body []byte, model string, isStream bool, start time.Time) {
 	realModel := strings.TrimPrefix(model, "opencode/")
-	if endpointForModel(realModel) == "/messages" {
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(http.StatusBadRequest)
-		fmt.Fprintf(w, `{"error":{"message":"model %s is anthropic-native on zen; use /v1/messages instead of /v1/chat/completions","type":"invalid_request_error"}}`, realModel)
-		return
+	isMessages := endpointForModel(realModel) == "/messages"
+	if isMessages {
+		// /messages models (union-alpha) are anthropic-native on zen:
+		// translate the OAI request and serve it back as OAI.
+		if b, err := oaiRequestToAnthropic(body, realModel); err == nil {
+			body = b
+		}
 	}
 	var m map[string]any
-	if json.Unmarshal(body, &m) == nil {
+	if !isMessages && json.Unmarshal(body, &m) == nil {
 		m["model"] = realModel
 		stripCacheFields(m)
 		ensureZenTools(m)
@@ -2172,11 +2174,12 @@ func (p *Pool) handleOpenCode(w http.ResponseWriter, r *http.Request, body []byt
 		sessionID = zenSession()
 	}
 	var usedProxy string
+	rotating := true
 	for zenRetries := 0; zenRetries < 5; zenRetries++ {
 		proxy := ""
 		if zenRetries == 0 {
 			cl = &http.Client{Timeout: 300 * time.Second}
-		} else {
+		} else if rotating {
 			proxy = pickFastProxy()
 			if proxy == "" {
 				continue
@@ -2184,6 +2187,10 @@ func (p *Pool) handleOpenCode(w http.ResponseWriter, r *http.Request, body []byt
 			cl = zenClient(proxy)
 			usedProxy = proxy
 			sessionID = zenSession()
+		} else {
+			// service overloaded: retry on the same proxy + session.
+			proxy = usedProxy
+			cl = zenClient(proxy)
 		}
 		req, err := http.NewRequest(r.Method, target, bytes.NewReader(body))
 		if err != nil {
@@ -2191,6 +2198,9 @@ func (p *Pool) handleOpenCode(w http.ResponseWriter, r *http.Request, body []byt
 			return
 		}
 		setZenHeaders(req, sessionID)
+		if isMessages {
+			req.Header.Set("anthropic-version", "2023-06-01")
+		}
 		if zenRetries > 0 {
 			acclog.Printf("  opencode retry %d/4 session=%s proxy=%s", zenRetries, sessionID, proxy)
 		}
@@ -2208,6 +2218,7 @@ func (p *Pool) handleOpenCode(w http.ResponseWriter, r *http.Request, body []byt
 		resp, err = cl.Do(req)
 		if err != nil {
 			dropProxy(proxy)
+			rotating = true
 			acclog.Printf("!! opencode zen error (retry %d/4) %s: %v", zenRetries, target, err)
 			if noteZenNetworkError() {
 				acclog.Printf("  3+ consecutive network errors, refreshing proxy pool")
@@ -2228,6 +2239,7 @@ func (p *Pool) handleOpenCode(w http.ResponseWriter, r *http.Request, body []byt
 		if resp.StatusCode == http.StatusTooManyRequests || resp.StatusCode == 529 {
 			resp.Body.Close()
 			dropProxy(proxy)
+			rotating = true
 			time.Sleep(time.Duration(zenRetries+1) * time.Second)
 			continue
 		}
@@ -2235,9 +2247,18 @@ func (p *Pool) handleOpenCode(w http.ResponseWriter, r *http.Request, body []byt
 		if resp.StatusCode != http.StatusOK {
 			eb, _ := io.ReadAll(io.LimitReader(resp.Body, 16<<10))
 			resp.Body.Close()
+			if zenServiceOverloaded(eb) {
+				acclog.Printf("  opencode overloaded model=%s proxy=%s, retrying same proxy+session", model, proxy)
+				rotating = false
+				if zenRetries < 4 {
+					time.Sleep(time.Duration(zenRetries+1) * time.Second)
+					continue
+				}
+			}
 			if zenGeoBlocked(eb) {
 				acclog.Printf("  opencode geo-blocked model=%s via proxy=%s, switching proxy", model, proxy)
 				dropProxy(proxy)
+				rotating = true
 				if noteZenGeoErr() {
 					acclog.Printf("  3+ geo-blocks, refreshing proxy pool")
 					refreshZenProxies()
@@ -2273,6 +2294,10 @@ func (p *Pool) handleOpenCode(w http.ResponseWriter, r *http.Request, body []byt
 		}
 		if endpoint == "/responses" && resp.StatusCode == http.StatusOK {
 			rb = responsesToChat(responsesSSEToJSON(rb))
+		} else if isMessages && resp.StatusCode == http.StatusOK {
+			rb = anthropicToOpenAI(foldAnthropicSSE(rb, realModel), realModel)
+		} else if isMessages {
+			rb = anthropicErrToOAI(rb, resp.StatusCode)
 		} else if !isStream && resp.StatusCode == http.StatusOK {
 			rb = sseToNonStream(rb, realModel)
 		}
@@ -2307,7 +2332,13 @@ func (p *Pool) handleOpenCode(w http.ResponseWriter, r *http.Request, body []byt
 	for k, v := range resp.Header {
 		w.Header()[k] = v
 	}
-	if !isStream && resp.StatusCode == http.StatusOK {
+	if isMessages {
+		// body rewritten (fold, error wrap, or sse rechunk) — stale length lied
+		w.Header().Del("Content-Length")
+		if !(isStream && resp.StatusCode == http.StatusOK) {
+			w.Header().Set("Content-Type", "application/json")
+		}
+	} else if !isStream && resp.StatusCode == http.StatusOK {
 		w.Header().Set("Content-Type", "application/json")
 	}
 	w.WriteHeader(resp.StatusCode)
@@ -2323,6 +2354,15 @@ func (p *Pool) handleOpenCode(w http.ResponseWriter, r *http.Request, body []byt
 				acclog.Printf("ZEN_DUMP raw responses SSE %d bytes -> %s", len(rb), rp)
 			}
 			written, prompT, compT = streamResponsesToChat(w, rb)
+		} else if isMessages {
+			rb, _ := io.ReadAll(resp.Body)
+			resp.Body.Close()
+			if os.Getenv("ZEN_DUMP") != "" {
+				rp := fmt.Sprintf("/tmp/zenraw_%d.sse", time.Now().UnixNano())
+				os.WriteFile(rp, rb, 0o644)
+				acclog.Printf("ZEN_DUMP raw messages SSE %d bytes -> %s", len(rb), rp)
+			}
+			written, prompT, compT = streamAnthropicToOpenAI(w, rb, realModel)
 		} else if fl, ok := w.(http.Flusher); ok {
 			buf := make([]byte, 4096)
 			for {
