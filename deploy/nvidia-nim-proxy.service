@@ -1,0 +1,16 @@
+[Unit]
+Description=NVIDIA NIM Proxy (OpenAI-compatible, keyless opencode free models)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=REPLACE_WITH_PATH
+ExecStart=REPLACE_WITH_PATH/nim-proxy
+Restart=always
+RestartSec=3
+Environment=PORT=5419
+# optional: Environment=KEY_FILE=/path/to/keys.jsonc
+
+[Install]
+WantedBy=default.target

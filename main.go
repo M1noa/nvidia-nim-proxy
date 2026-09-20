@@ -113,8 +113,15 @@ func newPool(entries map[string]string) *Pool {
 		p.keys = append(p.keys, &Key{Name: name, Key: k})
 	}
 	limit := (len(entries)*3 + 3) / 4 // ceil(75%)
+	if len(entries) == 0 {
+		limit = 16 // keyless: zen has no per-key limit
+	}
 	p.sem = make(chan struct{}, limit)
-	log.Printf("  Concurrency limit: %d (75%% of %d keys)", limit, len(entries))
+	if len(entries) == 0 {
+		log.Printf("  Concurrency limit: %d (keyless, opencode/* only)", limit)
+	} else {
+		log.Printf("  Concurrency limit: %d (75%% of %d keys)", limit, len(entries))
+	}
 	sort.Slice(p.keys, func(i, j int) bool { return p.keys[i].Name < p.keys[j].Name })
 	return p
 }
@@ -379,7 +386,7 @@ type StatusResponse struct {
 	Available  int           `json:"available"`
 	Concurrent int           `json:"concurrent"`
 	SemLimit   int           `json:"sem_limit"`
-	Keys       []KeyStatus   `json:"keys"`
+	Keys       []KeyStatus   `json:"keys,omitempty"`
 	Locks      interface{}   `json:"model_locks,omitempty"`
 	Opencode   *OpencodeInfo `json:"opencode,omitempty"`
 	ZenSession string        `json:"zen_session,omitempty"`
@@ -415,7 +422,9 @@ func (p *Pool) Status() StatusResponse {
 		Total:      len(p.keys),
 		Concurrent: int(p.concurrent.Load()),
 		SemLimit:   cap(p.sem),
-		Keys:       make([]KeyStatus, len(p.keys)),
+	}
+	if len(p.keys) > 0 {
+		sr.Keys = make([]KeyStatus, len(p.keys))
 	}
 	locks := make(map[string][]string)
 	for i, k := range p.keys {
@@ -1187,6 +1196,162 @@ func streamResponsesToChat(w http.ResponseWriter, body []byte) (written int64, p
 	return
 }
 
+// isTerminalResponsesEvent reports whether a /responses SSE payload ends the
+// turn, after which streamResponsesToChat returns and ignores the rest.
+func isTerminalResponsesEvent(data string) bool {
+	if data == "[DONE]" {
+		return true
+	}
+	var evt struct {
+		Type string `json:"type"`
+	}
+	if err := json.Unmarshal([]byte(data), &evt); err != nil {
+		return false
+	}
+	switch evt.Type {
+	case "response.completed", "response.incomplete", "response.failed":
+		return true
+	}
+	return false
+}
+
+// mergeResponsesSSE concatenates buffered /responses SSE bodies into one
+// stream: terminal events are stripped from every body but the last so the
+// merged body plays as a single turn.
+func mergeResponsesSSE(bodies [][]byte) []byte {
+	var out bytes.Buffer
+	for i, b := range bodies {
+		last := i == len(bodies)-1
+		for _, line := range strings.Split(string(b), "\n") {
+			t := strings.TrimSpace(line)
+			if !last && strings.HasPrefix(t, "data: ") && isTerminalResponsesEvent(strings.TrimPrefix(t, "data: ")) {
+				continue
+			}
+			out.WriteString(line)
+			out.WriteByte('\n')
+		}
+	}
+	return out.Bytes()
+}
+
+// nudgePostResponses re-POSTs a body to zen with the same proxy failover as
+// handleOpenCode. best effort: nil on any failure.
+func (p *Pool) nudgePostResponses(r *http.Request, target string, nb []byte, sessionID *string) []byte {
+	var cl *http.Client
+	lastProxy := ""
+	rotating := true
+	for zenRetries := 0; zenRetries < 5; zenRetries++ {
+		proxy := ""
+		if zenRetries == 0 {
+			cl = &http.Client{Timeout: 300 * time.Second}
+		} else if rotating {
+			proxy = pickFastProxy()
+			if proxy == "" {
+				continue
+			}
+			cl = zenClient(proxy)
+			lastProxy = proxy
+			*sessionID = zenSession()
+		} else {
+			proxy = lastProxy
+			cl = zenClient(proxy)
+		}
+		req, err := http.NewRequest(r.Method, target, bytes.NewReader(nb))
+		if err != nil {
+			return nil
+		}
+		setZenHeaders(req, *sessionID)
+		for k, v := range r.Header {
+			switch strings.ToLower(k) {
+			case "authorization", "host", "content-type", "accept", "accept-encoding",
+				"connection", "content-length", "user-agent",
+				"x-opencode-client", "x-opencode-session", "x-opencode-request", "x-opencode-project":
+				continue
+			default:
+				req.Header[k] = v
+			}
+		}
+		up, err := cl.Do(req)
+		if err != nil {
+			dropProxy(proxy)
+			rotating = true
+			acclog.Printf("!! opencode zen error (retry %d/4) nudge %s: %v", zenRetries, target, err)
+			if zenRetries < 4 {
+				time.Sleep(time.Duration(zenRetries+1) * time.Second)
+				continue
+			}
+			return nil
+		}
+		if up.StatusCode == http.StatusTooManyRequests || up.StatusCode == 529 {
+			up.Body.Close()
+			dropProxy(proxy)
+			rotating = true
+			time.Sleep(time.Duration(zenRetries+1) * time.Second)
+			continue
+		}
+		if up.StatusCode != http.StatusOK {
+			eb, _ := io.ReadAll(io.LimitReader(up.Body, 16<<10))
+			up.Body.Close()
+			if zenServiceOverloaded(eb) {
+				rotating = false
+				if zenRetries < 4 {
+					time.Sleep(time.Duration(zenRetries+1) * time.Second)
+					continue
+				}
+			}
+			if zenGeoBlocked(eb) {
+				dropProxy(proxy)
+				rotating = true
+				if zenRetries < 4 {
+					time.Sleep(time.Duration(zenRetries+1) * time.Second)
+					continue
+				}
+			}
+			return nil
+		}
+		nb2, _ := io.ReadAll(up.Body)
+		up.Body.Close()
+		p.noteZenSuccess(*sessionID, proxy)
+		return nb2
+	}
+	return nil
+}
+
+// maybeNudgeResponses applies the nudge_no_tools reprompt (same gates as the
+// /v1/messages path) to a buffered /responses SSE body on the OAI path. it
+// returns the body to stream, merged with the retry when the nudge fires.
+func (p *Pool) maybeNudgeResponses(r *http.Request, target string, posted, rb []byte, sessionID *string, clientModel string) []byte {
+	mp := matchModelParams(clientModel)
+	if mp == nil {
+		return rb
+	}
+	if nv, ok := mp["nudge_no_tools"]; !ok || nv != true {
+		return rb
+	}
+	if !toolsOffered(posted) {
+		return rb
+	}
+	text, hasCalls := scanResponsesSSE(rb)
+	if hasCalls || strings.TrimSpace(text) == "" || endsWithQuestion(text) {
+		return rb
+	}
+	nb := nudgeContinuation(posted, text)
+	if nb == nil {
+		return rb
+	}
+	nb2 := p.nudgePostResponses(r, target, nb, sessionID)
+	if nb2 == nil {
+		return rb
+	}
+	if isWaitOnly(nb2) {
+		acclog.Printf("  opencode nudge model=%s waiting, swallowing retry", clientModel)
+		return rb
+	}
+	_, nHasCalls := scanResponsesSSE(nb2)
+	acclog.Printf("  opencode nudge model=%s calls=%v bytes=%d [oai]", clientModel, nHasCalls, len(nb2))
+	return mergeResponsesSSE([][]byte{rb, nb2})
+}
+
 func (p *Pool) handleModels(w http.ResponseWriter, r *http.Request) {
 	var key *Key
 	p.mu.RLock()
@@ -1224,6 +1389,10 @@ func (p *Pool) handleModels(w http.ResponseWriter, r *http.Request) {
 
 	var out struct {
 		Data []openRouterModel `json:"data"`
+	}
+	// keyless: nim models would 503, list opencode/* only.
+	if len(p.keys) == 0 {
+		nvModels = nil
 	}
 	seen := make(map[string]bool)
 	for _, mid := range nvModels {
@@ -1268,7 +1437,8 @@ func (p *Pool) handleModels(w http.ResponseWriter, r *http.Request) {
 			PerRequestLimits: nil,
 		})
 	}
-	if len(out.Data) == 0 {
+	// keyless: nim models would 503, skip the params fallback too.
+	if len(out.Data) == 0 && len(p.keys) > 0 {
 		modelMu.RLock()
 		for _, e := range modelParams {
 			cl := 131072
@@ -1891,6 +2061,13 @@ func (p *Pool) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// keyless mode serves opencode/* only; nim models need keys.
+	if len(p.keys) == 0 {
+		acclog.Printf("<- 503 %s %s model=%s (keyless: no nvidia keys)", r.Method, r.URL.Path, model)
+		http.Error(w, `{"error":"no nvidia keys configured; use an opencode/<model> free model or add keys to keys.jsonc"}`, http.StatusServiceUnavailable)
+		return
+	}
+
 	if debugMode {
 		dbglog.Printf("=== REQUEST %s %s ===\nHeaders: %+v\nBody: %s", r.Method, r.URL.String(), r.Header, string(body))
 	}
@@ -2353,6 +2530,7 @@ func (p *Pool) handleOpenCode(w http.ResponseWriter, r *http.Request, body []byt
 				os.WriteFile(rp, rb, 0o644)
 				acclog.Printf("ZEN_DUMP raw responses SSE %d bytes -> %s", len(rb), rp)
 			}
+			rb = p.maybeNudgeResponses(r, target, body, rb, &sessionID, model)
 			written, prompT, compT = streamResponsesToChat(w, rb)
 		} else if isMessages {
 			rb, _ := io.ReadAll(resp.Body)
@@ -2599,8 +2777,7 @@ func watchKeys(p *Pool, path string) {
 			if !mod.Equal(lastMod) && !lastMod.IsZero() {
 				raw, err := os.ReadFile(path)
 				if err == nil {
-					entries, err := loadKeys(raw)
-					if err == nil && len(entries) > 0 {
+					if entries, err := loadKeys(raw); err == nil {
 						added, removed := p.Reload(entries)
 						if added > 0 || removed > 0 {
 							stat := p.Status()
@@ -2664,17 +2841,17 @@ func serverMain() {
 		kf = e
 	}
 
+	// keys are optional: without any, the proxy serves opencode/* free
+	// models only. a missing file is created so adding keys is easy.
+	entries := map[string]string{}
 	raw, err := os.ReadFile(kf)
 	if err != nil {
-		log.Fatalf("Cannot read %s: %v\n\nCreate %s with:\n{\n  // comments are ok\n  \"main\": \"nvapi-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\",\n  \"backup-1\": \"nvapi-yyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyy\"\n}", kf, err, kf)
-	}
-
-	entries, err := loadKeys(raw)
-	if err != nil {
+		_ = os.WriteFile(kf, []byte("{\n  // nvidia nim keys, optional. opencode/* models work without any.\n  // \"main\": \"nvapi-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\"\n}\n"), 0644)
+		log.Printf("  No %s, running keyless (opencode/* free models only)", kf)
+	} else if entries, err = loadKeys(raw); err != nil {
 		log.Fatalf("Invalid JSON in %s: %v", kf, err)
-	}
-	if len(entries) == 0 {
-		log.Fatalf("%s is empty", kf)
+	} else if len(entries) == 0 {
+		log.Printf("  %s has no keys, running keyless (opencode/* free models only)", kf)
 	}
 
 	pool := newPool(entries)
@@ -2694,10 +2871,14 @@ func serverMain() {
 		names = append(names, n)
 	}
 	sort.Strings(names)
-	log.Printf("NVIDIA NIM Proxy v%s — %d keys: %s", versionStr, stat.Total, strings.Join(names, ", "))
-	log.Printf("  429 backoff=%v..%v (exp, reset on success), model-lockout=%v, burst-backoff=%v", cooldown429, maxBackoff, modelLockout, burstCooldown)
-	log.Printf("  weighted key pick: idle-preference + 50m failure window")
-	log.Printf("  Effective ~%d RPM (40 RPM/key × %d keys)", 40*stat.Total, stat.Total)
+	if stat.Total == 0 {
+		log.Printf("NVIDIA NIM Proxy v%s — keyless (opencode/* free models only)", versionStr)
+	} else {
+		log.Printf("NVIDIA NIM Proxy v%s — %d keys: %s", versionStr, stat.Total, strings.Join(names, ", "))
+		log.Printf("  429 backoff=%v..%v (exp, reset on success), model-lockout=%v, burst-backoff=%v", cooldown429, maxBackoff, modelLockout, burstCooldown)
+		log.Printf("  weighted key pick: idle-preference + 50m failure window")
+		log.Printf("  Effective ~%d RPM (40 RPM/key × %d keys)", 40*stat.Total, stat.Total)
+	}
 	log.Printf("  Usage tracking -> nim-usage.jsonl")
 	log.Printf("  Keys hot-reload enabled (JSONC)")
 	log.Print()
@@ -2763,7 +2944,7 @@ func runProbe() {
 		log.Fatalf("Invalid JSON in %s: %v", kf, err)
 	}
 	if len(entries) == 0 {
-		log.Fatalf("%s is empty", kf)
+		log.Fatalf("%s has no keys: probe needs nvidia keys", kf)
 	}
 
 	keyList := make([]string, 0, len(entries))

@@ -78,6 +78,7 @@ type anthropicBlock struct {
 		Type      string `json:"type"`
 		MediaType string `json:"media_type"`
 		Data      string `json:"data"`
+		URL       string `json:"url"`
 	} `json:"source,omitempty"`
 }
 
@@ -299,6 +300,7 @@ func convertUserMessage(raw json.RawMessage) []map[string]any {
 
 	var result []map[string]any
 	var textParts []string
+	var imgParts []map[string]any
 
 	for _, b := range blocks {
 		switch b.Type {
@@ -315,14 +317,56 @@ func convertUserMessage(raw json.RawMessage) []map[string]any {
 				"content":      content,
 			})
 		case "image":
-			if b.Source != nil {
-				textParts = append(textParts, fmt.Sprintf("[Image: %s]", b.Source.MediaType))
+			if b.Source == nil {
+				continue
+			}
+			var url string
+			switch b.Source.Type {
+			case "base64":
+				if b.Source.Data == "" {
+					continue
+				}
+				mt := b.Source.MediaType
+				if mt == "" {
+					mt = "image/jpeg"
+				}
+				url = "data:" + mt + ";base64," + b.Source.Data
+			case "url":
+				if b.Source.URL == "" {
+					continue
+				}
+				url = b.Source.URL
+			default:
+				// claude code sends base64 without explicit type sometimes
+				if b.Source.Data != "" {
+					mt := b.Source.MediaType
+					if mt == "" {
+						mt = "image/jpeg"
+					}
+					url = "data:" + mt + ";base64," + b.Source.Data
+				} else if b.Source.URL != "" {
+					url = b.Source.URL
+				}
+			}
+			if url != "" {
+				imgParts = append(imgParts, map[string]any{"type": "image_url", "image_url": map[string]any{"url": url}})
 			}
 		}
 	}
 
-	if len(textParts) > 0 {
-		userMsg := map[string]any{"role": "user", "content": strings.Join(textParts, "\n")}
+	if len(textParts) > 0 || len(imgParts) > 0 {
+		var content any = strings.Join(textParts, "\n")
+		if len(imgParts) > 0 {
+			arr := make([]any, 0, len(textParts)+len(imgParts))
+			for _, t := range textParts {
+				arr = append(arr, map[string]any{"type": "text", "text": t})
+			}
+			for _, im := range imgParts {
+				arr = append(arr, im)
+			}
+			content = arr
+		}
+		userMsg := map[string]any{"role": "user", "content": content}
 		result = append([]map[string]any{userMsg}, result...)
 	}
 
@@ -781,7 +825,33 @@ func oaiUserBlocks(raw json.RawMessage) []map[string]any {
 			}
 		case "image_url":
 			if p.ImageURL != nil && p.ImageURL.URL != "" {
-				blocks = append(blocks, map[string]any{"type": "text", "text": "[Image: " + p.ImageURL.URL + "]"})
+				u := p.ImageURL.URL
+				if strings.HasPrefix(u, "data:") {
+					// data:<mediatype>;base64,<data> -> anthropic base64 source
+					rest := strings.TrimPrefix(u, "data:")
+					mt := "image/jpeg"
+					data := ""
+					if i := strings.Index(rest, ";base64,"); i >= 0 {
+						if rest[:i] != "" {
+							mt = rest[:i]
+						}
+						data = rest[i+len(";base64,"):]
+					} else if i := strings.Index(rest, ","); i >= 0 {
+						if rest[:i] != "" {
+							mt = rest[:i]
+						}
+						data = rest[i+1:]
+					}
+					if data != "" {
+						blocks = append(blocks, map[string]any{"type": "image", "source": map[string]any{
+							"type": "base64", "media_type": mt, "data": data,
+						}})
+						continue
+					}
+				}
+				blocks = append(blocks, map[string]any{"type": "image", "source": map[string]any{
+					"type": "url", "url": u,
+				}})
 			}
 		}
 	}
@@ -1727,6 +1797,13 @@ func (p *Pool) handleAnthropic(w http.ResponseWriter, r *http.Request, start tim
 	// Route opencode/* models to zen endpoint
 	if strings.HasPrefix(upstreamModel, "opencode/") {
 		p.handleOpenCodeAnthropic(w, r, body, oaiBody, clientModel, upstreamModel, isStream, start)
+		return
+	}
+
+	// keyless mode serves opencode/* only; nim models need keys.
+	if len(p.keys) == 0 {
+		acclog.Printf("<- 503 POST /v1/messages model=%s (keyless: no nvidia keys)", clientModel)
+		writeAnthropicError(w, http.StatusServiceUnavailable, "api_error", "no nvidia keys configured; use an opencode/<model> free model or add keys to keys.jsonc")
 		return
 	}
 

@@ -1,0 +1,15 @@
+<!-- windows service definition for winsw (https://github.com/winsw/winsw).
+1. download WinSW-x64.exe next to nim-proxy.exe, rename to nim-proxy-service.exe
+2. put this file next to it as nim-proxy-service.xml
+3. edit the paths below, then: nim-proxy-service.exe install && nim-proxy-service.exe start -->
+<service>
+  <id>nvidia-nim-proxy</id>
+  <name>NVIDIA NIM Proxy</name>
+  <description>OpenAI-compatible proxy: keyless opencode free models, optional NVIDIA NIM keys</description>
+  <executable>REPLACE_WITH_PATH\nim-proxy.exe</executable>
+  <workingdirectory>REPLACE_WITH_PATH</workingdirectory>
+  <env name="PORT" value="5419"/>
+  <!-- optional: <env name="KEY_FILE" value="C:\nim-proxy\keys.jsonc"/> -->
+  <log mode="roll" />
+  <onfailure action="restart" delay="3 sec"/>
+</service>

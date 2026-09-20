@@ -4,77 +4,110 @@
 ![build](https://github.com/M1noa/nvidia-nim-proxy/actions/workflows/build.yml/badge.svg)
 ![go](https://img.shields.io/badge/go-1.22-00ADD8)
 ![release](https://img.shields.io/github/v/release/M1noa/nvidia-nim-proxy)
+![license](https://img.shields.io/badge/license-MIT-green)
 
-A single-file Go reverse proxy for the NVIDIA NIM API (`integrate.api.nvidia.com`). It holds a pool of API keys, rotates between them, and backs off on 429s so you can push past the per-key rate limit. It also exposes opencode zen free models under `opencode/<model>` with no auth.
+OpenAI-compatible proxy with two backends:
 
-OpenAI-compatible. Point any client at it with `base_url=http://localhost:5419/v1` and any API key.
+- **NVIDIA NIM** (`integrate.api.nvidia.com`) — pool of API keys, weighted rotation, exponential 429 backoff. Needs keys.
+- **opencode zen free models** (`opencode/<model>`) — no auth, no keys needed. Works out of the box.
 
-## How it works
+Point any OpenAI client at `base_url=http://localhost:5419/v1` with any API key.
 
-- Keys live in `keys.jsonc` (JSON with comments). Edits hot-reload; no restart needed.
-- Key picking is weighted: idle keys score higher, keys that failed a 429 in the last 50 minutes get crushed. On a 429 the key gets an exponential backoff (1m → 16m cap) and the (key, model) pair is locked out for 30s.
-- `model_params.jsonc` sets per-model default parameters (temperature, top_p, top_k, min_p, reasoning_effort, ...) with glob patterns. First match wins; a client-sent value always wins over the default. Edits hot-reload.
-- Every request is logged to `nim-usage.jsonl` (tokens, latency, retries, rate-limit headers).
-- `/status` returns pool health as JSON. `/v1/models` lists whitelisted models.
-
-## Install
-
-Download a binary from [Releases](../../releases) (macOS, Linux, Windows; amd64 and arm64), or build it:
+## Quickstart (no keys)
 
 ```sh
 go build -o nim-proxy .
+./nim-proxy          # listens on :5419, creates keys.jsonc for later
 ```
 
-## Configure
+This already serves every `opencode/<model>` free model. Check what's available:
 
 ```sh
-cp keys.json.example keys.jsonc
-# edit keys.jsonc: {"main": "nvapi-xxx", "backup": "nvapi-yyy"}
+curl -s http://localhost:5419/v1/models | python3 -m json.tool
+curl -s http://localhost:5419/status | python3 -m json.tool
 ```
 
-## Run
-
-```sh
-./nim-proxy          # listens on :5419
-```
-
-macOS users can use the `nim` helper script, which manages the proxy through launchd:
-
-```sh
-./nim start|stop|restart|status|logs|tail
-```
-
-## Use
+Try one:
 
 ```sh
 curl http://localhost:5419/v1/chat/completions \
   -H "Content-Type: application/json" \
-  -d '{"model": "moonshotai/kimi-k3", "messages": [{"role":"user","content":"hi"}]}'
+  -d '{"model": "opencode/big-pickle", "messages": [{"role":"user","content":"hi"}]}'
 ```
 
-`./nim-proxy probe` hits a few models with test requests and reports per-model rate limits.
+## Adding NVIDIA keys (optional)
 
-`./bench.py [runs] [max_tokens]` measures TTFT and throughput for every model in `model_params.jsonc` through the proxy and prints a table sorted by TTFT.
+```sh
+cp keys.jsonc.example keys.jsonc
+# edit keys.jsonc: {"main": "nvapi-xxx", "backup": "nvapi-yyy"}
+```
 
-## Claude Code
+Edits hot-reload, no restart. Without keys, NIM models return 503 with a hint; `opencode/*` keeps working.
 
-The proxy supports the Anthropic Messages API, so you can use it as a base URL for Claude Code:
+## Use with opencode
+
+opencode works through any OpenAI-compatible provider. Point it at the proxy:
+
+- base URL: `http://localhost:5419/v1`
+- api key: anything (e.g. `dummy`)
+- model: any `opencode/<model>` id from `/v1/models` — no NVIDIA keys required
+
+## Use with Claude Code
+
+The proxy speaks the Anthropic Messages API:
 
 ```sh
 ANTHROPIC_BASE_URL=http://localhost:5419 claude
 ```
 
-Models are mapped via `claude_models.jsonc` (glob patterns, first match wins, hot-reloaded). Example:
+`claude_models.jsonc` maps `claude-*` names to backends (glob patterns, first match wins, hot-reloaded). Defaults route to free `opencode/*` models, so Claude Code works keyless too.
 
-```jsonc
-[
-  {"pattern": "claude-sonnet-*", "model": "moonshotai/kimi-k3"},
-  {"pattern": "claude-haiku-*",  "model": "moonshotai/kimi-k3"}
-]
+Endpoints: `POST /v1/messages` (stream + tools), `POST /v1/messages/count_tokens`, `POST /v1/messages/classifier` (always approves).
+
+## Run as a service
+
+`./nim` handles all three OSes (launchd on macOS, systemd user unit on Linux, background process elsewhere):
+
+```sh
+./nim run        # foreground
+./nim start      # start service
+./nim stop       # stop service
+./nim restart    # restart service
+./nim status     # pretty status (key pool hidden when keyless)
+./nim logs       # status + last log lines
+./nim tail       # follow access log
+./nim install    # install + start, persists across reboots
+./nim uninstall  # stop + remove service
 ```
 
-Endpoints exposed for Claude Code:
-- `POST /v1/messages` — full Anthropic Messages API (stream + non-stream, tools)
-- `POST /v1/messages/count_tokens` — crude token estimate (chars / 4)
+System-wide installs: templates live in `deploy/` (replace `REPLACE_WITH_PATH` with the install dir):
 
-Auth headers are accepted but ignored. Backend API keys come from `keys.jsonc` as usual.
+- macOS: `deploy/com.user.nvidia-nim-proxy.plist` → `/Library/LaunchDaemons/`
+- Linux: `deploy/nvidia-nim-proxy.service` → `/etc/systemd/system/`
+- Windows: `deploy/nvidia-nim-proxy.xml` with [WinSW](https://github.com/winsw/winsw) next to `nim-proxy.exe`
+
+## Configure
+
+| file | purpose |
+|---|---|
+| `keys.jsonc` | NVIDIA keys, optional (auto-created empty on first run) |
+| `model_params.jsonc` | per-model default params, glob patterns, first match wins |
+| `claude_models.jsonc` | `claude-*` → backend mapping for `/v1/messages` |
+| `guardrails.json` | system-prompt guardrail strings stripped from requests |
+
+Env vars: `PORT` (default 5419), `KEY_FILE` (default `keys.jsonc`), `DEBUG=1` (verbose body logging to `nim-proxy-debug.log`).
+
+Other endpoints: `/status` (pool health, `keys` omitted when keyless), `/v1/models` (whitelisted NIM + live zen free models), `./nim-proxy probe` (NIM rate-limit probe, needs keys).
+
+Requests are logged to `nim-usage.jsonl` (tokens, latency, retries, rate-limit headers).
+
+## Dev
+
+```sh
+go test ./...
+go build -o nim-proxy .
+```
+
+## License
+
+MIT — see [LICENSE](LICENSE).

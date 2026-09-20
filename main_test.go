@@ -2,6 +2,8 @@ package main
 
 import (
 	"encoding/json"
+	"io"
+	"log"
 	"math"
 	"net/http"
 	"net/http/httptest"
@@ -13,6 +15,7 @@ import (
 
 func TestMain(m *testing.M) {
 	loadModelParams("model_params.jsonc")
+	acclog = log.New(io.Discard, "", 0)
 	os.Exit(m.Run())
 }
 
@@ -774,5 +777,187 @@ func TestGuardrailScoring(t *testing.T) {
 	out, n := stripSomeGuardrails(ben)
 	if n != 0 || out != ben {
 		t.Errorf("benign doc changed: %q (%d)", out, n)
+	}
+}
+
+const nudgeSparkModel = "opencode/muse-spark-1.3-contributor-free"
+
+var nudgePostedBody = []byte(`{"model":"` + nudgeSparkModel + `","input":[{"role":"user","content":"list the files"}],"tools":[{"name":"bash","parameters":{"type":"object","properties":{}}}],"stream":true}`)
+
+const nudgeFirstSSE = "event: response.output_text.delta\n" +
+	"data: {\"type\":\"response.output_text.delta\",\"delta\":\"I will list the files.\"}\n\n" +
+	"data: {\"type\":\"response.completed\",\"response\":{\"usage\":{\"input_tokens\":10,\"output_tokens\":20}}}\n\n" +
+	"data: [DONE]\n\n"
+
+const nudgeRetrySSE = "data: {\"type\":\"response.output_item.added\",\"item\":{\"type\":\"function_call\",\"call_id\":\"call_1\",\"name\":\"bash\",\"arguments\":\"\"}}\n\n" +
+	"data: {\"type\":\"response.function_call_arguments.delta\",\"delta\":\"{}\"}\n\n" +
+	"data: {\"type\":\"response.completed\",\"response\":{\"usage\":{\"input_tokens\":10,\"output_tokens\":5}}}\n\n" +
+	"data: [DONE]\n\n"
+
+func TestMergeResponsesSSE(t *testing.T) {
+	merged := mergeResponsesSSE([][]byte{[]byte(nudgeFirstSSE), []byte(nudgeRetrySSE)})
+	s := string(merged)
+	if c := strings.Count(s, "data: [DONE]"); c != 1 {
+		t.Fatalf("merged has %d [DONE], want 1", c)
+	}
+	if c := strings.Count(s, "response.completed"); c != 1 {
+		t.Fatalf("merged has %d response.completed, want 1", c)
+	}
+	if !strings.Contains(s, "I will list the files.") || !strings.Contains(s, "function_call") {
+		t.Fatalf("merged lost a body: %q", s)
+	}
+}
+
+func TestMaybeNudgeResponsesGating(t *testing.T) {
+	p := &Pool{}
+	req := httptest.NewRequest("POST", "http://localhost:5419/v1/chat/completions", nil)
+	sess := "ses_test123"
+	first := []byte(nudgeFirstSSE)
+
+	// non-spark model: no nudge flag, body untouched (no network).
+	if out := p.maybeNudgeResponses(req, "http://127.0.0.1:1/x", nudgePostedBody, first, &sess, "opencode/big-pickle"); string(out) != string(first) {
+		t.Fatalf("non-spark model mutated body")
+	}
+	// no tools offered: untouched.
+	bare := []byte(`{"model":"` + nudgeSparkModel + `","input":[{"role":"user","content":"hi"}],"stream":true}`)
+	if out := p.maybeNudgeResponses(req, "http://127.0.0.1:1/x", bare, first, &sess, nudgeSparkModel); string(out) != string(first) {
+		t.Fatalf("no-tools body mutated")
+	}
+	// question text: untouched.
+	q := []byte("data: {\"type\":\"response.output_text.delta\",\"delta\":\"Which file should I edit?\"}\n\ndata: {\"type\":\"response.completed\",\"response\":{\"usage\":{\"input_tokens\":1,\"output_tokens\":1}}}\n\ndata: [DONE]\n\n")
+	if out := p.maybeNudgeResponses(req, "http://127.0.0.1:1/x", nudgePostedBody, q, &sess, nudgeSparkModel); string(out) != string(q) {
+		t.Fatalf("question body nudged")
+	}
+	// already has calls: untouched.
+	if out := p.maybeNudgeResponses(req, "http://127.0.0.1:1/x", nudgePostedBody, []byte(nudgeRetrySSE), &sess, nudgeSparkModel); string(out) != nudgeRetrySSE {
+		t.Fatalf("with-calls body nudged")
+	}
+}
+
+func TestMaybeNudgeResponsesMerges(t *testing.T) {
+	var gotBody []byte
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotBody, _ = io.ReadAll(r.Body)
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.Write([]byte(nudgeRetrySSE))
+	}))
+	defer srv.Close()
+	p := &Pool{}
+	req := httptest.NewRequest("POST", "http://localhost:5419/v1/chat/completions", nil)
+	sess := "ses_test123"
+	out := string(p.maybeNudgeResponses(req, srv.URL, nudgePostedBody, []byte(nudgeFirstSSE), &sess, nudgeSparkModel))
+	if !strings.Contains(string(gotBody), "You have tools available") {
+		t.Fatalf("nudge body not re-posted: %q", string(gotBody))
+	}
+	if c := strings.Count(out, "data: [DONE]"); c != 1 {
+		t.Fatalf("merged has %d [DONE], want 1: %q", c, out)
+	}
+	if c := strings.Count(out, "response.completed"); c != 1 {
+		t.Fatalf("merged has %d response.completed, want 1: %q", c, out)
+	}
+	if !strings.Contains(out, "I will list the files.") || !strings.Contains(out, "function_call") {
+		t.Fatalf("merged lost a body: %q", out)
+	}
+}
+
+func TestConvertUserMessageCarriesImage(t *testing.T) {
+	raw := json.RawMessage(`[{"type":"text","text":"what is this"},{"type":"image","source":{"type":"base64","media_type":"image/png","data":"aGVsbG8="}}]`)
+	msgs := convertUserMessage(raw)
+	if len(msgs) != 1 {
+		t.Fatalf("want 1 msg, got %d: %v", len(msgs), msgs)
+	}
+	arr, ok := msgs[0]["content"].([]any)
+	if !ok {
+		t.Fatalf("content not parts array: %T %v", msgs[0]["content"], msgs[0]["content"])
+	}
+	found := false
+	for _, p := range arr {
+		pm, _ := p.(map[string]any)
+		if pm["type"] == "image_url" {
+			iu, _ := pm["image_url"].(map[string]any)
+			if strings.HasPrefix(iu["url"].(string), "data:image/png;base64,aGVsbG8=") {
+				found = true
+			}
+		}
+	}
+	if !found {
+		t.Fatalf("image bytes lost: %v", arr)
+	}
+}
+
+func TestOaiUserBlocksCarriesImage(t *testing.T) {
+	raw := json.RawMessage(`[{"type":"text","text":"look"},{"type":"image_url","image_url":{"url":"data:image/jpeg;base64,/9j/"}}]`)
+	blocks := oaiUserBlocks(raw)
+	found := false
+	for _, b := range blocks {
+		if b["type"] == "image" {
+			src, _ := b["source"].(map[string]any)
+			if src["type"] == "base64" && src["data"] == "/9j/" && src["media_type"] == "image/jpeg" {
+				found = true
+			}
+		}
+	}
+	if !found {
+		t.Fatalf("image lost in oai->anthropic: %v", blocks)
+	}
+}
+
+func TestKeylessServesOpencodeOnly(t *testing.T) {
+	p := newPool(map[string]string{})
+
+	// nim model -> 503 with hint
+	req := httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(`{"model":"moonshotai/kimi-k3","messages":[{"role":"user","content":"hi"}]}`))
+	rec := httptest.NewRecorder()
+	p.ServeHTTP(rec, req)
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Fatalf("nim keyless status = %d, want 503", rec.Code)
+	}
+	if !strings.Contains(rec.Body.String(), "opencode/") {
+		t.Fatalf("503 missing opencode hint: %s", rec.Body.String())
+	}
+
+	// status hides keys
+	var st StatusResponse
+	st = p.Status()
+	if st.Total != 0 || st.Available != 0 {
+		t.Fatalf("keyless status total=%d avail=%d, want 0/0", st.Total, st.Available)
+	}
+	if st.Keys != nil {
+		t.Fatalf("keyless status exposes keys: %v", st.Keys)
+	}
+
+	// reload from empty picks up added keys
+	added, _ := p.Reload(map[string]string{"a": "nvapi-x"})
+	if added != 1 {
+		t.Fatalf("reload added=%d, want 1", added)
+	}
+	if p.Status().Total != 1 {
+		t.Fatalf("after reload total=%d, want 1", p.Status().Total)
+	}
+}
+
+func TestConvertToResponsesCarriesImage(t *testing.T) {
+	m := map[string]any{"messages": []any{map[string]any{"role": "user", "content": []any{
+		map[string]any{"type": "text", "text": "see"},
+		map[string]any{"type": "image_url", "image_url": map[string]any{"url": "data:image/png;base64,abc"}},
+	}}}}
+	convertToResponses(m)
+	in, ok := m["input"].([]any)
+	if !ok || len(in) != 1 {
+		t.Fatalf("bad input: %v", m["input"])
+	}
+	arr, ok := in[0].(map[string]any)["content"].([]any)
+	if !ok {
+		t.Fatalf("content not array: %v", in[0])
+	}
+	found := false
+	for _, p := range arr {
+		pm, _ := p.(map[string]any)
+		if pm["type"] == "input_image" {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("input_image lost: %v", arr)
 	}
 }
