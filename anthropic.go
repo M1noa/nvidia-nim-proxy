@@ -2150,7 +2150,7 @@ func (p *Pool) handleOpenCodeAnthropic(w http.ResponseWriter, r *http.Request, o
 			if err != nil {
 				dropProxy(proxy)
 				rotating = true
-				acclog.Printf("!! opencode zen error (retry %d/4) %s %s: %v", zenRetries, tag, target, err)
+				logZenNetErr(zenRetries, clientModel, proxy, tag+" "+target, err)
 				if noteZenNetworkError() {
 					acclog.Printf("  3+ consecutive network errors, refreshing proxy pool")
 					refreshZenProxies()
@@ -2165,6 +2165,8 @@ func (p *Pool) handleOpenCodeAnthropic(w http.ResponseWriter, r *http.Request, o
 
 			if up.StatusCode == http.StatusTooManyRequests || up.StatusCode == 529 {
 				up.Body.Close()
+				acclog.Printf("  opencode rate-limited %d (retry %d/4) model=%s country=%s proxy=%s %s, switching proxy",
+					up.StatusCode, zenRetries, clientModel, proxyCountry(proxy), proxy, tag)
 				dropProxy(proxy)
 				rotating = true
 				time.Sleep(time.Duration(zenRetries+1) * time.Second)
@@ -2175,7 +2177,8 @@ func (p *Pool) handleOpenCodeAnthropic(w http.ResponseWriter, r *http.Request, o
 				eb, _ := io.ReadAll(io.LimitReader(up.Body, 16<<10))
 				up.Body.Close()
 				if zenServiceOverloaded(eb) {
-					acclog.Printf("  opencode overloaded %s proxy=%s, retrying same proxy+session", tag, proxy)
+					acclog.Printf("  opencode overloaded %d (retry %d/4) model=%s country=%s proxy=%s %s retrying same proxy+session err=%q",
+						up.StatusCode, zenRetries, clientModel, proxyCountry(proxy), proxy, tag, errSnippet(eb, 160))
 					rotating = false
 					if zenRetries < 4 {
 						time.Sleep(time.Duration(zenRetries+1) * time.Second)
@@ -2183,7 +2186,7 @@ func (p *Pool) handleOpenCodeAnthropic(w http.ResponseWriter, r *http.Request, o
 					}
 				}
 				if zenGeoBlocked(eb) {
-					acclog.Printf("  opencode geo-blocked %s via proxy=%s, switching proxy", tag, proxy)
+					logZenBlocked("geo", zenRetries, up.StatusCode, clientModel, proxy, tag, eb)
 					dropProxy(proxy)
 					rotating = true
 					if noteZenGeoErr() {
@@ -2196,6 +2199,22 @@ func (p *Pool) handleOpenCodeAnthropic(w http.ResponseWriter, r *http.Request, o
 						continue
 					}
 				}
+				if zenUserBlocked(eb) {
+					logZenBlocked("user", zenRetries, up.StatusCode, clientModel, proxy, tag, eb)
+					dropProxy(proxy)
+					rotating = true
+					if noteZenBlockErr() {
+						acclog.Printf("  3+ user-blocks, refreshing proxy pool")
+						refreshZenProxies()
+						resetZenBlockErrs()
+					}
+					if zenRetries < 4 {
+						time.Sleep(time.Duration(zenRetries+1) * time.Second)
+						continue
+					}
+				}
+				acclog.Printf("!! opencode upstream %d (retry %d/4) model=%s country=%s proxy=%s %s err=%q",
+					up.StatusCode, zenRetries, clientModel, proxyCountry(proxy), proxy, tag, errSnippet(eb, 160))
 				up.Body = io.NopCloser(bytes.NewReader(eb))
 			}
 			resetZenNetworkErrors()

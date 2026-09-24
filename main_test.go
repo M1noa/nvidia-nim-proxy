@@ -961,3 +961,24 @@ func TestConvertToResponsesCarriesImage(t *testing.T) {
 		t.Fatalf("input_image lost: %v", arr)
 	}
 }
+
+func TestEnsureZenToolsHaveParameters(t *testing.T) {
+	// space-bunny 400s on tools without a parameters object.
+	m := map[string]any{"tools": []any{
+		map[string]any{"type": "function", "function": map[string]any{"name": "Bash"}},
+	}}
+	ensureZenTools(m)
+	tools, _ := m["tools"].([]any)
+	if len(tools) < 5 {
+		t.Fatalf("gate tools missing: %d tools", len(tools))
+	}
+	for _, x := range tools {
+		fn, _ := x.(map[string]any)["function"].(map[string]any)
+		if fn == nil {
+			t.Fatalf("non-oai tool shape: %v", x)
+		}
+		if _, ok := fn["parameters"]; !ok {
+			t.Errorf("tool %q has no parameters", fn["name"])
+		}
+	}
+}

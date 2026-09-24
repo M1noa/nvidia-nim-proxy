@@ -18,7 +18,16 @@ import (
 	"time"
 )
 
-const proxyListURL = "https://proxies.minoa.cat/list?format=json&sort=response&limit=0&country=us&response_max=400"
+const proxyListURL = "https://proxies.minoa.cat/list?format=json&sort=response&limit=0&response_max=400"
+
+// zenBlockedCountries are api-reported countries whose exits zen geo-blocks
+// for muse-spark (RegionError "not available in your country"). from the
+// probe_zen_proxies.py sweep: PK 4/4 blocked, RU/VE/HK blocked with 0 ok,
+// BY/TJ/IQ/MM blocked with 0 ok.
+var zenBlockedCountries = map[string]bool{
+	"PK": true, "RU": true, "VE": true, "HK": true,
+	"BY": true, "TJ": true, "IQ": true, "MM": true,
+}
 
 var (
 	zenProxiesMu sync.RWMutex
@@ -27,6 +36,14 @@ var (
 	zenNetErrs   int
 	zenGeoMu     sync.Mutex
 	zenGeoErrs   int
+	zenBlockMu   sync.Mutex
+	zenBlockErrs int
+	// api-reported proxy -> country, rebuilt on each refresh.
+	zenProxyCountryMu sync.RWMutex
+	zenProxyCountry   = map[string]string{}
+	// geo/user blocks per country, for hardcoding bad regions.
+	zenCountryBlockMu sync.Mutex
+	zenCountryBlocks  = map[string]int{}
 )
 
 // zenVersion is the opencode release tag reported in the User-Agent. Defaults
@@ -67,6 +84,8 @@ func watchOpenCodeVersion() {
 type proxyEntry struct {
 	IP             string   `json:"ip"`
 	Port           int      `json:"port"`
+	Country        string   `json:"country"`
+	HTTPS          bool     `json:"https"`
 	Protocols      []string `json:"protocols"`
 	Anonymity      string   `json:"anonymity"`
 	Reliability    float64  `json:"reliability"`
@@ -115,6 +134,12 @@ func refreshZenProxies() {
 		if e.ResponseTimeMs > 400 {
 			continue
 		}
+		if zenBlockedCountries[strings.ToUpper(strings.TrimSpace(e.Country))] {
+			continue
+		}
+		if !e.HTTPS && schemeFor(e.Protocols) == "http" {
+			continue // https-only zen, no-tls http proxies can't connect
+		}
 		fast = append(fast, e)
 	}
 	sort.Slice(fast, func(i, j int) bool { return fast[i].ResponseTimeMs < fast[j].ResponseTimeMs })
@@ -122,9 +147,13 @@ func refreshZenProxies() {
 		fast = fast[:400]
 	}
 	cands := make([]string, 0, len(fast))
+	countries := make(map[string]string, len(fast))
 	for _, e := range fast {
-		cands = append(cands, schemeFor(e.Protocols)+"://"+e.IP+":"+itoa(e.Port))
+		u := schemeFor(e.Protocols) + "://" + e.IP + ":" + itoa(e.Port)
+		cands = append(cands, u)
+		countries[u] = strings.ToUpper(strings.TrimSpace(e.Country))
 	}
+	setProxyCountries(countries)
 
 	var wg sync.WaitGroup
 	var mu sync.Mutex
@@ -264,6 +293,79 @@ func resetZenGeoErrs() {
 	zenGeoMu.Lock()
 	defer zenGeoMu.Unlock()
 	zenGeoErrs = 0
+}
+
+// zenUserBlocked reports whether an upstream error body means the exit IP is
+// banned from zen (403 [user_blocked]). Switching to another proxy fixes it.
+func zenUserBlocked(body []byte) bool {
+	return strings.Contains(string(body), "[user_blocked]")
+}
+
+// noteZenBlockErr counts consecutive user-blocks and returns true once the
+// threshold is crossed, signaling most of the pool is banned.
+func noteZenBlockErr() bool {
+	zenBlockMu.Lock()
+	defer zenBlockMu.Unlock()
+	zenBlockErrs++
+	return zenBlockErrs >= 3
+}
+
+func resetZenBlockErrs() {
+	zenBlockMu.Lock()
+	defer zenBlockMu.Unlock()
+	zenBlockErrs = 0
+}
+
+// setProxyCountries replaces the proxy->country map after a refresh.
+func setProxyCountries(m map[string]string) {
+	zenProxyCountryMu.Lock()
+	defer zenProxyCountryMu.Unlock()
+	zenProxyCountry = m
+}
+
+// proxyCountry returns the api-reported country for a proxy.
+func proxyCountry(proxyURL string) string {
+	if proxyURL == "" {
+		return "direct"
+	}
+	zenProxyCountryMu.RLock()
+	defer zenProxyCountryMu.RUnlock()
+	if c := zenProxyCountry[proxyURL]; c != "" {
+		return c
+	}
+	return "??"
+}
+
+// noteZenCountryBlock counts a geo/user block for a country, returns total.
+func noteZenCountryBlock(country string) int {
+	zenCountryBlockMu.Lock()
+	defer zenCountryBlockMu.Unlock()
+	zenCountryBlocks[country]++
+	return zenCountryBlocks[country]
+}
+
+// logZenNetErr logs a transport-level zen failure with model and country.
+func logZenNetErr(retry int, model, proxy, tag string, err error) {
+	acclog.Printf("!! opencode zen error (retry %d/4) model=%s country=%s proxy=%s %s: %v",
+		retry, model, proxyCountry(proxy), proxy, tag, err)
+}
+
+// logZenBlocked logs a geo/user block with status, snippet, and the running
+// per-country block count. returns the count.
+func logZenBlocked(kind string, retry, status int, model, proxy, tag string, body []byte) int {
+	n := noteZenCountryBlock(proxyCountry(proxy))
+	acclog.Printf("  opencode %s-blocked %d (retry %d/4) model=%s country=%s blocks=%d via proxy=%s %s err=%q",
+		kind, status, retry, model, proxyCountry(proxy), n, proxy, tag, errSnippet(body, 160))
+	return n
+}
+
+// errSnippet squashes a body to one line, capped at n chars.
+func errSnippet(b []byte, n int) string {
+	s := strings.Join(strings.Fields(string(b)), " ")
+	if len(s) > n {
+		return s[:n] + "..."
+	}
+	return s
 }
 
 func watchZenProxies() {

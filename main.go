@@ -1275,7 +1275,8 @@ func (p *Pool) nudgePostResponses(r *http.Request, target string, nb []byte, ses
 		if err != nil {
 			dropProxy(proxy)
 			rotating = true
-			acclog.Printf("!! opencode zen error (retry %d/4) nudge %s: %v", zenRetries, target, err)
+			acclog.Printf("!! opencode zen error (retry %d/4) nudge country=%s proxy=%s %s: %v",
+				zenRetries, proxyCountry(proxy), proxy, target, err)
 			if zenRetries < 4 {
 				time.Sleep(time.Duration(zenRetries+1) * time.Second)
 				continue
@@ -1300,6 +1301,8 @@ func (p *Pool) nudgePostResponses(r *http.Request, target string, nb []byte, ses
 				}
 			}
 			if zenGeoBlocked(eb) {
+				acclog.Printf("  opencode nudge geo-blocked %d country=%s proxy=%s err=%q",
+					up.StatusCode, proxyCountry(proxy), proxy, errSnippet(eb, 160))
 				dropProxy(proxy)
 				rotating = true
 				if zenRetries < 4 {
@@ -1307,6 +1310,8 @@ func (p *Pool) nudgePostResponses(r *http.Request, target string, nb []byte, ses
 					continue
 				}
 			}
+			acclog.Printf("!! opencode nudge upstream %d country=%s proxy=%s err=%q",
+				up.StatusCode, proxyCountry(proxy), proxy, errSnippet(eb, 160))
 			return nil
 		}
 		nb2, _ := io.ReadAll(up.Body)
@@ -2396,7 +2401,7 @@ func (p *Pool) handleOpenCode(w http.ResponseWriter, r *http.Request, body []byt
 		if err != nil {
 			dropProxy(proxy)
 			rotating = true
-			acclog.Printf("!! opencode zen error (retry %d/4) %s: %v", zenRetries, target, err)
+			logZenNetErr(zenRetries, model, proxy, target, err)
 			if noteZenNetworkError() {
 				acclog.Printf("  3+ consecutive network errors, refreshing proxy pool")
 				refreshZenProxies()
@@ -2415,6 +2420,8 @@ func (p *Pool) handleOpenCode(w http.ResponseWriter, r *http.Request, body []byt
 
 		if resp.StatusCode == http.StatusTooManyRequests || resp.StatusCode == 529 {
 			resp.Body.Close()
+			acclog.Printf("  opencode rate-limited %d (retry %d/4) model=%s country=%s proxy=%s, switching proxy",
+				resp.StatusCode, zenRetries, model, proxyCountry(proxy), proxy)
 			dropProxy(proxy)
 			rotating = true
 			time.Sleep(time.Duration(zenRetries+1) * time.Second)
@@ -2425,7 +2432,8 @@ func (p *Pool) handleOpenCode(w http.ResponseWriter, r *http.Request, body []byt
 			eb, _ := io.ReadAll(io.LimitReader(resp.Body, 16<<10))
 			resp.Body.Close()
 			if zenServiceOverloaded(eb) {
-				acclog.Printf("  opencode overloaded model=%s proxy=%s, retrying same proxy+session", model, proxy)
+				acclog.Printf("  opencode overloaded %d (retry %d/4) model=%s country=%s proxy=%s retrying same proxy+session err=%q",
+					resp.StatusCode, zenRetries, model, proxyCountry(proxy), proxy, errSnippet(eb, 160))
 				rotating = false
 				if zenRetries < 4 {
 					time.Sleep(time.Duration(zenRetries+1) * time.Second)
@@ -2433,7 +2441,7 @@ func (p *Pool) handleOpenCode(w http.ResponseWriter, r *http.Request, body []byt
 				}
 			}
 			if zenGeoBlocked(eb) {
-				acclog.Printf("  opencode geo-blocked model=%s via proxy=%s, switching proxy", model, proxy)
+				logZenBlocked("geo", zenRetries, resp.StatusCode, model, proxy, "", eb)
 				dropProxy(proxy)
 				rotating = true
 				if noteZenGeoErr() {
@@ -2446,6 +2454,22 @@ func (p *Pool) handleOpenCode(w http.ResponseWriter, r *http.Request, body []byt
 					continue
 				}
 			}
+			if zenUserBlocked(eb) {
+				logZenBlocked("user", zenRetries, resp.StatusCode, model, proxy, "", eb)
+				dropProxy(proxy)
+				rotating = true
+				if noteZenBlockErr() {
+					acclog.Printf("  3+ user-blocks, refreshing proxy pool")
+					refreshZenProxies()
+					resetZenBlockErrs()
+				}
+				if zenRetries < 4 {
+					time.Sleep(time.Duration(zenRetries+1) * time.Second)
+					continue
+				}
+			}
+			acclog.Printf("!! opencode upstream %d (retry %d/4) model=%s country=%s proxy=%s err=%q",
+				resp.StatusCode, zenRetries, model, proxyCountry(proxy), proxy, errSnippet(eb, 160))
 			resp.Body = io.NopCloser(bytes.NewReader(eb))
 		}
 		resetZenNetworkErrors()
@@ -2597,14 +2621,24 @@ func stripCacheFields(v any) any {
 var zenGateNames = []string{"bash", "read", "glob", "grep"}
 
 func zenGateTool(name string) any {
-	return map[string]any{"type": "function", "function": map[string]any{"name": name}}
+	// parameters is required: space-bunny 400s on tools without it.
+	return map[string]any{"type": "function", "function": map[string]any{
+		"name":       name,
+		"parameters": map[string]any{"type": "object", "properties": map[string]any{}},
+	}}
 }
 
 // ensureZenTools appends any missing gate tools. clients like claude code send
 // capitalized names (Bash, Read, ...) which the gate does not accept, so a
 // presence check by exact name is required rather than a skip when non-empty.
+// bodies with no tools at all (title gen, compact summaries) are left alone:
+// giving the summarizer a callable read stub makes it emit tool calls that
+// opencode rejects with "tool call not allowed while generating summary".
 func ensureZenTools(m map[string]any) {
 	t, _ := m["tools"].([]any)
+	if len(t) == 0 {
+		return
+	}
 	have := make(map[string]bool, len(t))
 	for _, x := range t {
 		xm, ok := x.(map[string]any)
@@ -2614,6 +2648,9 @@ func ensureZenTools(m map[string]any) {
 		name := ""
 		if fn, ok := xm["function"].(map[string]any); ok {
 			name, _ = fn["name"].(string)
+			if _, ok := fn["parameters"]; !ok {
+				fn["parameters"] = map[string]any{"type": "object", "properties": map[string]any{}}
+			}
 		} else if n, ok := xm["name"].(string); ok {
 			name = n
 		}

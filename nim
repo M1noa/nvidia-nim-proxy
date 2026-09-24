@@ -1,6 +1,6 @@
 #!/bin/sh
 # nim: run nim-proxy in foreground, as a service, or show status.
-# usage: nim [run|start|stop|restart|status|logs|tail|install|uninstall]
+# usage: nim [run|start|stop|restart|status [tail]|status-tail|logs|log [N|tail]|tail|install|uninstall]
 PROXY_DIR="$(cd "$(dirname "$0")" && pwd)"
 LOGFILE="$PROXY_DIR/nim-proxy.log"
 BINARY="$PROXY_DIR/nim-proxy"
@@ -30,11 +30,19 @@ svc_running() {
   esac
 }
 
+# port_alive reports whether something is serving on the proxy port. catches
+# instances started manually (outside the service manager) so status reads
+# correctly and start does not double-bind.
+port_alive() {
+  command -v curl >/dev/null 2>&1 && curl -sf -m 2 "http://localhost:${PORT:-5419}/status" >/dev/null 2>&1
+}
+
 svc_start() {
   case "$SVC_CMD" in
     launchd)
       sed "s|REPLACE_WITH_PATH|$PROXY_DIR|g" "$PROXY_DIR/deploy/$SVC.plist" > "$PLIST"
-      launchctl bootstrap "gui/$(id -u)" "$PLIST" 2>/dev/null || launchctl load "$PLIST" 2>/dev/null ;;
+      launchctl bootout "gui/$(id -u)/$SVC" 2>/dev/null
+      launchctl bootstrap "gui/$(id -u)" "$PLIST" || launchctl load "$PLIST" ;;
     systemd)
       mkdir -p "$(dirname "$SYSTEMD")"
       sed "s|REPLACE_WITH_PATH|$PROXY_DIR|g" "$PROXY_DIR/deploy/nvidia-nim-proxy.service" > "$SYSTEMD"
@@ -54,7 +62,7 @@ svc_stop() {
 }
 
 pretty_status() {
-  if svc_running; then echo "nim-proxy: RUNNING ($SVC_CMD)"; else echo "nim-proxy: STOPPED"; return 1; fi
+  if svc_running || port_alive; then echo "nim-proxy: RUNNING ($SVC_CMD)"; else echo "nim-proxy: STOPPED"; return 1; fi
   PY="$(find_py)" || PY=""
   if [ -n "$PY" ] && command -v curl >/dev/null 2>&1; then
     "$PY" << EOF 2>/dev/null
@@ -64,6 +72,7 @@ try:
   print()
   print(f"  Version:    {data.get('version','?')}")
   print(f"  Uptime:     {data['uptime']}")
+  print(f"  Load:       {data.get('concurrent',0)}/{data.get('sem_limit',0)} concurrent")
   if 'keys' in data:
     print(f"  Keys:       {data['available']}/{data['total']} available")
     print()
@@ -84,6 +93,12 @@ try:
     print()
     print(f"  Opencode:   {len(ocm)} free models")
     for m in ocm: print(f"    {m}")
+  if data.get('model_locks'):
+    print()
+    print(f"  Locks:      {data['model_locks']}")
+  if data.get('zen_session') or data.get('zen_proxy'):
+    print()
+    print(f"  Zen:        {data.get('zen_session','?')} via {data.get('zen_proxy') or 'direct'} ({data.get('zen_ago','?')} ago)")
   print()
 except Exception as e:
   print(f'  (status fetch failed: {e})')
@@ -93,19 +108,37 @@ EOF
   fi
 }
 
+# status_tail live-loops pretty_status every 2s. distinct from log tail.
+status_tail() {
+  trap 'exit 0' INT TERM
+  while true; do
+    clear 2>/dev/null || printf '\033c'
+    pretty_status
+    sleep 2
+  done
+}
+
 case "${1:-status}" in
   run)     exec "$BINARY" ;;
-  start)   svc_start; sleep 2; pretty_status ;;
+  start)
+    if port_alive; then pretty_status; exit 0; fi
+    svc_start; sleep 2; pretty_status ;;
   stop)    svc_stop; echo "nim-proxy stopped" ;;
   restart) svc_stop; sleep 1; svc_start; sleep 2; pretty_status ;;
-  status)  pretty_status ;;
-  logs)
-    pretty_status
-    [ -f "$LOGFILE" ] && { echo ""; echo "  Access log (last 10):"; tail -10 "$LOGFILE" | sed 's/^/    /'; } ;;
+  status)  pretty_status; [ "$2" = "tail" ] && status_tail ;;
+  status-tail) status_tail ;;
+  logs)    pretty_status; [ -f "$LOGFILE" ] && { echo ""; echo "  Access log (last 10):"; tail -10 "$LOGFILE" | sed 's/^/    /'; } ;;
+  log)
+    case "$2" in
+      ""|tail|f) tail -f "$LOGFILE" ;;
+      [0-9]*) [ -f "$LOGFILE" ] && { echo ""; echo "  Access log (last $2):"; tail -n "$2" "$LOGFILE" | sed 's/^/    /'; } ;;
+      *) echo "Usage: nim log [N|tail]"; exit 1 ;;
+    esac ;;
   tail)    tail -f "$LOGFILE" ;;
   install)
+    port_alive && { pretty_status; exit 0; }
     svc_start; sleep 2; pretty_status
     echo "installed ($SVC_CMD). see deploy/ for system-wide setup." ;;
   uninstall) svc_stop; rm -f "$PLIST" "$SYSTEMD"; echo "nim-proxy uninstalled" ;;
-  *) echo "Usage: nim [run|start|stop|restart|status|logs|tail|install|uninstall]"; exit 1 ;;
+  *) echo "Usage: nim [run|start|stop|restart|status [tail]|status-tail|logs|log [N|tail]|tail|install|uninstall]"; exit 1 ;;
 esac

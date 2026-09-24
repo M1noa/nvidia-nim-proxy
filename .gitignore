@@ -13,6 +13,8 @@ nvidia-nim-proxy-*
 nim-proxy.log
 nim-proxy.err.log
 nim-proxy-debug.log
+nim-proxy.log.pre-rotate
+nim-proxy.err.log.pre-rotate
 nim-usage.jsonl
 
 # os / editor
@@ -29,3 +31,5 @@ nim-usage.jsonl
 system-prompts/
 cctest.py
 opencode_prompt.py
+zen_probe_spark.tsv
+zen_probe_countries.tsv
