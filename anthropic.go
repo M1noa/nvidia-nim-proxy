@@ -68,6 +68,8 @@ type anthropicMsg struct {
 type anthropicBlock struct {
 	Type      string          `json:"type"`
 	Text      string          `json:"text,omitempty"`
+	Thinking  string          `json:"thinking,omitempty"`
+	Signature string          `json:"signature,omitempty"`
 	ID        string          `json:"id,omitempty"`
 	Name      string          `json:"name,omitempty"`
 	Input     json.RawMessage `json:"input,omitempty"`
@@ -388,11 +390,20 @@ func convertAssistantMessage(raw json.RawMessage) []map[string]any {
 
 	var textParts []string
 	var toolCalls []map[string]any
+	var thinkingParts []string
 
 	for _, b := range blocks {
 		switch b.Type {
 		case "text":
 			textParts = append(textParts, b.Text)
+		case "thinking", "redacted_thinking":
+			// zen's interleaved-reasoning models (space-bunny, big-pickle)
+			// expect prior reasoning back on assistant messages as
+			// reasoning_content, matching opencode's transform. drop the
+			// signature; it is opaque and zen does not require it.
+			if b.Thinking != "" {
+				thinkingParts = append(thinkingParts, b.Thinking)
+			}
 		case "tool_use":
 			input := "{}"
 			if len(b.Input) > 0 && string(b.Input) != "null" {
@@ -417,6 +428,9 @@ func convertAssistantMessage(raw json.RawMessage) []map[string]any {
 	}
 	if len(toolCalls) > 0 {
 		msg["tool_calls"] = toolCalls
+	}
+	if len(thinkingParts) > 0 {
+		msg["reasoning_content"] = strings.Join(thinkingParts, "\n")
 	}
 	return []map[string]any{msg}
 }
