@@ -1005,6 +1005,79 @@
   },
   {
     "source": [
+      "Anthropic/claude-code/claude-code-desktop-fable-5",
+      "Anthropic/claude-code/claude-code-fable-5",
+      "Anthropic/claude-code/claude-code-fable-5.1",
+      "Anthropic/claude-code/claude-code-haiku-4.5",
+      "Anthropic/claude-code/claude-code-headless-fable-5.1",
+      "Anthropic/claude-code/claude-code-opus-4.6",
+      "Anthropic/claude-code/claude-code-opus-4.7",
+      "Anthropic/claude-code/claude-code-opus-4.8",
+      "Anthropic/claude-code/claude-code-opus-5",
+      "Anthropic/claude-code/claude-code-sonnet-4.6",
+      "Anthropic/claude-code/claude-code-sonnet-5",
+      "anthropic-claude-code-print_20260902.md",
+      "anthropic-claude-code_20260902.md"
+    ],
+    "guardrail": "Refuse requests for destructive techniques, DoS attacks, mass targeting, supply chain compromise, or detection evasion for malicious purposes.",
+    "locations": [
+      {
+        "file": "leaked-system-prompts/anthropic-claude-code-print_20260902.md",
+        "line": 19
+      },
+      {
+        "file": "leaked-system-prompts/anthropic-claude-code_20260902.md",
+        "line": 15
+      },
+      {
+        "file": "system_prompts_leaks/Anthropic/claude-code/claude-code-desktop-fable-5.md",
+        "line": 10
+      },
+      {
+        "file": "system_prompts_leaks/Anthropic/claude-code/claude-code-fable-5.1.md",
+        "line": 23
+      },
+      {
+        "file": "system_prompts_leaks/Anthropic/claude-code/claude-code-fable-5.md",
+        "line": 19
+      },
+      {
+        "file": "system_prompts_leaks/Anthropic/claude-code/claude-code-haiku-4.5.md",
+        "line": 7
+      },
+      {
+        "file": "system_prompts_leaks/Anthropic/claude-code/claude-code-headless-fable-5.1.md",
+        "line": 23
+      },
+      {
+        "file": "system_prompts_leaks/Anthropic/claude-code/claude-code-opus-4.6.md",
+        "line": 7
+      },
+      {
+        "file": "system_prompts_leaks/Anthropic/claude-code/claude-code-opus-4.7.md",
+        "line": 7
+      },
+      {
+        "file": "system_prompts_leaks/Anthropic/claude-code/claude-code-opus-4.8.md",
+        "line": 7
+      },
+      {
+        "file": "system_prompts_leaks/Anthropic/claude-code/claude-code-opus-5.md",
+        "line": 7
+      },
+      {
+        "file": "system_prompts_leaks/Anthropic/claude-code/claude-code-sonnet-4.6.md",
+        "line": 7
+      },
+      {
+        "file": "system_prompts_leaks/Anthropic/claude-code/claude-code-sonnet-5.md",
+        "line": 7
+      }
+    ],
+    "count": 13
+  },
+  {
+    "source": [
       "Anthropic/claude-fable-5",
       "Anthropic/claude-fable-5.1",
       "Anthropic/claude-opus-5",

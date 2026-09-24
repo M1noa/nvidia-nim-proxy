@@ -17,6 +17,7 @@ import (
 	"syscall"
 	"time"
 	"unicode"
+	"unicode/utf8"
 )
 
 const (
@@ -1720,27 +1721,65 @@ func loadGuardrails(path string) {
 	log.Printf("  Loaded %d guardrails from %s", len(guardrailList), path)
 }
 
+// byteSpan is a [start,end) byte range in the original text.
+type byteSpan struct{ start, end int }
+
+// joinCut splices a removal: trims leading whitespace off the tail and keeps
+// a single space at the seam so sentences don't fuse or leave double spaces.
+func joinCut(left, right string) string {
+	right = strings.TrimLeft(right, " \n\t")
+	if strings.HasSuffix(left, " ") && strings.HasPrefix(right, " ") {
+		right = strings.TrimPrefix(right, " ")
+	}
+	return left + right
+}
+
 // normGuardrail canonicalizes text for matching: lowercase, collapse runs of
 // whitespace, drop leading bullet/markdown and trailing punctuation.
 func normGuardrail(s string) string {
+	n, _ := normSpans(s)
+	return n
+}
+
+// normSpans is normGuardrail plus the byte span of every emitted token in s,
+// so removals can map a normalized match back to the exact original text.
+func normSpans(s string) (string, []byteSpan) {
 	var b strings.Builder
+	var spans []byteSpan
 	space := false
 	first := true
-	for _, r := range s {
+	start, end := -1, -1
+	flush := func() {
+		if start >= 0 && end > start {
+			spans = append(spans, byteSpan{start, end})
+		}
+		start, end = -1, -1
+	}
+	for i := 0; i < len(s); {
+		r, sz := utf8.DecodeRuneInString(s[i:])
 		if unicode.IsSpace(r) {
+			flush()
 			space = true
+			i += sz
 			continue
 		}
 		if first {
 			// skip leading markdown bullets / quotes
 			switch r {
 			case '-', '*', '#', '"', '>', '`', '\'', '(':
+				if start < 0 {
+					start = i // keep skipped leading chars inside the span
+				}
+				i += sz
 				continue
 			}
 			first = false
 		}
 		if space && b.Len() > 0 {
 			b.WriteByte(' ')
+		}
+		if start < 0 {
+			start = i
 		}
 		space = false
 		// sentence punctuation carries no matching signal; drop it so
@@ -1749,15 +1788,19 @@ func normGuardrail(s string) string {
 		// exact-substring matching tight on both sides.
 		switch r {
 		case '.', ',', ';', ':', '!', '?', '"', '\'', '(', ')', '[', ']', '{', '}', '`':
+			i += sz
 			continue
 		}
 		if unicode.IsUpper(r) {
 			r = unicode.ToLower(r)
 		}
 		b.WriteRune(r)
+		end = i + sz
+		i += sz
 	}
+	flush()
 	out := strings.TrimRight(b.String(), " \t.,;:!?\"'-")
-	return strings.TrimSpace(out)
+	return strings.TrimSpace(out), spans
 }
 
 // isStopword reports whether w is a stopword that carries no matching signal.
@@ -1801,18 +1844,20 @@ func dedupeGuardrails() {
 	})
 }
 
-// stripSomeGuardrails removes matched guardrail sentences from a system text.
+// stripSomeGuardrails removes matched guardrail spans from a system text.
 // Normalizes and tokenizes once, then matches each guardrail against that
-// single normalized view. Returns the cleaned text and a removal count.
+// single normalized view. Exact matches cut the exact byte span; fuzzy
+// matches cut from the sentence holding the first matched token through the
+// sentence holding the last matched token. Returns the cleaned text and a
+// removal count.
 func stripSomeGuardrails(text string) (string, int) {
 	if text == "" || len(guardrailPrefixes) == 0 {
 		return text, 0
 	}
-	norm := normGuardrail(text)
-	if norm == "" {
+	norm, spans := normSpans(text)
+	if norm == "" || len(spans) == 0 {
 		return text, 0
 	}
-	low := strings.ToLower(text)
 	words := strings.Fields(norm)
 
 	n := 0
@@ -1820,53 +1865,62 @@ func stripSomeGuardrails(text string) (string, int) {
 		if !guardrailMatchNorm(norm, words, gn) {
 			continue
 		}
-		// exact first: normalized substring in the original, case-insensitive
-		if ci := strings.Index(low, gn); ci >= 0 {
-			end := ci + len(gn)
-			for end < len(text) && (text[end] == '.' || text[end] == ' ' || text[end] == '\n' || text[end] == '\t' || text[end] == ',' || text[end] == ';') {
-				end++
-			}
-			text = text[:ci] + text[end:]
-			low = strings.ToLower(text)
-			norm = normGuardrail(text)
-			words = strings.Fields(norm)
-			n++
+		score, first, last := guardrailScore(norm, words, gn)
+		if first < 0 || last < first || first >= len(spans) {
 			continue
 		}
-		// fuzzy: anchor on the scorer's first matched sig token (the
-		// actual window start), cut the enclosing sentence. score was
-		// already >= threshold, so this anchor is the real hit.
-		_, first := guardrailScore(norm, words, gn)
-		sig := sigTokens(gn)
-		if first < 0 || len(sig) == 0 {
-			continue
+		if last >= len(spans) {
+			last = len(spans) - 1
 		}
-		fi := strings.Index(low, sig[0])
-		if fi < 0 {
-			continue
-		}
-		start := 0
-		for j := fi; j > 0; j-- {
-			if low[j] == '\n' || low[j] == '.' || low[j] == '!' || low[j] == '?' {
-				start = j + 1
+		if score == 1.0 {
+			// exact: cut from span[first].start through the end of span[last]'s
+			// sentence, so trailing punctuation is removed with the match.
+			start := spans[first].start
+			end := spans[last].end
+			for end < len(text) {
+				c := text[end]
+				if c == '\n' || c == '.' || c == '!' || c == '?' {
+					end++
+					break
+				}
+				if c == ' ' || c == ',' || c == ';' || c == '\t' {
+					end++
+					continue
+				}
 				break
 			}
-		}
-		end := len(text)
-		for j := fi; j < len(low); j++ {
-			if low[j] == '\n' || low[j] == '.' || low[j] == '!' || low[j] == '?' {
-				end = j + 1
-				break
+			text = joinCut(text[:start], text[end:])
+		} else {
+			// fuzzy: cut from the sentence containing span[first] through the
+			// sentence containing span[last]; never further into the text.
+			s0 := spans[first].start
+			for s0 > 0 {
+				c := text[s0-1]
+				if c == '\n' || c == '.' || c == '!' || c == '?' {
+					break
+				}
+				s0--
 			}
+			e0 := spans[last].end
+			for e0 < len(text) {
+				c := text[e0]
+				if c == '\n' || c == '.' || c == '!' || c == '?' {
+					e0++
+					break
+				}
+				e0++
+			}
+			if e0 <= s0 {
+				continue
+			}
+			text = joinCut(text[:s0], text[e0:])
 		}
-		if end <= start {
-			continue
-		}
-		text = text[:start] + strings.TrimLeft(text[end:], " \n\t")
-		low = strings.ToLower(text)
-		norm = normGuardrail(text)
-		words = strings.Fields(norm)
 		n++
+		norm, spans = normSpans(text)
+		if norm == "" {
+			break
+		}
+		words = strings.Fields(norm)
 	}
 	return text, n
 }
@@ -1894,24 +1948,45 @@ func sigTokens(gn string) []string {
 	return sig
 }
 
+// tokenAt returns the word index containing byte pos in a normalized string
+// whose tokens are separated by single spaces.
+func tokenAt(norm string, pos int) int {
+	if pos <= 0 {
+		return 0
+	}
+	if pos >= len(norm) {
+		return strings.Count(norm, " ")
+	}
+	return strings.Count(norm[:pos], " ")
+}
+
 // guardrailScore scores a guardrail against a pre-normalized token stream.
 // Returns 1.0 for exact substring, else coverage*density of the best window,
-// or 0 when no window qualifies. Also returns the position of the first
-// matched sig token in words (for anchoring removal), or -1.
+// or 0 when no window qualifies. Also returns the word range [first,last]
+// covered by the match in the text (for exact spans as well), so removals can
+// cut precisely what matched instead of rounding to a sentence.
 // Partial matches count: a paraphrase dropping the tail still scores via
-// coverage, but the window constraint and threshold keep scattered or
-// coincidental tokens out.
-func guardrailScore(norm string, words []string, gn string) (float64, int) {
-	if strings.Contains(norm, gn) {
-		return 1.0, 0
+// coverage, but the window constraint, threshold, and tail weight keep
+// scattered or coincidental tokens out.
+func guardrailScore(norm string, words []string, gn string) (float64, int, int) {
+	if ci := strings.Index(norm, gn); ci >= 0 {
+		first := tokenAt(norm, ci)
+		last := tokenAt(norm, ci+len(gn)-1)
+		if first < 0 {
+			first = 0
+		}
+		if last < first {
+			last = first
+		}
+		return 1.0, first, last
 	}
 	sig := sigTokens(gn)
 	gnLen := len(strings.Fields(gn))
 	if len(sig) < minSigTokens {
-		return 0, -1 // too few distinguishing tokens: exact only (checked above)
+		return 0, -1, -1 // too few distinguishing tokens: exact only (checked above)
 	}
 	// candidate starts: every occurrence of sig[0]
-	best, bestFirst := 0.0, -1
+	best, bestFirst, bestLast := 0.0, -1, -1
 	for s := 0; s < len(words); s++ {
 		if words[s] != sig[0] {
 			continue
@@ -1947,11 +2022,21 @@ func guardrailScore(norm string, words []string, gn string) (float64, int) {
 		density := float64(matched) / float64(span)
 		// tight windows score near coverage; sparse windows are penalized
 		score := coverage * (0.7 + 0.3*density)
+		// distinctiveness floor: short guardrails have few distinguishing
+		// tokens, so a partial match is more likely coincidental. require
+		// near-total coverage as the guardrail gets shorter.
+		floor := 0.9 - 0.03*float64(len(sig))
+		if floor > 0.72 {
+			floor = 0.72
+		}
+		if coverage < floor {
+			continue
+		}
 		if score > best {
-			best, bestFirst = score, s
+			best, bestFirst, bestLast = score, s, last
 		}
 	}
-	return best, bestFirst
+	return best, bestFirst, bestLast
 }
 
 // guardrailMatchNorm reports a hit when the score clears the threshold.
@@ -1959,7 +2044,7 @@ func guardrailMatchNorm(norm string, words []string, gn string) bool {
 	if strings.Contains(norm, gn) {
 		return true
 	}
-	s, _ := guardrailScore(norm, words, gn)
+	s, _, _ := guardrailScore(norm, words, gn)
 	return s >= guardrailMatchThreshold
 }
 
