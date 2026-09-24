@@ -614,10 +614,10 @@ func openAIToAnthropic(body []byte, clientModel string) (out []byte, errMsg stri
 func oaiRequestToAnthropic(body []byte, model string) ([]byte, error) {
 	var req struct {
 		Messages []struct {
-			Role       string          `json:"role"`
-			Content    json.RawMessage `json:"content"`
-			Name       string          `json:"name"`
-			ToolCalls  []struct {
+			Role      string          `json:"role"`
+			Content   json.RawMessage `json:"content"`
+			Name      string          `json:"name"`
+			ToolCalls []struct {
 				ID       string `json:"id"`
 				Type     string `json:"type"`
 				Function struct {
@@ -2035,7 +2035,7 @@ func setZenHeaders(req *http.Request, sessionID string) {
 	req.Header.Set("x-opencode-session", sessionID)
 	req.Header.Set("x-opencode-request", zenMsgID())
 	req.Header.Set("x-opencode-project", "global")
- req.Header.Set("User-Agent", "opencode/"+zenVersion+zenUASuffix)
+	req.Header.Set("User-Agent", "opencode/"+zenVersion+zenUASuffix)
 	req.Header.Set("Accept", "*/*")
 }
 

@@ -702,7 +702,7 @@ type openRouterModel struct {
 }
 
 // hard-coded free models that don't end in "-free"
-var extraFreeModels = []string{"big-pickle"}
+var extraFreeModels = []string{"big-pickle", "union-alpha"}
 
 // endpointForModel returns the Zen API endpoint path for a model.
 // Muse Spark models use /responses; union-alpha uses /messages (anthropic
@@ -1265,7 +1265,7 @@ func (p *Pool) nudgePostResponses(r *http.Request, target string, nb []byte, ses
 		for k, v := range r.Header {
 			switch strings.ToLower(k) {
 			case "authorization", "host", "content-type", "accept", "accept-encoding",
-				"connection", "content-length", "user-agent",
+				"connection", "content-length", "user-agent", "cookie",
 				"x-opencode-client", "x-opencode-session", "x-opencode-request", "x-opencode-project":
 				continue
 			default:
@@ -1378,15 +1378,17 @@ func (p *Pool) handleModels(w http.ResponseWriter, r *http.Request) {
 		req, _ := http.NewRequest("GET", nvidiaBase+"/models", nil)
 		req.Header.Set("Authorization", "Bearer "+key.Key)
 		resp, err := mc.Do(req)
-		if err == nil && resp.StatusCode == 200 {
-			var nv struct {
-				Data []struct {
-					ID string `json:"id"`
-				} `json:"data"`
-			}
-			if json.NewDecoder(resp.Body).Decode(&nv) == nil {
-				for _, m := range nv.Data {
-					nvModels = append(nvModels, m.ID)
+		if err == nil {
+			if resp.StatusCode == 200 {
+				var nv struct {
+					Data []struct {
+						ID string `json:"id"`
+					} `json:"data"`
+				}
+				if json.NewDecoder(resp.Body).Decode(&nv) == nil {
+					for _, m := range nv.Data {
+						nvModels = append(nvModels, m.ID)
+					}
 				}
 			}
 			resp.Body.Close()
@@ -1478,15 +1480,19 @@ func (p *Pool) handleModels(w http.ResponseWriter, r *http.Request) {
 	// opencode zen free models (no auth) -> opencode/<id>
 	ocClient := &http.Client{Timeout: 10 * time.Second}
 	if ocResp, err := ocClient.Get(OpencodeBase + "/models"); err == nil {
-		var oc struct {
-			Data []struct {
-				ID string `json:"id"`
-			} `json:"data"`
-		}
-		if json.NewDecoder(ocResp.Body).Decode(&oc) == nil {
+		func() {
+			defer ocResp.Body.Close()
+			var oc struct {
+				Data []struct {
+					ID string `json:"id"`
+				} `json:"data"`
+			}
+			if json.NewDecoder(ocResp.Body).Decode(&oc) != nil {
+				return
+			}
 			ocSeen := make(map[string]bool)
 			for _, m := range oc.Data {
-				if !strings.HasSuffix(m.ID, "-free") || ocSeen[m.ID] {
+				if (!strings.HasSuffix(m.ID, "-free") && m.ID != "union-alpha") || ocSeen[m.ID] {
 					continue
 				}
 				ocSeen[m.ID] = true
@@ -1516,17 +1522,19 @@ func (p *Pool) handleModels(w http.ResponseWriter, r *http.Request) {
 					TopProvider:   map[string]any{"context_length": cl, "max_completion_tokens": nil, "is_moderated": false},
 				})
 			}
-		}
-		ocResp.Body.Close()
+		}()
 	}
 
 	// hard-coded extra free models (don't end in "-free", not in /models list)
-	ocSeen := make(map[string]bool)
+	seenIDs := make(map[string]bool, len(out.Data))
+	for _, e := range out.Data {
+		seenIDs[e.ID] = true
+	}
 	for _, id := range extraFreeModels {
-		if ocSeen[id] {
+		if seenIDs["opencode/"+id] {
 			continue
 		}
-		ocSeen[id] = true
+		seenIDs["opencode/"+id] = true
 		cl := 131072
 		desc := ""
 		if e := matchesModelParams(id); e != nil {
@@ -2170,7 +2178,7 @@ func (p *Pool) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	fwd := http.Header{}
 	for k, v := range r.Header {
 		lk := strings.ToLower(k)
-		if lk == "authorization" || lk == "host" || lk == "origin" {
+		if lk == "authorization" || lk == "host" || lk == "origin" || lk == "cookie" {
 			continue
 		}
 		fwd[k] = v
@@ -2474,7 +2482,7 @@ func (p *Pool) handleOpenCode(w http.ResponseWriter, r *http.Request, body []byt
 		for k, v := range r.Header {
 			switch strings.ToLower(k) {
 			case "authorization", "host", "content-type", "accept", "accept-encoding",
-				"connection", "content-length", "user-agent",
+				"connection", "content-length", "user-agent", "cookie",
 				"x-opencode-client", "x-opencode-session", "x-opencode-request", "x-opencode-project":
 				continue
 			default:
@@ -2562,6 +2570,12 @@ func (p *Pool) handleOpenCode(w http.ResponseWriter, r *http.Request, body []byt
 			p.noteZenSuccess(sessionID, usedProxy)
 		}
 		break
+	}
+
+	if resp == nil {
+		acclog.Printf("!! opencode zen unreachable model=%s (no proxy available)", model)
+		http.Error(w, `{"error":"upstream: no proxy available"}`, http.StatusBadGateway)
+		return
 	}
 
 	if usedProxy != "" {

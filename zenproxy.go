@@ -2,7 +2,6 @@ package main
 
 import (
 	"context"
-	"crypto/tls"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -149,7 +148,7 @@ func refreshZenProxies() {
 	cands := make([]string, 0, len(fast))
 	countries := make(map[string]string, len(fast))
 	for _, e := range fast {
-		u := schemeFor(e.Protocols) + "://" + e.IP + ":" + itoa(e.Port)
+		u := schemeFor(e.Protocols) + "://" + e.IP + ":" + strconv.Itoa(e.Port)
 		cands = append(cands, u)
 		countries[u] = strings.ToUpper(strings.TrimSpace(e.Country))
 	}
@@ -386,7 +385,6 @@ func zenClient(proxyURL string) *http.Client {
 		return &http.Client{Timeout: 300 * time.Second}
 	}
 	tr := http.DefaultTransport.(*http.Transport).Clone()
-	tr.TLSClientConfig = &tls.Config{InsecureSkipVerify: true}
 	switch pu.Scheme {
 	case "socks4":
 		tr.Proxy = nil
@@ -514,18 +512,4 @@ func socks5Dial(ctx context.Context, network, addr string, proxyAddr string) (ne
 		return nil, err
 	}
 	return conn, nil
-}
-
-func itoa(n int) string {
-	if n == 0 {
-		return "0"
-	}
-	var b [8]byte
-	i := len(b)
-	for n > 0 {
-		i--
-		b[i] = byte('0' + n%10)
-		n /= 10
-	}
-	return string(b[i:])
 }
