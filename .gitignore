@@ -1,6 +1,8 @@
 # secrets
 keys.json
 keys.jsonc
+config.yml
+proxies.txt
 .env
 
 # binaries

@@ -1,7 +1,9 @@
 package main
 
 import (
+	"bufio"
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -23,9 +25,18 @@ const proxyListURL = "https://proxies.minoa.cat/list?format=json&sort=response&l
 // for muse-spark (RegionError "not available in your country"). from the
 // probe_zen_proxies.py sweep: PK 4/4 blocked, RU/VE/HK blocked with 0 ok,
 // BY/TJ/IQ/MM blocked with 0 ok.
-var zenBlockedCountries = map[string]bool{
-	"PK": true, "RU": true, "VE": true, "HK": true,
-	"BY": true, "TJ": true, "IQ": true, "MM": true,
+var (
+	zenBlockedMu       sync.RWMutex
+	zenBlockedCountries = map[string]bool{
+		"PK": true, "RU": true, "VE": true, "HK": true,
+		"BY": true, "TJ": true, "IQ": true, "MM": true,
+	}
+)
+
+func zenBlocked(cc string) bool {
+	zenBlockedMu.RLock()
+	defer zenBlockedMu.RUnlock()
+	return zenBlockedCountries[cc]
 }
 
 var (
@@ -40,6 +51,9 @@ var (
 	// api-reported proxy -> country, rebuilt on each refresh.
 	zenProxyCountryMu sync.RWMutex
 	zenProxyCountry   = map[string]string{}
+	// api-reported proxy -> response ms, rebuilt on each refresh.
+	zenLatencyMu sync.RWMutex
+	zenLatency   = map[string]int{}
 	// geo/user blocks per country, for hardcoding bad regions.
 	zenCountryBlockMu sync.Mutex
 	zenCountryBlocks  = map[string]int{}
@@ -122,6 +136,7 @@ func refreshZenProxies() {
 		log.Printf("  zen proxies: decode failed: %v", err)
 		return
 	}
+	c := cfg() // caps live in config.yml zen section
 	var fast []proxyEntry
 	for _, e := range list {
 		if e.Port == 0 || e.IP == "" {
@@ -130,10 +145,10 @@ func refreshZenProxies() {
 		if schemeFor(e.Protocols) == "" {
 			continue
 		}
-		if e.ResponseTimeMs > 400 {
+		if c.Zen.MaxResponseMs > 0 && e.ResponseTimeMs > c.Zen.MaxResponseMs {
 			continue
 		}
-		if zenBlockedCountries[strings.ToUpper(strings.TrimSpace(e.Country))] {
+		if zenBlocked(strings.ToUpper(strings.TrimSpace(e.Country))) {
 			continue
 		}
 		if !e.HTTPS && schemeFor(e.Protocols) == "http" {
@@ -142,17 +157,20 @@ func refreshZenProxies() {
 		fast = append(fast, e)
 	}
 	sort.Slice(fast, func(i, j int) bool { return fast[i].ResponseTimeMs < fast[j].ResponseTimeMs })
-	if len(fast) > 400 {
-		fast = fast[:400]
+	if n := c.Zen.PoolSize; n > 0 && len(fast) > n {
+		fast = fast[:n]
 	}
 	cands := make([]string, 0, len(fast))
 	countries := make(map[string]string, len(fast))
+	lats := make(map[string]int, len(fast))
 	for _, e := range fast {
 		u := schemeFor(e.Protocols) + "://" + e.IP + ":" + strconv.Itoa(e.Port)
 		cands = append(cands, u)
 		countries[u] = strings.ToUpper(strings.TrimSpace(e.Country))
+		lats[u] = e.ResponseTimeMs
 	}
 	setProxyCountries(countries)
+	setProxyLatency(lats)
 
 	var wg sync.WaitGroup
 	var mu sync.Mutex
@@ -203,8 +221,28 @@ func verifyProxy(proxyURL string) bool {
 	return strings.Contains(string(body), `"object":"list"`)
 }
 
-// testProxy quickly verifies a proxy is reachable via TCP dial.
-func testProxy(proxyURL string) bool {
+// setProxyLatency replaces the proxy->response-ms map after a refresh.
+func setProxyLatency(m map[string]int) {
+	zenLatencyMu.Lock()
+	defer zenLatencyMu.Unlock()
+	zenLatency = m
+}
+
+// proxyLatency returns api-reported ms, big default when unknown.
+func proxyLatency(proxyURL string) int {
+	zenLatencyMu.RLock()
+	defer zenLatencyMu.RUnlock()
+	if ms := zenLatency[proxyURL]; ms > 0 {
+		return ms
+	}
+	return 10000
+}
+
+// probeProxyFull verifies the full path to zen's front door through the
+// proxy with a short timeout: socks dials opencode.ai:443 via the proxy,
+// http issues a CONNECT for it. beats a tcp ping: dead egress fails here,
+// not 30s into the real request.
+func probeProxyFull(proxyURL string, timeout time.Duration) bool {
 	if proxyURL == "" {
 		return true
 	}
@@ -212,26 +250,162 @@ func testProxy(proxyURL string) bool {
 	if err != nil {
 		return false
 	}
-	conn, err := net.DialTimeout("tcp", pu.Host, 3*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+	switch pu.Scheme {
+	case "socks4":
+		c, err := socks4Dial(ctx, "tcp", "opencode.ai:443", pu.Host)
+		if err != nil {
+			return false
+		}
+		c.Close()
+		return true
+	case "socks5":
+		c, err := socks5Dial(ctx, "tcp", "opencode.ai:443", pu.Host)
+		if err != nil {
+			return false
+		}
+		c.Close()
+		return true
+	default:
+		return probeHTTPConnect(ctx, pu, "opencode.ai:443")
+	}
+}
+
+// probeHTTPConnect dials the proxy and issues CONNECT target, true on 200.
+func probeHTTPConnect(ctx context.Context, pu *url.URL, target string) bool {
+	var d net.Dialer
+	c, err := d.DialContext(ctx, "tcp", pu.Host)
 	if err != nil {
 		return false
 	}
-	conn.Close()
-	return true
+	defer c.Close()
+	if dl, ok := ctx.Deadline(); ok {
+		c.SetDeadline(dl)
+		defer c.SetDeadline(time.Time{})
+	}
+	var sb strings.Builder
+	sb.WriteString("CONNECT " + target + " HTTP/1.1\r\nHost: " + target + "\r\n")
+	if pu.User != nil {
+		pw, _ := pu.User.Password()
+		cred := base64.StdEncoding.EncodeToString([]byte(pu.User.Username() + ":" + pw))
+		sb.WriteString("Proxy-Authorization: Basic " + cred + "\r\n")
+	}
+	sb.WriteString("\r\n")
+	if _, err := io.WriteString(c, sb.String()); err != nil {
+		return false
+	}
+	line, err := bufio.NewReader(c).ReadString('\n')
+	if err != nil {
+		return false
+	}
+	return strings.Contains(line, " 200")
 }
 
-// pickFastProxy returns a random TCP-reachable proxy, or "" if none.
+// raceProbe probes proxies in parallel, first full-path winner wins.
+// "" when none passes within timeout.
+func raceProbe(proxies []string, timeout time.Duration) string {
+	win := make(chan string, 1)
+	var wg sync.WaitGroup
+	for _, u := range proxies {
+		if u == "" {
+			continue
+		}
+		wg.Add(1)
+		go func(u string) {
+			defer wg.Done()
+			if probeProxyFull(u, timeout) {
+				select {
+				case win <- u:
+				default:
+				}
+			}
+		}(u)
+	}
+	go func() {
+		wg.Wait()
+		close(win)
+	}()
+	t := time.NewTimer(timeout + 500*time.Millisecond)
+	defer t.Stop()
+	select {
+	case w := <-win:
+		return w
+	case <-t.C:
+		return ""
+	}
+}
+
+// sampleProxies returns up to n distinct pool proxies, weighted toward low
+// api-reported latency: the fastest quartile wins ~3/4 of draws.
+func sampleProxies(n int) []string {
+	zenProxiesMu.RLock()
+	pool := append([]string(nil), zenProxies...)
+	zenProxiesMu.RUnlock()
+	if len(pool) == 0 {
+		return nil
+	}
+	sort.Slice(pool, func(i, j int) bool { return proxyLatency(pool[i]) < proxyLatency(pool[j]) })
+	q := len(pool) / 4
+	if q < 1 {
+		q = 1
+	}
+	var out []string
+	seen := map[string]bool{}
+	for len(out) < n && len(seen) < len(pool) {
+		u := pool[rand.Intn(len(pool))]
+		if rand.Intn(4) < 3 {
+			u = pool[rand.Intn(q)]
+		}
+		if !seen[u] {
+			seen[u] = true
+			out = append(out, u)
+		}
+	}
+	return out
+}
+
+// firstClient picks the attempt-0 client: a proxy when always_proxy is on,
+// direct otherwise. session rotates whenever a proxy is used.
+func firstClient(sessionID *string) (string, *http.Client) {
+	if fp := firstProxy(); fp != "" {
+		if sessionID != nil {
+			*sessionID = zenSession()
+		}
+		return fp, zenClient(fp)
+	}
+	return "", &http.Client{Timeout: 300 * time.Second}
+}
+
+// firstProxy returns a proxy for attempt 0 when always_proxy is on.
+func firstProxy() string {
+	if !cfg().Zen.AlwaysProxy {
+		return ""
+	}
+	if p := pickFastProxy(); p != "" {
+		return p
+	}
+	log.Printf("  zen always_proxy on but no proxies yet, going direct")
+	return ""
+}
+
+// pickFastProxy races two sampled proxies per call: latency-weighted toward
+// the fastest quartile, full zen-path probe, 3s budget. custom wins.
+// sequential tcp pick version replaced: it liked tcp-open dead egress.
 func pickFastProxy() string {
+	if cps := getCustomProxies(); len(cps) > 0 {
+		if w := raceProbe(cps, 3*time.Second); w != "" {
+			return w
+		}
+		return cps[rand.Intn(len(cps))]
+	}
+	if w := raceProbe(sampleProxies(2), 3*time.Second); w != "" {
+		return w
+	}
 	zenProxiesMu.RLock()
 	defer zenProxiesMu.RUnlock()
 	if len(zenProxies) == 0 {
 		return ""
-	}
-	for i := 0; i < 8 && i < len(zenProxies); i++ {
-		idx := rand.Intn(len(zenProxies))
-		if testProxy(zenProxies[idx]) {
-			return zenProxies[idx]
-		}
 	}
 	return zenProxies[rand.Intn(len(zenProxies))]
 }
@@ -265,6 +439,18 @@ func resetZenNetworkErrors() {
 	zenNetErrMu.Lock()
 	defer zenNetErrMu.Unlock()
 	zenNetErrs = 0
+}
+
+// zenBackoff caps retry sleeps at 300ms: 0, 150ms, 300ms, 300ms.
+// old linear 1-4s sleeps added up to 10s per request on a dead pool.
+func zenBackoff(retry int) {
+	d := time.Duration(retry) * 150 * time.Millisecond
+	if d > 300*time.Millisecond {
+		d = 300 * time.Millisecond
+	}
+	if d > 0 {
+		time.Sleep(d)
+	}
 }
 
 // zenGeoBlocked reports whether an upstream error body means the model is
@@ -385,21 +571,30 @@ func zenClient(proxyURL string) *http.Client {
 		return &http.Client{Timeout: 300 * time.Second}
 	}
 	tr := http.DefaultTransport.(*http.Transport).Clone()
+	tr.TLSHandshakeTimeout = 10 * time.Second
+	tr.ResponseHeaderTimeout = 30 * time.Second
+	tr.ExpectContinueTimeout = 1 * time.Second
+	dialer := &net.Dialer{Timeout: 10 * time.Second, KeepAlive: 30 * time.Second}
 	switch pu.Scheme {
 	case "socks4":
 		tr.Proxy = nil
 		tr.DialContext = func(ctx context.Context, network, addr string) (net.Conn, error) {
-			return socks4Dial(ctx, network, addr, pu.Host)
+			c, cancel := context.WithTimeout(ctx, 12*time.Second)
+			defer cancel()
+			return socks4Dial(c, network, addr, pu.Host)
 		}
 	case "socks5":
 		tr.Proxy = nil
 		tr.DialContext = func(ctx context.Context, network, addr string) (net.Conn, error) {
-			return socks5Dial(ctx, network, addr, pu.Host)
+			c, cancel := context.WithTimeout(ctx, 12*time.Second)
+			defer cancel()
+			return socks5Dial(c, network, addr, pu.Host)
 		}
 	default:
 		tr.Proxy = http.ProxyURL(pu)
+		tr.DialContext = dialer.DialContext
 	}
-	return &http.Client{Timeout: 300 * time.Second, Transport: tr}
+	return &http.Client{Timeout: 120 * time.Second, Transport: tr}
 }
 
 // socks4Dial connects to proxyAddr and requests a SOCKS4/SOCKS4a CONNECT to addr.
@@ -416,6 +611,10 @@ func socks4Dial(ctx context.Context, network, addr string, proxyAddr string) (ne
 	conn, err := (&net.Dialer{}).DialContext(ctx, "tcp", proxyAddr)
 	if err != nil {
 		return nil, err
+	}
+	if dl, ok := ctx.Deadline(); ok {
+		conn.SetDeadline(dl)
+		defer conn.SetDeadline(time.Time{})
 	}
 
 	req := []byte{0x04, 0x01, byte(port >> 8), byte(port & 0xff)}
@@ -458,6 +657,10 @@ func socks5Dial(ctx context.Context, network, addr string, proxyAddr string) (ne
 	conn, err := (&net.Dialer{}).DialContext(ctx, "tcp", proxyAddr)
 	if err != nil {
 		return nil, err
+	}
+	if dl, ok := ctx.Deadline(); ok {
+		conn.SetDeadline(dl)
+		defer conn.SetDeadline(time.Time{})
 	}
 
 	if _, err := conn.Write([]byte{0x05, 0x01, 0x00}); err != nil {

@@ -66,9 +66,13 @@ pretty_status() {
   PY="$(find_py)" || PY=""
   if [ -n "$PY" ] && command -v curl >/dev/null 2>&1; then
     "$PY" << EOF 2>/dev/null
-import json, urllib.request
+import json, os, urllib.request
 try:
-  data = json.loads(urllib.request.urlopen('http://localhost:${PORT:-5419}/status', timeout=3).read())
+  # NIM_AUTH forwards your token so authed proxies show full status.
+  req = urllib.request.Request('http://localhost:${PORT:-5419}/status')
+  if os.environ.get('NIM_AUTH'):
+    req.add_header('Authorization', 'Bearer ' + os.environ['NIM_AUTH'])
+  data = json.loads(urllib.request.urlopen(req, timeout=3).read())
   print()
   print(f"  Version:    {data.get('version','?')}")
   print(f"  Uptime:     {data['uptime']}")

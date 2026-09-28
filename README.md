@@ -17,7 +17,7 @@ Point any OpenAI client at `base_url=http://localhost:5419/v1` with any API key.
 
 ```sh
 go build -o nim-proxy .
-./nim-proxy          # listens on :5419, creates keys.jsonc for later
+./nim-proxy          # listens on :5419, creates config.yml on first run
 ```
 
 This already serves every `opencode/<model>` free model. Check what's available:
@@ -37,12 +37,25 @@ curl http://localhost:5419/v1/chat/completions \
 
 ## Adding NVIDIA keys (optional)
 
-```sh
-cp keys.jsonc.example keys.jsonc
-# edit keys.jsonc: {"main": "nvapi-xxx", "backup": "nvapi-yyy"}
+Edit `config.yml` (created from `config.yml.example` on first run):
+
+```yaml
+nvidia_keys:
+  main: "nvapi-xxx"
+  backup-1: "nvapi-yyy"
 ```
 
 Edits hot-reload, no restart. Without keys, NIM models return 503 with a hint; `opencode/*` keeps working.
+
+## Locking it down with auth (optional)
+
+```yaml
+auth:
+  tokens:
+    - "sk-my-secret-token"
+```
+
+Empty `tokens` (default) means open proxy, any key works. With tokens set, every model endpoint (`/v1/chat/*`, `/v1/messages*`, `/v1/responses*`) needs `Authorization: Bearer <token>` or `x-api-key: <token>`. `/v1/models` and `/status` stay open, but `/status` hides keys, locks, zen session and proxy unless the request carries a valid token. `./nim status` forwards `NIM_AUTH` as the token when set.
 
 ## Use with opencode
 
@@ -60,7 +73,7 @@ The proxy speaks the Anthropic Messages API:
 ANTHROPIC_BASE_URL=http://localhost:5419 claude
 ```
 
-`claude_models.jsonc` maps `claude-*` names to backends (glob patterns, first match wins, hot-reloaded). Defaults route to free `opencode/*` models, so Claude Code works keyless too.
+`models.claude_map` in `config.yml` maps `claude-*` names to backends (glob patterns, first match wins, hot-reloaded). Defaults route to free `opencode/*` models, so Claude Code works keyless too.
 
 Endpoints: `POST /v1/messages` (stream + tools), `POST /v1/messages/count_tokens`, `POST /v1/messages/classifier` (always approves).
 
@@ -88,16 +101,25 @@ System-wide installs: templates live in `deploy/` (replace `REPLACE_WITH_PATH` w
 
 ## Configure
 
-| file | purpose |
+Everything lives in `config.yml` (auto-created from `config.yml.example`, hot-reloaded, heavily commented). Knobs:
+
+| section | purpose |
 |---|---|
-| `keys.jsonc` | NVIDIA keys, optional (auto-created empty on first run) |
-| `model_params.jsonc` | per-model default params, glob patterns, first match wins |
-| `claude_models.jsonc` | `claude-*` → backend mapping for `/v1/messages` |
-| `guardrails.json` | system-prompt guardrail strings stripped from requests |
+| `server.port` | listen port (env `PORT` wins) |
+| `auth.tokens` | tokens gating model endpoints; empty = open proxy |
+| `nvidia_keys` | NVIDIA keys, optional (keyless serves `opencode/*` only) |
+| `guardrails` | strip baked-in refusals (`enabled`, big `file` list, inline `extra`) |
+| `inject` | request tweaks (`params`, `helpful_line` + custom `helpful_text`) |
+| `anonymize` | mask `entities` (name + `variations`, per-type) and legacy `terms` per request (`enabled`, `mode: realistic`/`variable`, `fuzzy_threshold`, `disclose`); model sees masks only, responses swap back |
+| `nudge` | master switch for the spark no-tools continue (`enabled`, default on; per-model `nudge_no_tools` still applies) |
+| `zen` | `always_proxy`, custom `proxies` / `proxy_file` (auth in URL ok), `blocked_countries`, pool caps |
+| `status` | toggle `show_keys`, `show_opencode_models`, `show_zen`, `show_locks` |
+| `models.params` | per-model default params, glob patterns, first match wins |
+| `models.claude_map` | `claude-*` → backend mapping for `/v1/messages` |
 
-Env vars: `PORT` (default 5419), `KEY_FILE` (default `keys.jsonc`), `DEBUG=1` (verbose body logging to `nim-proxy-debug.log`).
+Env vars: `PORT`, `CONFIG_FILE` (default `config.yml`), `NIM_AUTH` (token for `./nim status`), `DEBUG=1` (verbose body logging to `nim-proxy-debug.log`).
 
-Other endpoints: `/status` (pool health, `keys` omitted when keyless), `/v1/models` (whitelisted NIM + live zen free models), `./nim-proxy probe` (NIM rate-limit probe, needs keys).
+Other endpoints: `/status` (pool health, sensitive fields hidden without a token when auth is on), `/v1/models` (whitelisted NIM + live zen free models), `./nim-proxy probe` (NIM rate-limit probe, needs keys).
 
 Requests are logged to `nim-usage.jsonl` (tokens, latency, retries, rate-limit headers).
 

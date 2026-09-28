@@ -10,7 +10,7 @@ ExecStart=REPLACE_WITH_PATH/nim-proxy
 Restart=always
 RestartSec=3
 Environment=PORT=5419
-# optional: Environment=KEY_FILE=/path/to/keys.jsonc
+# optional: Environment=CONFIG_FILE=/path/to/config.yml
 
 [Install]
 WantedBy=default.target
