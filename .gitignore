@@ -35,3 +35,7 @@ cctest.py
 opencode_prompt.py
 zen_probe_spark.tsv
 zen_probe_countries.tsv
+
+# pii model artifacts (fetched by pii/fetch_model.sh, never committed)
+pii/testdata/*.onnx
+pii/model/

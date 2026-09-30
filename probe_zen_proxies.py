@@ -2,7 +2,7 @@
 """probe every proxy against zen with a short prompt and random session.
 
 usage:
-  python3 probe_zen_proxies.py [--models big-pickle,union-alpha] [--threads 20] [--limit 0] [--country US]
+  python3 probe_zen_proxies.py [--models big-pickle,muse-spark-1.3-contributor-free] [--threads 20] [--limit 0] [--country US]
   python3 probe_zen_proxies.py --models big-pickle --threads 30 --out zen_probe.tsv
 
 fetches the proxy list from the same api as zenproxy.go (minus the us-only
@@ -43,8 +43,6 @@ def new_id(prefix):
 def endpoint(model):
     if model.startswith("muse-spark"):
         return "/responses"
-    if model == "union-alpha" or model.startswith("union-alpha-"):
-        return "/messages"
     return "/chat/completions"
 
 

@@ -26,7 +26,7 @@ const proxyListURL = "https://proxies.minoa.cat/list?format=json&sort=response&l
 // probe_zen_proxies.py sweep: PK 4/4 blocked, RU/VE/HK blocked with 0 ok,
 // BY/TJ/IQ/MM blocked with 0 ok.
 var (
-	zenBlockedMu       sync.RWMutex
+	zenBlockedMu        sync.RWMutex
 	zenBlockedCountries = map[string]bool{
 		"PK": true, "RU": true, "VE": true, "HK": true,
 		"BY": true, "TJ": true, "IQ": true, "MM": true,
@@ -194,6 +194,9 @@ func refreshZenProxies() {
 	zenProxiesMu.Lock()
 	zenProxies = verified
 	zenProxiesMu.Unlock()
+	// a fresh pool means every lane's pinned exit is suspect: revalidate
+	// against the new verified set so lanes stop burning stale exits.
+	lanesRevalidate(verified)
 	log.Printf("  zen proxies: %d verified of %d candidates", len(verified), len(cands))
 }
 
@@ -365,51 +368,6 @@ func sampleProxies(n int) []string {
 	return out
 }
 
-// firstClient picks the attempt-0 client: a proxy when always_proxy is on,
-// direct otherwise. session rotates whenever a proxy is used.
-func firstClient(sessionID *string) (string, *http.Client) {
-	if fp := firstProxy(); fp != "" {
-		if sessionID != nil {
-			*sessionID = zenSession()
-		}
-		return fp, zenClient(fp)
-	}
-	return "", &http.Client{Timeout: 300 * time.Second}
-}
-
-// firstProxy returns a proxy for attempt 0 when always_proxy is on.
-func firstProxy() string {
-	if !cfg().Zen.AlwaysProxy {
-		return ""
-	}
-	if p := pickFastProxy(); p != "" {
-		return p
-	}
-	log.Printf("  zen always_proxy on but no proxies yet, going direct")
-	return ""
-}
-
-// pickFastProxy races two sampled proxies per call: latency-weighted toward
-// the fastest quartile, full zen-path probe, 3s budget. custom wins.
-// sequential tcp pick version replaced: it liked tcp-open dead egress.
-func pickFastProxy() string {
-	if cps := getCustomProxies(); len(cps) > 0 {
-		if w := raceProbe(cps, 3*time.Second); w != "" {
-			return w
-		}
-		return cps[rand.Intn(len(cps))]
-	}
-	if w := raceProbe(sampleProxies(2), 3*time.Second); w != "" {
-		return w
-	}
-	zenProxiesMu.RLock()
-	defer zenProxiesMu.RUnlock()
-	if len(zenProxies) == 0 {
-		return ""
-	}
-	return zenProxies[rand.Intn(len(zenProxies))]
-}
-
 // dropProxy removes a dead proxy from the pool so it is not picked again.
 func dropProxy(proxyURL string) {
 	if proxyURL == "" {
@@ -421,6 +379,7 @@ func dropProxy(proxyURL string) {
 		if p == proxyURL {
 			zenProxies = append(zenProxies[:i], zenProxies[i+1:]...)
 			log.Printf("  zen proxies: dropped %s (left %d)", proxyURL, len(zenProxies))
+			laneDropProxy(proxyURL)
 			return
 		}
 	}
@@ -501,6 +460,49 @@ func resetZenBlockErrs() {
 	zenBlockErrs = 0
 }
 
+var (
+	zenFreeTierMu   sync.Mutex
+	zenFreeTierErrs int
+	zenRefreshMu    sync.Mutex
+)
+
+// zenFreeTierBlocked reports whether an upstream error body refuses the exit
+// IP the anonymous free tier (403 FreeTierError). the flag is per-IP: the
+// same request succeeds from another exit, so rotate proxies instead of
+// failing the client request.
+func zenFreeTierBlocked(body []byte) bool {
+	s := string(body)
+	return strings.Contains(s, "FreeTierError") ||
+		strings.Contains(strings.ToLower(s), "free tier can only be used from within")
+}
+
+// noteZenFreeTierErr counts consecutive free-tier blocks and returns true
+// once the threshold is crossed, signaling most of the pool is flagged.
+func noteZenFreeTierErr() bool {
+	zenFreeTierMu.Lock()
+	defer zenFreeTierMu.Unlock()
+	zenFreeTierErrs++
+	return zenFreeTierErrs >= 3
+}
+
+func resetZenFreeTierErrs() {
+	zenFreeTierMu.Lock()
+	defer zenFreeTierMu.Unlock()
+	zenFreeTierErrs = 0
+}
+
+// refreshZenProxiesAsync triggers a pool refresh without blocking the request
+// path. concurrent triggers collapse into one in-flight refresh.
+func refreshZenProxiesAsync() {
+	go func() {
+		if !zenRefreshMu.TryLock() {
+			return
+		}
+		defer zenRefreshMu.Unlock()
+		refreshZenProxies()
+	}()
+}
+
 // setProxyCountries replaces the proxy->country map after a refresh.
 func setProxyCountries(m map[string]string) {
 	zenProxyCountryMu.Lock()
@@ -554,10 +556,15 @@ func errSnippet(b []byte, n int) string {
 }
 
 func watchZenProxies() {
-	refreshZenProxies()
+	if zenEnabled() {
+		refreshZenProxies()
+	}
 	for {
 		time.Sleep(time.Hour)
-		refreshZenProxies()
+		if zenEnabled() {
+			refreshZenProxies()
+		}
+		sweepLanes()
 	}
 }
 

@@ -121,12 +121,38 @@ func mapClaudeModel(model string) string {
 	return model
 }
 
+// toolNames are the tool names the client declared, in the client's spelling.
+// Upstream models (zen, spark, and other OpenAI-compatible gateways) frequently
+// return tool call names lowercased ("bash" for "Bash"), which makes Claude Code
+// reject the call with "No such tool available". Response emitters run the
+// upstream name back through resolve so tool_use carries the declared spelling.
+type toolNames []string
+
+// resolve maps an upstream tool call name back to the client's spelling: exact
+// match first, then case-insensitive. Unknown names pass through unchanged.
+func (tn toolNames) resolve(name string) string {
+	if !cfg().Translate.restoreToolNames() {
+		return name
+	}
+	for _, c := range tn {
+		if c == name {
+			return c
+		}
+	}
+	for _, c := range tn {
+		if strings.EqualFold(c, name) {
+			return c
+		}
+	}
+	return name
+}
+
 // --- Request Conversion ---
 
-func anthropicRequestToOpenAI(body []byte) (oai []byte, clientModel, upstreamModel string, isStream bool, err error) {
+func anthropicRequestToOpenAI(body []byte) (oai []byte, clientModel, upstreamModel string, tnames toolNames, isStream bool, err error) {
 	var req anthropicRequest
 	if err = json.Unmarshal(body, &req); err != nil {
-		return nil, "", "", false, fmt.Errorf("invalid JSON: %w", err)
+		return nil, "", "", nil, false, fmt.Errorf("invalid JSON: %w", err)
 	}
 
 	clientModel = strings.TrimSuffix(req.Model, "[1m]")
@@ -199,6 +225,7 @@ func anthropicRequestToOpenAI(body []byte) (oai []byte, clientModel, upstreamMod
 			if strings.TrimSpace(name) == "" {
 				continue // zen rejects empty tool names
 			}
+			tnames = append(tnames, name)
 			// zen 400s when parameters is null/missing/non-object.
 			var obj map[string]any
 			if err := json.Unmarshal(params, &obj); err != nil || obj == nil {
@@ -234,7 +261,7 @@ func anthropicRequestToOpenAI(body []byte) (oai []byte, clientModel, upstreamMod
 	ob, _ := json.Marshal(out)
 	injectParams(&ob)
 
-	return ob, clientModel, upstreamModel, isStream, nil
+	return ob, clientModel, upstreamModel, tnames, isStream, nil
 }
 
 func extractSystemText(raw json.RawMessage) string {
@@ -461,7 +488,7 @@ func convertToolChoice(tc any) any {
 
 // --- Response Conversion (non-stream) ---
 
-func openAIToAnthropic(body []byte, clientModel string) (out []byte, errMsg string, msgID string) {
+func openAIToAnthropic(body []byte, clientModel string, tnames toolNames) (out []byte, errMsg string, msgID string) {
 	msgID = "msg_" + randHex(24)
 
 	var oaiResp struct {
@@ -511,6 +538,7 @@ func openAIToAnthropic(body []byte, clientModel string) (out []byte, errMsg stri
 		} else if msg.ReasoningContent != nil && *msg.ReasoningContent != "" {
 			text = *msg.ReasoningContent
 		}
+		text = stripWaitSentinel(text)
 		if text != "" {
 			content = append(content, map[string]any{"type": "text", "text": text})
 		}
@@ -525,7 +553,7 @@ func openAIToAnthropic(body []byte, clientModel string) (out []byte, errMsg stri
 			content = append(content, map[string]any{
 				"type":  "tool_use",
 				"id":    tc.ID,
-				"name":  tc.Function.Name,
+				"name":  tnames.resolve(tc.Function.Name),
 				"input": input,
 			})
 		}
@@ -574,655 +602,11 @@ func openAIToAnthropic(body []byte, clientModel string) (out []byte, errMsg stri
 	return out, "", msgID
 }
 
-// --- OAI <-> Anthropic translation (for /messages models on the OAI path) ---
-
-// oaiRequestToAnthropic converts an openai chat.completions request body into
-// an anthropic-native /messages body for union-alpha and other /messages
-// models, mirroring anthropicRequestToOpenAI in reverse.
-func oaiRequestToAnthropic(body []byte, model string) ([]byte, error) {
-	var req struct {
-		Messages []struct {
-			Role      string          `json:"role"`
-			Content   json.RawMessage `json:"content"`
-			Name      string          `json:"name"`
-			ToolCalls []struct {
-				ID       string `json:"id"`
-				Type     string `json:"type"`
-				Function struct {
-					Name      string `json:"name"`
-					Arguments string `json:"arguments"`
-				} `json:"function"`
-			} `json:"tool_calls"`
-			ToolCallID string `json:"tool_call_id"`
-		} `json:"messages"`
-		Tools []struct {
-			Type     string `json:"type"`
-			Function struct {
-				Name        string          `json:"name"`
-				Description string          `json:"description"`
-				Parameters  json.RawMessage `json:"parameters"`
-			} `json:"function"`
-		} `json:"tools"`
-		ToolChoice  json.RawMessage `json:"tool_choice"`
-		MaxTokens   int             `json:"max_tokens"`
-		Temperature *float64        `json:"temperature"`
-		TopP        *float64        `json:"top_p"`
-		Stop        json.RawMessage `json:"stop"`
-		Stream      bool            `json:"stream"`
-		Reasoning   json.RawMessage `json:"reasoning_effort"`
-	}
-	if err := json.Unmarshal(body, &req); err != nil {
-		return nil, fmt.Errorf("invalid JSON: %w", err)
-	}
-
-	var system []map[string]any
-	msgs := make([]map[string]any, 0, len(req.Messages))
-	for _, m := range req.Messages {
-		switch m.Role {
-		case "system", "developer":
-			if t := oaiContentText(m.Content); t != "" {
-				system = append(system, map[string]any{"type": "text", "text": t})
-			}
-		case "user":
-			blocks := oaiUserBlocks(m.Content)
-			if len(blocks) > 0 {
-				msgs = append(msgs, map[string]any{"role": "user", "content": blocks})
-			}
-		case "assistant":
-			blocks := []map[string]any{}
-			if t := oaiContentText(m.Content); t != "" {
-				blocks = append(blocks, map[string]any{"type": "text", "text": t})
-			}
-			for _, tc := range m.ToolCalls {
-				var input any = map[string]any{}
-				if tc.Function.Arguments != "" {
-					_ = json.Unmarshal([]byte(tc.Function.Arguments), &input)
-				}
-				id := tc.ID
-				if id == "" {
-					id = "toolu_" + randHex(24)
-				}
-				blocks = append(blocks, map[string]any{
-					"type": "tool_use", "id": id,
-					"name": tc.Function.Name, "input": input,
-				})
-			}
-			if len(blocks) > 0 {
-				msgs = append(msgs, map[string]any{"role": "assistant", "content": blocks})
-			}
-		case "tool":
-			tid := m.ToolCallID
-			if tid == "" {
-				tid = m.Name
-			}
-			msgs = append(msgs, map[string]any{"role": "user", "content": []map[string]any{{
-				"type": "tool_result", "tool_use_id": tid,
-				"content": oaiContentText(m.Content),
-			}}})
-		}
-	}
-
-	out := map[string]any{
-		"model":    model,
-		"messages": msgs,
-	}
-	if len(system) == 1 {
-		out["system"] = system[0]["text"]
-	} else if len(system) > 1 {
-		out["system"] = system
-	}
-	if req.MaxTokens > 0 {
-		out["max_tokens"] = req.MaxTokens
-	} else {
-		out["max_tokens"] = 4096
-	}
-	if req.Temperature != nil {
-		out["temperature"] = *req.Temperature
-	}
-	if req.TopP != nil {
-		out["top_p"] = *req.TopP
-	}
-	if len(req.Stop) > 0 {
-		var stops []string
-		if json.Unmarshal(req.Stop, &stops) == nil {
-			out["stop_sequences"] = stops
-		}
-	}
-	if len(req.Tools) > 0 {
-		tools := make([]map[string]any, 0, len(req.Tools))
-		for _, t := range req.Tools {
-			if strings.TrimSpace(t.Function.Name) == "" {
-				continue
-			}
-			schema := t.Function.Parameters
-			if len(schema) == 0 {
-				schema = json.RawMessage(`{"type":"object"}`)
-			}
-			tools = append(tools, map[string]any{
-				"name": t.Function.Name, "description": t.Function.Description,
-				"input_schema": schema,
-			})
-		}
-		if len(tools) > 0 {
-			out["tools"] = tools
-		}
-	}
-	if len(req.ToolChoice) > 0 {
-		var s string
-		if json.Unmarshal(req.ToolChoice, &s) == nil {
-			switch s {
-			case "none":
-				out["tool_choice"] = map[string]any{"type": "none"}
-			case "required":
-				out["tool_choice"] = map[string]any{"type": "any"}
-			default:
-				out["tool_choice"] = map[string]any{"type": "auto"}
-			}
-		} else {
-			var tc struct {
-				Type     string `json:"type"`
-				Function struct {
-					Name string `json:"name"`
-				} `json:"function"`
-			}
-			if json.Unmarshal(req.ToolChoice, &tc) == nil && tc.Function.Name != "" {
-				out["tool_choice"] = map[string]any{"type": "tool", "name": tc.Function.Name}
-			}
-		}
-	}
-
-	out["stream"] = true
-	ob, _ := json.Marshal(out)
-	return ob, nil
-}
-
-// oaiContentText extracts plain text from an openai message content field
-// (string or parts array).
-func oaiContentText(raw json.RawMessage) string {
-	if len(raw) == 0 {
-		return ""
-	}
-	var s string
-	if json.Unmarshal(raw, &s) == nil {
-		return s
-	}
-	var parts []struct {
-		Type     string `json:"type"`
-		Text     string `json:"text"`
-		ImageURL *struct {
-			URL string `json:"url"`
-		} `json:"image_url"`
-	}
-	if json.Unmarshal(raw, &parts) != nil {
-		return ""
-	}
-	var texts []string
-	for _, p := range parts {
-		switch p.Type {
-		case "text":
-			if p.Text != "" {
-				texts = append(texts, p.Text)
-			}
-		case "image_url":
-			if p.ImageURL != nil && p.ImageURL.URL != "" {
-				texts = append(texts, "[Image: "+p.ImageURL.URL+"]")
-			}
-		case "input_text", "output_text":
-			if p.Text != "" {
-				texts = append(texts, p.Text)
-			}
-		}
-	}
-	return strings.Join(texts, "\n")
-}
-
-// oaiUserBlocks converts an openai user content field into anthropic blocks.
-func oaiUserBlocks(raw json.RawMessage) []map[string]any {
-	if len(raw) == 0 {
-		return nil
-	}
-	var s string
-	if json.Unmarshal(raw, &s) == nil {
-		if s == "" {
-			return nil
-		}
-		return []map[string]any{{"type": "text", "text": s}}
-	}
-	var parts []struct {
-		Type     string `json:"type"`
-		Text     string `json:"text"`
-		ImageURL *struct {
-			URL string `json:"url"`
-		} `json:"image_url"`
-	}
-	if json.Unmarshal(raw, &parts) != nil {
-		return nil
-	}
-	blocks := []map[string]any{}
-	for _, p := range parts {
-		switch p.Type {
-		case "text", "input_text", "output_text":
-			if p.Text != "" {
-				blocks = append(blocks, map[string]any{"type": "text", "text": p.Text})
-			}
-		case "image_url":
-			if p.ImageURL != nil && p.ImageURL.URL != "" {
-				u := p.ImageURL.URL
-				if strings.HasPrefix(u, "data:") {
-					// data:<mediatype>;base64,<data> -> anthropic base64 source
-					rest := strings.TrimPrefix(u, "data:")
-					mt := "image/jpeg"
-					data := ""
-					if i := strings.Index(rest, ";base64,"); i >= 0 {
-						if rest[:i] != "" {
-							mt = rest[:i]
-						}
-						data = rest[i+len(";base64,"):]
-					} else if i := strings.Index(rest, ","); i >= 0 {
-						if rest[:i] != "" {
-							mt = rest[:i]
-						}
-						data = rest[i+1:]
-					}
-					if data != "" {
-						blocks = append(blocks, map[string]any{"type": "image", "source": map[string]any{
-							"type": "base64", "media_type": mt, "data": data,
-						}})
-						continue
-					}
-				}
-				blocks = append(blocks, map[string]any{"type": "image", "source": map[string]any{
-					"type": "url", "url": u,
-				}})
-			}
-		}
-	}
-	return blocks
-}
-
-// anthropicFinishToOAI maps an anthropic stop_reason to an openai
-// finish_reason.
-func anthropicFinishToOAI(stop string) string {
-	switch stop {
-	case "max_tokens":
-		return "length"
-	case "tool_use":
-		return "tool_calls"
-	default:
-		return "stop"
-	}
-}
-
-// anthropicToOpenAI converts a folded anthropic message (as produced by
-// foldAnthropicSSE) into an openai chat.completion body.
-func anthropicToOpenAI(folded []byte, modelName string) []byte {
-	var msg struct {
-		Content []struct {
-			Type  string          `json:"type"`
-			Text  string          `json:"text"`
-			ID    string          `json:"id"`
-			Name  string          `json:"name"`
-			Input json.RawMessage `json:"input"`
-		} `json:"content"`
-		StopReason string `json:"stop_reason"`
-		Usage      *struct {
-			InputTokens  int `json:"input_tokens"`
-			OutputTokens int `json:"output_tokens"`
-		} `json:"usage"`
-	}
-	_ = json.Unmarshal(folded, &msg)
-
-	var texts []string
-	var toolCalls []map[string]any
-	for _, b := range msg.Content {
-		switch b.Type {
-		case "text":
-			if b.Text != "" {
-				texts = append(texts, b.Text)
-			}
-		case "tool_use":
-			args := "{}"
-			if len(b.Input) > 0 && string(b.Input) != "null" {
-				args = string(b.Input)
-			}
-			toolCalls = append(toolCalls, map[string]any{
-				"id": b.ID, "type": "function",
-				"function": map[string]any{"name": b.Name, "arguments": args},
-			})
-		}
-	}
-	var content any
-	if len(texts) > 0 {
-		content = strings.Join(texts, "\n")
-	}
-	choice := map[string]any{
-		"index": 0,
-		"message": map[string]any{
-			"role": "assistant", "content": content,
-		},
-		"finish_reason": anthropicFinishToOAI(msg.StopReason),
-	}
-	if len(toolCalls) > 0 {
-		choice["message"].(map[string]any)["tool_calls"] = toolCalls
-	}
-	promptT, compT := 0, 0
-	if msg.Usage != nil {
-		promptT, compT = msg.Usage.InputTokens, msg.Usage.OutputTokens
-	}
-	out, _ := json.Marshal(map[string]any{
-		"id": "chatcmpl-" + randHex(24), "object": "chat.completion",
-		"created": time.Now().Unix(), "model": modelName,
-		"choices": []any{choice},
-		"usage": map[string]any{
-			"prompt_tokens": promptT, "completion_tokens": compT,
-			"total_tokens": promptT + compT,
-		},
-	})
-	return out
-}
-
-// anthropicErrToOAI wraps a native anthropic error body in an openai error
-// envelope so OAI clients on the translated path get a parseable error.
-func anthropicErrToOAI(body []byte, code int) []byte {
-	var ae struct {
-		Error *struct {
-			Type    string `json:"type"`
-			Message string `json:"message"`
-		} `json:"error"`
-	}
-	msg := ""
-	if json.Unmarshal(body, &ae) == nil && ae.Error != nil {
-		msg = ae.Error.Message
-	}
-	if msg == "" {
-		msg = extractErrMessage(string(body))
-	}
-	out, _ := json.Marshal(map[string]any{
-		"error": map[string]any{
-			"message": msg, "type": "server_error",
-			"param": nil, "code": code,
-		},
-	})
-	return out
-}
-
-// streamAnthropicToOpenAI converts a buffered native anthropic /messages SSE
-// stream into openai chat.completion.chunk SSE plus a [DONE] terminator.
-func streamAnthropicToOpenAI(w http.ResponseWriter, body []byte, modelName string) (written int64, promptT, compT int) {
+func streamAnthropic(w http.ResponseWriter, body []byte, clientModel string, tnames toolNames) (written int64, promptT, compT int) {
 	fl, _ := w.(http.Flusher)
-	id := "chatcmpl-" + randHex(24)
-	created := time.Now().Unix()
-	chunk := func(delta string, finish *string) int64 {
-		fr := "null"
-		if finish != nil {
-			fr = jsonStr(*finish)
-		}
-		n, _ := fmt.Fprintf(w, "data: {\"id\":%s,\"object\":\"chat.completion.chunk\",\"created\":%d,\"model\":%s,\"choices\":[{\"index\":0,\"delta\":%s,\"finish_reason\":%s}]}\n\n",
-			jsonStr(id), created, jsonStr(modelName), delta, fr)
-		if fl != nil {
-			fl.Flush()
-		}
-		return int64(n)
-	}
-	written += chunk(`{"role":"assistant"}`, nil)
-	type tcState struct {
-		id   string
-		name string
-		open bool
-	}
-	tools := map[int]*tcState{}
-	stop := "stop"
-	for _, line := range strings.Split(string(body), "\n") {
-		line = strings.TrimSpace(line)
-		if !strings.HasPrefix(line, "data: ") {
-			continue
-		}
-		data := strings.TrimPrefix(line, "data: ")
-		if data == "[DONE]" {
-			break
-		}
-		var evt struct {
-			Type         string `json:"type"`
-			Index        int    `json:"index"`
-			ContentBlock *struct {
-				Type string `json:"type"`
-				Text string `json:"text"`
-				ID   string `json:"id"`
-				Name string `json:"name"`
-			} `json:"content_block"`
-			Delta *struct {
-				Type        string `json:"type"`
-				Text        string `json:"text"`
-				PartialJSON string `json:"partial_json"`
-				StopReason  string `json:"stop_reason"`
-			} `json:"delta"`
-			Message *struct {
-				Usage *struct {
-					InputTokens int `json:"input_tokens"`
-				} `json:"usage"`
-			} `json:"message"`
-			Usage *struct {
-				OutputTokens int `json:"output_tokens"`
-			} `json:"usage"`
-		}
-		if json.Unmarshal([]byte(data), &evt) != nil {
-			continue
-		}
-		switch evt.Type {
-		case "message_start":
-			if evt.Message != nil && evt.Message.Usage != nil {
-				promptT = evt.Message.Usage.InputTokens
-			}
-		case "content_block_start":
-			if evt.ContentBlock != nil && evt.ContentBlock.Type == "tool_use" {
-				tid := evt.ContentBlock.ID
-				if tid == "" {
-					tid = "toolu_" + randHex(24)
-				}
-				tools[evt.Index] = &tcState{id: tid, name: evt.ContentBlock.Name, open: true}
-				written += chunk(fmt.Sprintf(`{"tool_calls":[{"index":%d,"id":%s,"type":"function","function":{"name":%s,"arguments":""}}]}`,
-					evt.Index, jsonStr(tid), jsonStr(evt.ContentBlock.Name)), nil)
-			}
-		case "content_block_delta":
-			if evt.Delta == nil {
-				continue
-			}
-			switch evt.Delta.Type {
-			case "text_delta":
-				written += chunk(fmt.Sprintf(`{"content":%s}`, jsonStr(evt.Delta.Text)), nil)
-			case "input_json_delta":
-				if _, ok := tools[evt.Index]; !ok {
-					tools[evt.Index] = &tcState{id: "toolu_" + randHex(24), open: true}
-				}
-				written += chunk(fmt.Sprintf(`{"tool_calls":[{"index":%d,"function":{"arguments":%s}}]}`,
-					evt.Index, jsonStr(evt.Delta.PartialJSON)), nil)
-			}
-		case "message_delta":
-			if evt.Delta != nil && evt.Delta.StopReason != "" {
-				stop = anthropicFinishToOAI(evt.Delta.StopReason)
-			}
-			if evt.Usage != nil {
-				compT = evt.Usage.OutputTokens
-			}
-		}
-	}
-	written += chunk(`{}`, &stop)
-	n, _ := fmt.Fprintf(w, "data: {\"id\":%s,\"object\":\"chat.completion.chunk\",\"created\":%d,\"model\":%s,\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":null}],\"usage\":{\"prompt_tokens\":%d,\"completion_tokens\":%d,\"total_tokens\":%d}}\n\ndata: [DONE]\n\n",
-		jsonStr(id), created, jsonStr(modelName), promptT, compT, promptT+compT)
-	written += int64(n)
-	if fl != nil {
-		fl.Flush()
-	}
-	return written, promptT, compT
-}
 
-// --- Streaming Conversion ---
-
-// anthropicStreamUsage extracts input/output token counts from a native
-// anthropic /messages SSE stream (message_start + message_delta events).
-func anthropicStreamUsage(body []byte) (promptT, compT int) {
-	for _, line := range strings.Split(string(body), "\n") {
-		line = strings.TrimSpace(line)
-		if !strings.HasPrefix(line, "data: ") {
-			continue
-		}
-		var evt struct {
-			Type    string `json:"type"`
-			Message *struct {
-				Usage *struct {
-					InputTokens int `json:"input_tokens"`
-				} `json:"usage"`
-			} `json:"message"`
-			Usage *struct {
-				OutputTokens int `json:"output_tokens"`
-			} `json:"usage"`
-		}
-		if json.Unmarshal([]byte(strings.TrimPrefix(line, "data: ")), &evt) != nil {
-			continue
-		}
-		if evt.Message != nil && evt.Message.Usage != nil {
-			promptT = evt.Message.Usage.InputTokens
-		}
-		if evt.Usage != nil && evt.Usage.OutputTokens > 0 {
-			compT = evt.Usage.OutputTokens
-		}
-	}
-	return
-}
-
-// foldAnthropicSSE folds a native anthropic /messages SSE stream (text and
-// tool_use blocks) into one message json body.
-func foldAnthropicSSE(body []byte, clientModel string) []byte {
-	type block struct {
-		typ     string // "text" or "tool_use"
-		text    strings.Builder
-		id      string
-		name    string
-		jsonArg strings.Builder
-	}
-	blocks := map[int]*block{}
-	order := []int{}
-	stopReason := "end_turn"
-	promptT, compT := 0, 0
-	for _, line := range strings.Split(string(body), "\n") {
-		line = strings.TrimSpace(line)
-		if !strings.HasPrefix(line, "data: ") {
-			continue
-		}
-		data := strings.TrimPrefix(line, "data: ")
-		if data == "[DONE]" {
-			break
-		}
-		var evt struct {
-			Type         string `json:"type"`
-			Index        int    `json:"index"`
-			ContentBlock *struct {
-				Type string `json:"type"`
-				Text string `json:"text"`
-				ID   string `json:"id"`
-				Name string `json:"name"`
-			} `json:"content_block"`
-			Delta *struct {
-				Type        string `json:"type"`
-				Text        string `json:"text"`
-				PartialJSON string `json:"partial_json"`
-				StopReason  string `json:"stop_reason"`
-			} `json:"delta"`
-			Message *struct {
-				Usage *struct {
-					InputTokens int `json:"input_tokens"`
-				} `json:"usage"`
-			} `json:"message"`
-			Usage *struct {
-				OutputTokens int `json:"output_tokens"`
-			} `json:"usage"`
-		}
-		if json.Unmarshal([]byte(data), &evt) != nil {
-			continue
-		}
-		get := func(idx int) *block {
-			if b, ok := blocks[idx]; ok {
-				return b
-			}
-			b := &block{}
-			blocks[idx] = b
-			order = append(order, idx)
-			return b
-		}
-		switch evt.Type {
-		case "message_start":
-			if evt.Message != nil && evt.Message.Usage != nil {
-				promptT = evt.Message.Usage.InputTokens
-			}
-		case "content_block_start":
-			if evt.ContentBlock != nil {
-				b := get(evt.Index)
-				b.typ = evt.ContentBlock.Type
-				b.id = evt.ContentBlock.ID
-				b.name = evt.ContentBlock.Name
-				b.text.WriteString(evt.ContentBlock.Text)
-			}
-		case "content_block_delta":
-			if evt.Delta != nil {
-				b := get(evt.Index)
-				switch evt.Delta.Type {
-				case "text_delta":
-					b.typ = "text"
-					b.text.WriteString(evt.Delta.Text)
-				case "input_json_delta":
-					b.typ = "tool_use"
-					b.jsonArg.WriteString(evt.Delta.PartialJSON)
-				}
-			}
-		case "message_delta":
-			if evt.Delta != nil && evt.Delta.StopReason != "" {
-				stopReason = evt.Delta.StopReason
-			}
-			if evt.Usage != nil {
-				compT = evt.Usage.OutputTokens
-			}
-		}
-	}
-	content := make([]any, 0, len(order))
-	for _, idx := range order {
-		b := blocks[idx]
-		switch b.typ {
-		case "tool_use":
-			var input any = map[string]any{}
-			if s := b.jsonArg.String(); s != "" {
-				_ = json.Unmarshal([]byte(s), &input)
-			}
-			id := b.id
-			if id == "" {
-				id = "toolu_" + randHex(24)
-			}
-			content = append(content, map[string]any{
-				"type": "tool_use", "id": id, "name": b.name, "input": input,
-			})
-		default:
-			content = append(content, map[string]any{
-				"type": "text", "text": b.text.String(),
-			})
-		}
-	}
-	out, _ := json.Marshal(map[string]any{
-		"id":            "msg_" + randHex(24),
-		"type":          "message",
-		"role":          "assistant",
-		"model":         clientModel,
-		"content":       content,
-		"stop_reason":   stopReason,
-		"stop_sequence": nil,
-		"usage": map[string]any{
-			"input_tokens":  promptT,
-			"output_tokens": compT,
-		},
-	})
-	return out
-}
-
-func streamAnthropic(w http.ResponseWriter, body []byte, clientModel string) (written int64, promptT, compT int) {
-	fl, _ := w.(http.Flusher)
+	// proxy-internal marker must never reach the client.
+	body = stripSentinelSSE(body)
 
 	msgID := "msg_" + randHex(24)
 	preamble := fmt.Sprintf(`{"type":"message_start","message":{"id":"%s","type":"message","role":"assistant","model":"%s","content":[],"stop_reason":null,"stop_sequence":null,"usage":{"input_tokens":0,"cache_creation_input_tokens":0,"cache_read_input_tokens":0,"output_tokens":0}}}`, msgID, clientModel)
@@ -1238,6 +622,12 @@ func streamAnthropic(w http.ResponseWriter, body []byte, clientModel string) (wr
 	toolIndex := -1
 	lastToolIdx := 0
 	hasSentStopReason := false
+	var strip sentinelStripper
+	flushStrip := func() {
+		if tail := strip.flush(); tail != "" && !hasToolCalls && !textClosed {
+			written += writeSSE(w, "content_block_delta", fmt.Sprintf(`{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":%s}}`, jsonStr(tail)))
+		}
+	}
 
 	lines := strings.Split(string(body), "\n")
 	for _, line := range lines {
@@ -1293,7 +683,9 @@ func streamAnthropic(w http.ResponseWriter, body []byte, clientModel string) (wr
 
 		// text delta
 		if choice.Delta.Content != "" && !hasToolCalls && !textClosed {
-			written += writeSSE(w, "content_block_delta", fmt.Sprintf(`{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":%s}}`, jsonStr(choice.Delta.Content)))
+			if clean := strip.push(choice.Delta.Content); clean != "" {
+				written += writeSSE(w, "content_block_delta", fmt.Sprintf(`{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":%s}}`, jsonStr(clean)))
+			}
 		}
 
 		// tool call deltas
@@ -1314,7 +706,7 @@ func streamAnthropic(w http.ResponseWriter, body []byte, clientModel string) (wr
 					if toolID == "" {
 						toolID = "toolu_" + randHex(24)
 					}
-					written += writeSSE(w, "content_block_start", fmt.Sprintf(`{"type":"content_block_start","index":%d,"content_block":{"type":"tool_use","id":"%s","name":"%s","input":{}}}`, lastToolIdx, toolID, tc.Function.Name))
+					written += writeSSE(w, "content_block_start", fmt.Sprintf(`{"type":"content_block_start","index":%d,"content_block":{"type":"tool_use","id":%s,"name":%s,"input":{}}}`, lastToolIdx, jsonStr(toolID), jsonStr(tnames.resolve(tc.Function.Name))))
 				}
 				if tc.Function.Arguments != "" {
 					written += writeSSE(w, "content_block_delta", fmt.Sprintf(`{"type":"content_block_delta","index":%d,"delta":{"type":"input_json_delta","partial_json":%s}}`, lastToolIdx, jsonStr(tc.Function.Arguments)))
@@ -1325,6 +717,7 @@ func streamAnthropic(w http.ResponseWriter, body []byte, clientModel string) (wr
 		// finish reason
 		if choice.FinishReason != nil && !hasSentStopReason {
 			hasSentStopReason = true
+			flushStrip()
 
 			for i := 1; i <= lastToolIdx; i++ {
 				written += writeSSE(w, "content_block_stop", fmt.Sprintf(`{"type":"content_block_stop","index":%d}`, i))
@@ -1356,6 +749,7 @@ func streamAnthropic(w http.ResponseWriter, body []byte, clientModel string) (wr
 
 	// stream ended without finish_reason
 	if !hasSentStopReason {
+		flushStrip()
 		for i := 1; i <= lastToolIdx; i++ {
 			written += writeSSE(w, "content_block_stop", fmt.Sprintf(`{"type":"content_block_stop","index":%d}`, i))
 		}
@@ -1381,12 +775,14 @@ type respStreamer struct {
 	fl          http.Flusher
 	hasFlusher  bool
 	clientModel string
+	tnames      toolNames
 	written     int64
 	promptT     int
 	compT       int
 	blockIdx    int
 	textIdx     int
 	textOpen    bool
+	strip       sentinelStripper
 	toolIdx     map[string]int
 	hasToolUse  bool
 	sentStop    bool
@@ -1413,6 +809,9 @@ func (s *respStreamer) closeText() {
 		return
 	}
 	s.textOpen = false
+	if tail := s.strip.flush(); tail != "" {
+		s.written += writeSSE(s.w, "content_block_delta", fmt.Sprintf(`{"type":"content_block_delta","index":%d,"delta":{"type":"text_delta","text":%s}}`, s.textIdx, jsonStr(tail)))
+	}
 	s.written += writeSSE(s.w, "content_block_stop", fmt.Sprintf(`{"type":"content_block_stop","index":%d}`, s.textIdx))
 }
 
@@ -1423,7 +822,7 @@ func (s *respStreamer) openTool(id, callID, name string) {
 	s.toolIdx[id] = s.blockIdx
 	s.blockIdx++
 	s.hasToolUse = true
-	s.written += writeSSE(s.w, "content_block_start", fmt.Sprintf(`{"type":"content_block_start","index":%d,"content_block":{"type":"tool_use","id":%s,"name":%s,"input":{}}}`, s.toolIdx[id], jsonStr(callID), jsonStr(name)))
+	s.written += writeSSE(s.w, "content_block_start", fmt.Sprintf(`{"type":"content_block_start","index":%d,"content_block":{"type":"tool_use","id":%s,"name":%s,"input":{}}}`, s.toolIdx[id], jsonStr(callID), jsonStr(s.tnames.resolve(name))))
 }
 
 func (s *respStreamer) closeTool(id string) {
@@ -1462,6 +861,8 @@ func (s *respStreamer) finish() {
 }
 
 func (s *respStreamer) feed(body []byte, last bool) {
+	// proxy-internal marker must never reach the client.
+	body = stripSentinelSSE(body)
 	lines := strings.Split(string(body), "\n")
 	for _, line := range lines {
 		line = strings.TrimSpace(line)
@@ -1517,7 +918,9 @@ func (s *respStreamer) feed(body []byte, last bool) {
 		case "response.output_text.delta":
 			s.openText()
 			if evt.Delta != "" {
-				s.written += writeSSE(s.w, "content_block_delta", fmt.Sprintf(`{"type":"content_block_delta","index":%d,"delta":{"type":"text_delta","text":%s}}`, s.textIdx, jsonStr(evt.Delta)))
+				if clean := s.strip.push(evt.Delta); clean != "" {
+					s.written += writeSSE(s.w, "content_block_delta", fmt.Sprintf(`{"type":"content_block_delta","index":%d,"delta":{"type":"text_delta","text":%s}}`, s.textIdx, jsonStr(clean)))
+				}
 			}
 		case "response.output_text.done", "response.content_part.done":
 			s.closeText()
@@ -1537,9 +940,9 @@ func (s *respStreamer) feed(body []byte, last bool) {
 
 // streamResponsesMerged emits several buffered /responses SSE bodies as one
 // Anthropic turn: one preamble, continuous block indices, one stop.
-func streamResponsesMerged(w http.ResponseWriter, bodies [][]byte, clientModel string) (written int64, promptT, compT int) {
+func streamResponsesMerged(w http.ResponseWriter, bodies [][]byte, clientModel string, tnames toolNames) (written int64, promptT, compT int) {
 	fl, _ := w.(http.Flusher)
-	s := &respStreamer{w: w, clientModel: clientModel, toolIdx: map[string]int{}, textIdx: -1}
+	s := &respStreamer{w: w, clientModel: clientModel, tnames: tnames, toolIdx: map[string]int{}, textIdx: -1}
 	if fl != nil {
 		s.fl = fl
 		s.hasFlusher = true
@@ -1674,6 +1077,55 @@ func isWaitOnly(body []byte) bool {
 	return strings.TrimSpace(text) == waitSentinel
 }
 
+// stripWaitSentinel removes the internal wait sentinel so it never reaches
+// the client. the model sometimes echoes it with extra words attached.
+func stripWaitSentinel(s string) string {
+	return strings.ReplaceAll(s, waitSentinel, "")
+}
+
+// stripSentinelSSE removes the internal wait sentinel from a buffered
+// /responses SSE body. belt and suspenders behind the swallow-non-calls
+// rule: the marker is proxy-internal and must never reach the client.
+func stripSentinelSSE(body []byte) []byte {
+	if !strings.Contains(string(body), waitSentinel) {
+		return body
+	}
+	return []byte(strings.ReplaceAll(string(body), waitSentinel, ""))
+}
+
+// sentinelStripper removes waitSentinel from a stream of text deltas. only
+// the trailing overlap with a sentinel prefix is held back, so ordinary
+// text flows through unbuffered while a marker split across deltas is
+// still caught; flush emits whatever is left at block close.
+type sentinelStripper struct {
+	pending string
+}
+
+func (s *sentinelStripper) push(d string) string {
+	s.pending += d
+	cleaned := strings.ReplaceAll(s.pending, waitSentinel, "")
+	hold := 0
+	max := len(cleaned)
+	if max > len(waitSentinel)-1 {
+		max = len(waitSentinel) - 1
+	}
+	for n := max; n > 0; n-- {
+		if strings.HasPrefix(waitSentinel, cleaned[len(cleaned)-n:]) {
+			hold = n
+			break
+		}
+	}
+	out := cleaned[:len(cleaned)-hold]
+	s.pending = cleaned[len(cleaned)-hold:]
+	return out
+}
+
+func (s *sentinelStripper) flush() string {
+	out := strings.ReplaceAll(s.pending, waitSentinel, "")
+	s.pending = ""
+	return out
+}
+
 // scanResponsesSSE returns the concatenated output text and whether any
 // function_call output item appeared in a buffered /responses SSE body.
 // it covers delta events plus the done/completed shapes spark actually
@@ -1766,14 +1218,17 @@ func tryNudgeResponses(clientModel string, posted, rb []byte, post func(nb []byt
 	if hasCalls {
 		return nil
 	}
+	if strings.Contains(text, waitSentinel) {
+		return nil
+	}
 	if strings.TrimSpace(text) == "" {
 		dbglog.Printf("  nudge skip model=%s reason=empty-text", clientModel)
 		return nil
 	}
-	if endsWithQuestion(text) {
-		dbglog.Printf("  nudge skip model=%s reason=question text=%q", clientModel, errSnippet([]byte(text), 120))
-		return nil
-	}
+	// no question exemption: the reprompt tells the model to emit
+	// only waitSentinel when waiting, so nudging past a question
+	// is safe. exempting questions let greetings loop forever
+	// with no tool calls and no nudge ever firing.
 	nb := nudgeContinuation(posted, text)
 	if nb == nil {
 		return nil
@@ -1782,11 +1237,19 @@ func tryNudgeResponses(clientModel string, posted, rb []byte, post func(nb []byt
 	if nb2 == nil {
 		return nil
 	}
-	if isWaitOnly(nb2) {
-		acclog.Printf("  opencode nudge model=%s waiting, swallowing retry", clientModel)
+	text2, nHasCalls := scanResponsesSSE(nb2)
+	if !nHasCalls {
+		// retry called nothing: swallowing keeps the turn to one
+		// assistant message so the agent acts instead of narrating
+		// twice. covers wait-only plus any tool-less text (which may
+		// carry the wait sentinel with extra words attached).
+		if isWaitOnly(nb2) {
+			acclog.Printf("  opencode nudge model=%s waiting, swallowing retry", clientModel)
+		} else {
+			acclog.Printf("  opencode nudge model=%s no-calls, swallowing retry text=%q", clientModel, errSnippet([]byte(text2), 120))
+		}
 		return nil
 	}
-	_, nHasCalls := scanResponsesSSE(nb2)
 	acclog.Printf("  opencode nudge model=%s calls=%v bytes=%d", clientModel, nHasCalls, len(nb2))
 	return nb2
 }
@@ -1838,11 +1301,15 @@ func (p *Pool) handleAnthropic(w http.ResponseWriter, r *http.Request, start tim
 	}
 	r.Body.Close()
 
+	// RTK: compress tool_result text before the PII guard masks, so filters
+	// see original bytes and vault placeholders are never chopped.
+	body = rtkCompressBody(body)
+
 	// same deal as ServeHTTP: mask the inbound body, unmask on the way out.
 	injectDiscloseLine(&body)
-	am := anonForRequest()
-	body = am.anonymize(body)
-	if dw := wrapDeanon(w, am); dw != nil {
+	pg := guardForRequest(r)
+	body = pg.MaskBody(body)
+	if dw := wrapPII(w, pg); dw != nil {
 		w = dw
 		defer dw.finish()
 	}
@@ -1859,7 +1326,7 @@ func (p *Pool) handleAnthropic(w http.ResponseWriter, r *http.Request, start tim
 		<-p.sem
 	}()
 
-	oaiBody, clientModel, upstreamModel, isStream, err := anthropicRequestToOpenAI(body)
+	oaiBody, clientModel, upstreamModel, tnames, isStream, err := anthropicRequestToOpenAI(body)
 	if err != nil {
 		writeAnthropicError(w, http.StatusBadRequest, "invalid_request_error", err.Error())
 		return
@@ -1869,11 +1336,29 @@ func (p *Pool) handleAnthropic(w http.ResponseWriter, r *http.Request, start tim
 
 	// Route opencode/* models to zen endpoint
 	if strings.HasPrefix(upstreamModel, "opencode/") {
-		p.handleOpenCodeAnthropic(w, r, body, oaiBody, clientModel, upstreamModel, isStream, start)
+		if !zenEnabled() {
+			acclog.Printf("<- 503 POST /v1/messages model=%s (zen disabled)", clientModel)
+			writeAnthropicError(w, http.StatusServiceUnavailable, "api_error", "opencode zen is disabled; set zen.enabled: true in config.yml")
+			return
+		}
+		p.handleOpenCodeAnthropic(w, r, body, oaiBody, clientModel, upstreamModel, tnames, isStream, start)
 		return
 	}
 
-	// keyless mode serves opencode/* only; nim models need keys.
+	// nvidia/ prefix is the listed form; bare ids stay nvidia for compat.
+	if strings.HasPrefix(upstreamModel, "nvidia/") {
+		upstreamModel = strings.TrimPrefix(upstreamModel, "nvidia/")
+		if b, err := setReqModel(oaiBody, upstreamModel); err == nil {
+			oaiBody = b
+		}
+	}
+
+	// disabled or keyless mode serves opencode/* only; nim models need keys.
+	if !cfg().Nvidia.Enabled {
+		acclog.Printf("<- 503 POST /v1/messages model=%s (nvidia disabled)", clientModel)
+		writeAnthropicError(w, http.StatusServiceUnavailable, "api_error", "nvidia backend is disabled; set nvidia.enabled: true in config.yml")
+		return
+	}
 	if len(p.keys) == 0 {
 		acclog.Printf("<- 503 POST /v1/messages model=%s (keyless: no nvidia keys)", clientModel)
 		writeAnthropicError(w, http.StatusServiceUnavailable, "api_error", "no nvidia keys configured; use an opencode/<model> free model or add nvidia_keys to config.yml")
@@ -1937,7 +1422,7 @@ func (p *Pool) handleAnthropic(w http.ResponseWriter, r *http.Request, start tim
 		w.Header().Set("Cache-Control", "no-cache")
 		w.Header().Set("Connection", "keep-alive")
 		w.WriteHeader(http.StatusOK)
-		written, promptT, compT := streamAnthropic(w, u.Body, clientModel)
+		written, promptT, compT := streamAnthropic(w, u.Body, clientModel, tnames)
 
 		p.Postpone(u.KeyObj, 1500*time.Millisecond)
 		p.Clear429(u.KeyObj)
@@ -1961,7 +1446,7 @@ func (p *Pool) handleAnthropic(w http.ResponseWriter, r *http.Request, start tim
 
 		acclog.Printf("<- 200 POST /v1/messages %v %d bytes [%s]", elapsed.Round(time.Millisecond), written, u.Key)
 	} else {
-		out, errMsg, _ := openAIToAnthropic(u.Body, clientModel)
+		out, errMsg, _ := openAIToAnthropic(u.Body, clientModel, tnames)
 		if errMsg != "" {
 			writeAnthropicError(w, http.StatusInternalServerError, "api_error", errMsg)
 			return
@@ -2071,22 +1556,57 @@ func randBase62(n int) string {
 	return string(out)
 }
 
-// zenSession mirrors opencode's session id format: ses_<12hex><14base62>.
-func zenSession() string {
-	return "ses_" + randHex(12) + randBase62(14)
+// zenID mirrors packages/schema/src/identifier.ts: timestamp ms * 0x1000 +
+// per-ms counter, 6 bytes big-endian hex (complemented when descending),
+// plus 14 base62 random chars from crypto bytes % 62.
+var (
+	zenIDMu        sync.Mutex
+	zenIDLastTs    int64
+	zenIDCounter   int64
+	zenIDMask      int64 = 0xFFFFFFFFFFFF
+)
+
+func zenID(descending bool) string {
+	ts := time.Now().UnixMilli()
+	zenIDMu.Lock()
+	if ts != zenIDLastTs {
+		zenIDLastTs = ts
+		zenIDCounter = 0
+	}
+	zenIDCounter++
+	current := ts*0x1000 + zenIDCounter
+	masked := current & zenIDMask
+	if descending {
+		masked = (^masked) & zenIDMask
+	}
+	zenIDMu.Unlock()
+	timeHex := fmt.Sprintf("%012x", masked)
+	// crypto random, same charset/modulo as identifier.ts
+	rb := make([]byte, 14)
+	rand.Read(rb)
+	rb62 := make([]byte, 14)
+	for i := range rb {
+		rb62[i] = b62chars[int(rb[i])%62]
+	}
+	return timeHex + string(rb62)
 }
 
-// zenUASuffix is part of the real opencode client's user-agent. The ai-sdk
-// provider-utils and bun runtime fingerprint gate the anonymous free tier.
-const zenUASuffix = " ai-sdk/provider-utils/4.0.23 runtime/bun/1.3.14"
+// zenSession mirrors opencode's session id: ses_ + descending().
+// (packages/schema/src/session-id.ts)
+func zenSession() string {
+	return "ses_" + zenID(true)
+}
 
-// zenMsgID mirrors opencode's per-request message id: msg_<12hex><14base62>.
+// zenMsgID mirrors opencode's per-request message id: msg_ + ascending().
+// (packages/schema/src/session-message.ts, sent as x-opencode-request)
 func zenMsgID() string {
-	return "msg_" + randHex(12) + randBase62(14)
+	return "msg_" + zenID(false)
 }
 
 // setZenHeaders applies the exact header set the real opencode client sends to
 // zen so anonymous free-tier requests pass the "used from within OpenCode" check.
+// real client (session/llm/request.ts): bare `opencode/${InstallationVersion}`
+// with no ai-sdk/bun suffix, x-opencode-request = user message id.
 func setZenHeaders(req *http.Request, sessionID string) {
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Authorization", "Bearer public")
@@ -2094,8 +1614,12 @@ func setZenHeaders(req *http.Request, sessionID string) {
 	req.Header.Set("x-opencode-session", sessionID)
 	req.Header.Set("x-opencode-request", zenMsgID())
 	req.Header.Set("x-opencode-project", "global")
-	req.Header.Set("User-Agent", "opencode/"+zenVersion+zenUASuffix)
+	req.Header.Set("User-Agent", "opencode/"+zenVersion)
 	req.Header.Set("Accept", "*/*")
+	// opencode's @ai-sdk/anthropic client sends this on every zen request.
+	// the anonymous free tier fingerprints it, so omitting it can surface as
+	// FreeTierError ("can only be used from within OpenCode").
+	req.Header.Set("anthropic-version", "2023-06-01")
 }
 
 func estimateTokens(body []byte) int {
@@ -2123,31 +1647,13 @@ func estimateTokens(body []byte) int {
 }
 
 // handleOpenCodeAnthropic routes opencode/* models through the zen endpoint.
-func (p *Pool) handleOpenCodeAnthropic(w http.ResponseWriter, r *http.Request, origBody, oaiBody []byte, clientModel, upstreamModel string, isStream bool, start time.Time) {
+func (p *Pool) handleOpenCodeAnthropic(w http.ResponseWriter, r *http.Request, origBody, oaiBody []byte, clientModel, upstreamModel string, tnames toolNames, isStream bool, start time.Time) {
 	zenModel := strings.TrimPrefix(upstreamModel, "opencode/")
 	endpoint := endpointForModel(zenModel)
 	isResponses := endpoint == "/responses"
-	isMessages := endpoint == "/messages"
 
 	var m map[string]any
-	if isMessages {
-		// union-alpha is anthropic-native on zen, like opencode's
-		// @ai-sdk/anthropic client: forward the client's body with the
-		// model swapped instead of converting to openai.
-		if json.Unmarshal(origBody, &m) == nil {
-			m["model"] = zenModel
-			stripCacheFields(m)
-			if mt, _ := m["max_tokens"].(float64); mt == 0 {
-				m["max_tokens"] = 4096
-			}
-			if !isStream {
-				m["stream"] = true
-			}
-			if b, err := json.Marshal(m); err == nil {
-				oaiBody = b
-			}
-		}
-	} else if json.Unmarshal(oaiBody, &m) == nil {
+	if json.Unmarshal(oaiBody, &m) == nil {
 		m["model"] = zenModel
 		stripCacheFields(m)
 		ensureZenTools(m)
@@ -2157,6 +1663,8 @@ func (p *Pool) handleOpenCodeAnthropic(w http.ResponseWriter, r *http.Request, o
 		}
 		if isResponses {
 			convertToResponses(m)
+		} else {
+			sanitizeZenChatMessages(m)
 		}
 		if b, err := json.Marshal(m); err == nil {
 			oaiBody = b
@@ -2176,12 +1684,8 @@ func (p *Pool) handleOpenCodeAnthropic(w http.ResponseWriter, r *http.Request, o
 		acclog.Printf("ZEN_DUMP inbound %d bytes -> %s", len(origBody), pi)
 	}
 
-	sessionID := ""
-	if s := r.Header.Get("x-session-id"); s != "" {
-		sessionID = s
-	} else {
-		sessionID = zenSession()
-	}
+	lane := laneFor(r.Header.Get("x-session-id"), oaiBody)
+	sessionID := laneSession(lane)
 
 	// zenPost sends body to zen with proxy failover and returns the response.
 	zenPost := func(body []byte, stream bool, tag string) *http.Response {
@@ -2189,20 +1693,40 @@ func (p *Pool) handleOpenCodeAnthropic(w http.ResponseWriter, r *http.Request, o
 		lastProxy := ""
 		rotating := true
 		for zenRetries := 0; zenRetries < 5; zenRetries++ {
+			if !laneHealthy(lane) {
+				if nl := laneFailover(lane); nl != nil {
+					lane = nl
+					sessionID = laneSession(lane)
+				} else if zenRetries > 0 {
+					if wait := laneWait(); wait > 0 {
+						acclog.Printf("  opencode all lanes cooling, waiting %v (retry %d/4)", wait, zenRetries)
+						time.Sleep(wait)
+					}
+				}
+			} else {
+				laneGate(lane)
+			}
 			proxy := ""
 			if zenRetries == 0 {
-				proxy, cl = firstClient(&sessionID)
+				proxy = laneProxyFor(lane)
+				cl = zenClient(proxy)
 				lastProxy = proxy
 			} else if rotating {
-				proxy = pickFastProxy()
-				if proxy == "" {
+				proxy = laneProxyFor(lane)
+				if proxy == "" && cfg().Zen.AlwaysProxy {
+					if nl := laneFailover(lane); nl != nil {
+						lane = nl
+						sessionID = laneSession(lane)
+						proxy = laneProxyFor(lane)
+					}
+				}
+				if proxy == "" && cfg().Zen.AlwaysProxy {
 					continue
 				}
 				cl = zenClient(proxy)
 				lastProxy = proxy
-				sessionID = zenSession()
 			} else {
-				// service overloaded: retry on the same proxy + session.
+				// service overloaded: retry on the same lane proxy + session.
 				proxy = lastProxy
 				cl = zenClient(proxy)
 			}
@@ -2211,13 +1735,8 @@ func (p *Pool) handleOpenCodeAnthropic(w http.ResponseWriter, r *http.Request, o
 				return nil
 			}
 			setZenHeaders(req, sessionID)
-			if isMessages {
-				// opencode's @ai-sdk/anthropic client sends this; zen's
-				// /messages endpoint expects an anthropic-native request.
-				req.Header.Set("anthropic-version", "2023-06-01")
-			}
 			if zenRetries > 0 {
-				acclog.Printf("  opencode retry %d/4 session=%s proxy=%s", zenRetries, sessionID, proxy)
+				acclog.Printf("  opencode retry %d/4 session=%s proxy=%s lane=%s", zenRetries, sessionID, proxy, lane.id)
 			}
 
 			up, err := cl.Do(req)
@@ -2227,7 +1746,7 @@ func (p *Pool) handleOpenCodeAnthropic(w http.ResponseWriter, r *http.Request, o
 				logZenNetErr(zenRetries, clientModel, proxy, tag+" "+target, err)
 				if noteZenNetworkError() {
 					acclog.Printf("  3+ consecutive network errors, refreshing proxy pool")
-					refreshZenProxies()
+					refreshZenProxiesAsync()
 					resetZenNetworkErrors()
 				}
 				if zenRetries < 4 {
@@ -2239,9 +1758,16 @@ func (p *Pool) handleOpenCodeAnthropic(w http.ResponseWriter, r *http.Request, o
 
 			if up.StatusCode == http.StatusTooManyRequests || up.StatusCode == 529 {
 				up.Body.Close()
-				acclog.Printf("  opencode rate-limited %d (retry %d/4) model=%s country=%s proxy=%s %s, switching proxy",
-					up.StatusCode, zenRetries, clientModel, proxyCountry(proxy), proxy, tag)
-				dropProxy(proxy)
+				acclog.Printf("  opencode rate-limited %d (retry %d/4) model=%s country=%s proxy=%s %s lane=%s, cooling lane",
+					up.StatusCode, zenRetries, clientModel, proxyCountry(proxy), proxy, tag, lane.id)
+				if proxy == "" {
+					laneEscalate(lane) // direct got limited: give the lane an exit
+				}
+				laneCool(lane)
+				if nl := laneFailover(lane); nl != nil {
+					lane = nl
+					sessionID = laneSession(lane)
+				}
 				rotating = true
 				zenBackoff(zenRetries)
 				continue
@@ -2262,10 +1788,15 @@ func (p *Pool) handleOpenCodeAnthropic(w http.ResponseWriter, r *http.Request, o
 				if zenGeoBlocked(eb) {
 					logZenBlocked("geo", zenRetries, up.StatusCode, clientModel, proxy, tag, eb)
 					dropProxy(proxy)
+					laneCoolSoft(lane)
+					if nl := laneFailover(lane); nl != nil {
+						lane = nl
+						sessionID = laneSession(lane)
+					}
 					rotating = true
 					if noteZenGeoErr() {
 						acclog.Printf("  3+ geo-blocks, refreshing proxy pool")
-						refreshZenProxies()
+						refreshZenProxiesAsync()
 						resetZenGeoErrs()
 					}
 					if zenRetries < 4 {
@@ -2276,11 +1807,39 @@ func (p *Pool) handleOpenCodeAnthropic(w http.ResponseWriter, r *http.Request, o
 				if zenUserBlocked(eb) {
 					logZenBlocked("user", zenRetries, up.StatusCode, clientModel, proxy, tag, eb)
 					dropProxy(proxy)
+					laneBlock(lane)
+					if nl := laneFailover(lane); nl != nil {
+						lane = nl
+						sessionID = laneSession(lane)
+					}
 					rotating = true
 					if noteZenBlockErr() {
 						acclog.Printf("  3+ user-blocks, refreshing proxy pool")
-						refreshZenProxies()
+						refreshZenProxiesAsync()
 						resetZenBlockErrs()
+					}
+					if zenRetries < 4 {
+						zenBackoff(zenRetries)
+						continue
+					}
+				}
+				if zenFreeTierBlocked(eb) {
+					acclog.Printf("  opencode free-tier-blocked %d (retry %d/4) model=%s country=%s proxy=%s %s lane=%s, switching lane",
+						up.StatusCode, zenRetries, clientModel, proxyCountry(proxy), proxy, tag, lane.id)
+					dropProxy(proxy)
+					if proxy == "" {
+						laneEscalate(lane) // direct is flagged: give the lane an exit
+					}
+					laneBlock(lane)
+					if nl := laneFailover(lane); nl != nil {
+						lane = nl
+						sessionID = laneSession(lane)
+					}
+					rotating = true
+					if noteZenFreeTierErr() {
+						acclog.Printf("  3+ free-tier blocks, refreshing proxy pool")
+						refreshZenProxiesAsync()
+						resetZenFreeTierErrs()
 					}
 					if zenRetries < 4 {
 						zenBackoff(zenRetries)
@@ -2294,6 +1853,7 @@ func (p *Pool) handleOpenCodeAnthropic(w http.ResponseWriter, r *http.Request, o
 			resetZenNetworkErrors()
 			if up.StatusCode == http.StatusOK {
 				p.noteZenSuccess(sessionID, proxy)
+				laneTouch(lane, proxy)
 			}
 			return up
 		}
@@ -2351,16 +1911,9 @@ func (p *Pool) handleOpenCodeAnthropic(w http.ResponseWriter, r *http.Request, o
 			if retry := tryNudgeResponses(upstreamModel, oaiBody, rb, post); retry != nil {
 				bodies = append(bodies, retry)
 			}
-			written, promptT, compT = streamResponsesMerged(w, bodies, clientModel)
-		} else if isMessages {
-			// native anthropic SSE in, native anthropic SSE out.
-			written, _ = io.Copy(w, bytes.NewReader(rb))
-			if fl, ok := w.(http.Flusher); ok {
-				fl.Flush()
-			}
-			promptT, compT = anthropicStreamUsage(rb)
+			written, promptT, compT = streamResponsesMerged(w, bodies, clientModel, tnames)
 		} else {
-			written, promptT, compT = streamAnthropic(w, rb, clientModel)
+			written, promptT, compT = streamAnthropic(w, rb, clientModel, tnames)
 		}
 
 		logUsage(UsageRecord{
@@ -2404,10 +1957,8 @@ func (p *Pool) handleOpenCodeAnthropic(w http.ResponseWriter, r *http.Request, o
 				rb = mergeResponsesSSE([][]byte{rb, retry})
 			}
 			rb = responsesToChat(responsesSSEToJSON(rb))
-		} else if isMessages {
-			rb = foldAnthropicSSE(rb, clientModel)
 		} else {
-			rb = sseToNonStream(rb, zenModel)
+			rb = sseToNonStream(rb, zenModel, tnames)
 		}
 		if os.Getenv("ZEN_DUMP") != "" {
 			p := fmt.Sprintf("/tmp/zenfold_%d.json", time.Now().UnixNano())
@@ -2416,26 +1967,13 @@ func (p *Pool) handleOpenCodeAnthropic(w http.ResponseWriter, r *http.Request, o
 		}
 		out := rb
 		prompT, compT := 0, 0
-		if isMessages {
-			// already anthropic-native from foldAnthropicSSE
-			var aj struct {
-				Usage *struct {
-					InputTokens  int `json:"input_tokens"`
-					OutputTokens int `json:"output_tokens"`
-				} `json:"usage"`
-			}
-			if json.Unmarshal(rb, &aj) == nil && aj.Usage != nil {
-				prompT, compT = aj.Usage.InputTokens, aj.Usage.OutputTokens
-			}
-		} else {
-			var errMsg string
-			out, errMsg, _ = openAIToAnthropic(rb, clientModel)
-			if errMsg != "" {
-				writeAnthropicError(w, http.StatusInternalServerError, "api_error", errMsg)
-				return
-			}
-			prompT, compT, _ = respTokens(rb)
+		var errMsg string
+		out, errMsg, _ = openAIToAnthropic(rb, clientModel, tnames)
+		if errMsg != "" {
+			writeAnthropicError(w, http.StatusInternalServerError, "api_error", errMsg)
+			return
 		}
+		prompT, compT, _ = respTokens(rb)
 
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusOK)

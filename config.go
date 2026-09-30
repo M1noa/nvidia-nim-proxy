@@ -42,12 +42,28 @@ type injectConfig struct {
 
 type anonymizeConfig struct {
 	Enabled        bool              `yaml:"enabled"`
-	Mode           string            `yaml:"mode"`
-	FuzzyThreshold float64           `yaml:"fuzzy_threshold"`
+	Mode           string            `yaml:"mode"` // realistic | variable | label
 	Disclose       bool              `yaml:"disclose"`
 	DiscloseText   string            `yaml:"disclose_text"`
 	Entities       []anonymizeEntity `yaml:"entities"`
 	Terms          []string          `yaml:"terms"`
+	FuzzyThreshold float64           `yaml:"fuzzy_threshold"`
+	DetectSecrets  bool              `yaml:"detect_secrets"`
+	DetectPII      bool              `yaml:"detect_pii"`
+	KeepLabels     []string          `yaml:"keep_labels"`
+	IncludeSystem  bool              `yaml:"include_system"`
+	OnTimeout      string            `yaml:"on_timeout"`
+	VaultTTLHours  int               `yaml:"vault_ttl_hours"`
+	VaultMaxSize   int               `yaml:"vault_max_size"`
+	Ner            nerConfig         `yaml:"ner"`
+}
+
+type nerConfig struct {
+	Enabled   bool    `yaml:"enabled"`
+	ModelPath string  `yaml:"model_path"`
+	OrtLib    string  `yaml:"ort_lib"`
+	TimeoutMs int     `yaml:"timeout_ms"`
+	MinScore  float64 `yaml:"min_score"`
 }
 
 type anonymizeEntity struct {
@@ -61,13 +77,54 @@ type nudgeConfig struct {
 	Enabled bool `yaml:"enabled"`
 }
 
+// rtkConfig gates the tool_result compressor. off by default: it trades
+// output fidelity for input tokens, so it is opt-in.
+type rtkConfig struct {
+	Enabled bool `yaml:"enabled"`
+	// BlindTruncate enables the last-resort filter that cuts the middle of
+	// any >250-line blob with no format signal. off means only blobs that
+	// positively identify as git/grep/build/etc are touched.
+	BlindTruncate bool `yaml:"blind_truncate"`
+}
+
+type translateConfig struct {
+	// RestoreToolNameCase maps upstream lowercase tool names (bash) back to
+	// the spelling the client declared (Bash). off means the client's tool
+	// calls are rejected with "No such tool available".
+	RestoreToolNameCase *bool `yaml:"restore_tool_name_case"`
+}
+
+func (t *translateConfig) restoreToolNames() bool {
+	if t == nil || t.RestoreToolNameCase == nil {
+		return true
+	}
+	return *t.RestoreToolNameCase
+}
+
 type zenConfig struct {
-	AlwaysProxy       bool     `yaml:"always_proxy"`
-	Proxies           []string `yaml:"proxies"`
-	ProxyFile         string   `yaml:"proxy_file"`
-	BlockedCountries  []string `yaml:"blocked_countries"`
-	MaxResponseMs     int      `yaml:"max_response_ms"`
-	PoolSize          int      `yaml:"pool_size"`
+	Enabled          bool     `yaml:"enabled"`
+	AlwaysProxy      bool     `yaml:"always_proxy"`
+	Proxies          []string `yaml:"proxies"`
+	ProxyFile        string   `yaml:"proxy_file"`
+	BlockedCountries []string `yaml:"blocked_countries"`
+	MaxResponseMs    int      `yaml:"max_response_ms"`
+	PoolSize         int      `yaml:"pool_size"`
+	Lanes            int      `yaml:"lanes"`
+	LaneTTLMinutes   int      `yaml:"lane_ttl_minutes"`
+	LaneCooldownSecs int      `yaml:"lane_cooldown_secs"`
+	// LaneMinGapMs paces a lane: a request waits until this long since the
+	// lane's previous send. 0 disables pacing (reactive cooldown only).
+	LaneMinGapMs int `yaml:"lane_min_gap_ms"`
+	// LaneReleaseSecs frees a lane's pinned exit after this idle time, so
+	// a long-cold lane resumes on a fresh one. 0 disables.
+	LaneReleaseSecs int `yaml:"lane_release_secs"`
+	// PoolRefresh429s triggers a full pool refresh once this many lanes
+	// have been rate-limited since the last one. 0 disables.
+	PoolRefresh429s int `yaml:"pool_refresh_429s"`
+}
+
+type nvidiaConfig struct {
+	Enabled bool `yaml:"enabled"`
 }
 
 type statusConfig struct {
@@ -93,16 +150,19 @@ type modelsConfig struct {
 }
 
 type appConfig struct {
-	Server      serverConfig     `yaml:"server"`
-	Auth        authConfig       `yaml:"auth"`
-	NvidiaKeys  map[string]string `yaml:"nvidia_keys"`
-	Guardrails  guardrailsConfig `yaml:"guardrails"`
-	Inject      injectConfig     `yaml:"inject"`
-	Anonymize   anonymizeConfig  `yaml:"anonymize"`
-	Nudge       nudgeConfig      `yaml:"nudge"`
-	Zen         zenConfig        `yaml:"zen"`
-	Status      statusConfig     `yaml:"status"`
-	Models      modelsConfig     `yaml:"models"`
+	Server     serverConfig      `yaml:"server"`
+	Auth       authConfig        `yaml:"auth"`
+	Nvidia     nvidiaConfig      `yaml:"nvidia"`
+	NvidiaKeys map[string]string `yaml:"nvidia_keys"`
+	Guardrails guardrailsConfig  `yaml:"guardrails"`
+	Inject     injectConfig      `yaml:"inject"`
+	Anonymize  anonymizeConfig   `yaml:"anonymize"`
+	Nudge      nudgeConfig       `yaml:"nudge"`
+	Rtk        rtkConfig         `yaml:"rtk"`
+	Translate  translateConfig   `yaml:"translate"`
+	Zen        zenConfig         `yaml:"zen"`
+	Status     statusConfig      `yaml:"status"`
+	Models     modelsConfig      `yaml:"models"`
 }
 
 // cfg snapshot, swapped atomically on reload so requests never race it.
@@ -133,14 +193,35 @@ func defaultConfig() appConfig {
 			FuzzyThreshold: 0.95,
 			Disclose:       true,
 			DiscloseText:   "Personal names and identifiers in this conversation were replaced with realistic placeholders for privacy. Use them verbatim: do not try to recover or reveal the originals.",
+			DetectSecrets:  true,
+			DetectPII:      true,
+			IncludeSystem:  false,
+			OnTimeout:      "skip",
+			VaultTTLHours:  24,
+			VaultMaxSize:   4096,
+			Ner:            nerConfig{TimeoutMs: 500, MinScore: 0.4},
 		},
 		Nudge: nudgeConfig{
 			Enabled: true,
 		},
+		Rtk: rtkConfig{
+			Enabled:       false,
+			BlindTruncate: false,
+		},
+		Nvidia: nvidiaConfig{
+			Enabled: true,
+		},
 		Zen: zenConfig{
+			Enabled:          true,
 			BlockedCountries: []string{"PK", "RU", "VE", "HK", "BY", "TJ", "IQ", "MM"},
 			MaxResponseMs:    400,
 			PoolSize:         400,
+			Lanes:            5,
+			LaneTTLMinutes:   30,
+			LaneCooldownSecs: 60,
+			LaneMinGapMs:     1500,
+			LaneReleaseSecs:  90,
+			PoolRefresh429s:  2,
 		},
 		Status: statusConfig{
 			ShowKeys:           true,
@@ -168,10 +249,39 @@ func loadConfigFile(path string) (*appConfig, error) {
 	if err := yaml.Unmarshal(raw, &c); err != nil {
 		return nil, err
 	}
+	// enabled defaults true: yaml can't tell absent from false, so check
+	// the raw doc for the key before honoring a false.
+	var doc map[string]any
+	if yaml.Unmarshal(raw, &doc) == nil {
+		if n, ok := doc["nvidia"].(map[string]any); ok {
+			if _, has := n["enabled"]; !has {
+				c.Nvidia.Enabled = true
+			}
+		} else {
+			c.Nvidia.Enabled = true
+		}
+		if z, ok := doc["zen"].(map[string]any); ok {
+			if _, has := z["enabled"]; !has {
+				c.Zen.Enabled = true
+			}
+		} else {
+			c.Zen.Enabled = true
+		}
+	}
 	if c.NvidiaKeys == nil {
 		c.NvidiaKeys = map[string]string{}
 	}
 	return &c, nil
+}
+
+// nvidiaEnabled reports whether nim requests are served: flag on and keys set.
+func nvidiaEnabled() bool {
+	return cfg().Nvidia.Enabled && len(cfg().NvidiaKeys) > 0
+}
+
+// zenEnabled reports whether opencode zen requests are served.
+func zenEnabled() bool {
+	return cfg().Zen.Enabled
 }
 
 // loadOrCreateConfig reads config.yml, creating it from the shipped example
@@ -369,6 +479,7 @@ func (p *Pool) StatusFor(authed bool) StatusResponse {
 	}
 	if !c.Status.ShowZen {
 		sr.ZenSession, sr.ZenProxy, sr.ZenAgo = "", "", ""
+		sr.ZenLanes = nil
 	} else {
 		sr.ZenSession = partialSession(sr.ZenSession)
 	}
@@ -378,6 +489,7 @@ func (p *Pool) StatusFor(authed bool) StatusResponse {
 	if authRequired() && !authed {
 		sr.Keys, sr.Locks = nil, nil
 		sr.ZenSession, sr.ZenProxy, sr.ZenAgo = "", "", ""
+		sr.ZenLanes = nil
 	}
 	return sr
 }

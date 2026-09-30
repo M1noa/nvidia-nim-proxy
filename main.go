@@ -393,6 +393,7 @@ type StatusResponse struct {
 	ZenSession string        `json:"zen_session,omitempty"`
 	ZenProxy   string        `json:"zen_proxy,omitempty"`
 	ZenAgo     string        `json:"zen_ago,omitempty"`
+	ZenLanes   []laneStatus  `json:"zen_lanes,omitempty"`
 }
 
 type OpencodeInfo struct {
@@ -455,22 +456,28 @@ func (p *Pool) Status() StatusResponse {
 	if len(locks) > 0 {
 		sr.Locks = locks
 	}
-	sr.Opencode = ocInfo.Load()
-	if !p.lastZenAt.IsZero() {
+	if zenEnabled() {
+		sr.Opencode = ocInfo.Load()
+	}
+	if zenEnabled() {
+		sr.ZenLanes = laneSnapshot()
+	}
+	if zenEnabled() && !p.lastZenAt.IsZero() {
 		sr.ZenSession = p.lastZenSession
-		sr.ZenProxy = p.lastZenProxy
+		sr.ZenProxy = redactProxyUserinfo(p.lastZenProxy)
 		sr.ZenAgo = now.Sub(p.lastZenAt).Round(time.Second).String()
 	}
 	return sr
 }
 
-// noteZenSuccess records the last working zen session/proxy for /status.
+// noteZenSuccess records the last working zen session/proxy for /status,
+// and pins it sticky so the next request skips the race probe.
 func (p *Pool) noteZenSuccess(session, proxy string) {
 	p.mu.Lock()
-	defer p.mu.Unlock()
 	p.lastZenSession = session
 	p.lastZenProxy = proxy
 	p.lastZenAt = time.Now()
+	p.mu.Unlock()
 }
 
 var (
@@ -482,28 +489,49 @@ var (
 // ocInfo caches the opencode zen free-model list fetched at startup.
 var ocInfo atomic.Pointer[OpencodeInfo]
 
+// fetchZenModelIDs returns the raw ids from the live zen /models endpoint,
+// nil when unreachable so callers keep serving stale/cached entries.
+func fetchZenModelIDs() []string {
+	return fetchZenModelIDsFrom(OpencodeBase)
+}
+
+func fetchZenModelIDsFrom(base string) []string {
+	cl := &http.Client{Timeout: 10 * time.Second}
+	resp, err := cl.Get(base + "/models")
+	if err != nil {
+		return nil
+	}
+	defer resp.Body.Close()
+	var oc struct {
+		Data []struct {
+			ID string `json:"id"`
+		} `json:"data"`
+	}
+	if json.NewDecoder(resp.Body).Decode(&oc) != nil {
+		return nil
+	}
+	ids := make([]string, 0, len(oc.Data))
+	for _, m := range oc.Data {
+		ids = append(ids, m.ID)
+	}
+	return ids
+}
+
 // refreshOpencodeModels pulls the free model list from opencode zen and caches it.
 func refreshOpencodeModels() {
 	info := &OpencodeInfo{Enabled: true, Base: OpencodeBase}
-	cl := &http.Client{Timeout: 10 * time.Second}
-	resp, err := cl.Get(OpencodeBase + "/models")
-	if err == nil {
-		var oc struct {
-			Data []struct {
-				ID string `json:"id"`
-			} `json:"data"`
+	if !zenEnabled() {
+		info.Enabled = false
+		ocInfo.Store(info)
+		return
+	}
+	for _, m := range fetchZenModelIDs() {
+		// big-pickle is free but lacks the -free suffix; everything
+		// else free matches -free.
+		if !strings.HasSuffix(m, "-free") && m != "big-pickle" {
+			continue
 		}
-		if json.NewDecoder(resp.Body).Decode(&oc) == nil {
-			for _, m := range oc.Data {
-				// big-pickle is free but lacks the -free suffix; everything
-				// else free matches -free.
-				if !strings.HasSuffix(m.ID, "-free") && m.ID != "big-pickle" {
-					continue
-				}
-				info.Models = append(info.Models, "opencode/"+m.ID)
-			}
-		}
-		resp.Body.Close()
+		info.Models = append(info.Models, "opencode/"+m)
 	}
 	sort.Strings(info.Models)
 	ocInfo.Store(info)
@@ -628,8 +656,8 @@ type openRouterModel struct {
 	PerRequestLimits any               `json:"per_request_limits"`
 }
 
-// hard-coded free models that don't end in "-free" (just big-pickle;
-// everything else free matches the -free suffix on the live endpoint).
+// extraFreeModels are free models that don't end in "-free" (just
+// big-pickle). only listed when also present on the live /models endpoint.
 var extraFreeModels = []string{"big-pickle"}
 
 // endpointForModel returns the Zen API endpoint path for a model.
@@ -642,8 +670,9 @@ func endpointForModel(model string) string {
 }
 
 // normalizeResponsesContent converts chat-style message content into the
-// content types /responses accepts (input_text for user/system, output_text
-// for assistant, input_image for images).
+// content types /responses accepts (input_text for user, output_text
+// for assistant, plain string for system, input_image for images).
+// mirrors upstream toOpenaiRequest in console zen provider.
 func normalizeResponsesContent(role string, content any) any {
 	textType := "input_text"
 	if role == "assistant" {
@@ -651,7 +680,13 @@ func normalizeResponsesContent(role string, content any) any {
 	}
 	switch c := content.(type) {
 	case string:
-		return c
+		if c == "" {
+			return nil
+		}
+		if role == "system" {
+			return c
+		}
+		return []any{map[string]any{"type": textType, "text": c}}
 	case []any:
 		out := make([]any, 0, len(c))
 		for _, p := range c {
@@ -780,6 +815,15 @@ func convertToResponses(m map[string]any) {
 		m["reasoning"] = map[string]any{"effort": re}
 		delete(m, "reasoning_effort")
 	}
+	// mirror upstream toOpenaiRequest defaults. responses 400s without them
+	// on some models and the free-tier fingerprint expects the real shape.
+	delete(m, "stream_options")
+	if _, ok := m["text"]; !ok {
+		m["text"] = map[string]any{"verbosity": "low"}
+	}
+	if _, ok := m["reasoning"]; !ok {
+		m["reasoning"] = map[string]any{"effort": "medium"}
+	}
 	if tools, ok := m["tools"].([]any); ok {
 		cleaned := make([]any, 0, len(tools))
 		for _, t := range tools {
@@ -871,7 +915,7 @@ func responsesToChat(rb []byte) []byte {
 			})
 		}
 	}
-	msg := map[string]any{"role": "assistant", "content": text.String()}
+	msg := map[string]any{"role": "assistant", "content": stripWaitSentinel(text.String())}
 	finish := "stop"
 	if r.Status == "incomplete" {
 		finish = "length"
@@ -903,8 +947,10 @@ func responsesToChat(rb []byte) []byte {
 }
 
 // responsesSSEToJSON folds a buffered /responses SSE body into a single
-// /responses-shaped JSON object so responsesToChat can consume it.
+// /responses-shaped JSON object so responsesToChat can consume it. the wait
+// sentinel is proxy-internal and stripped from folded text.
 func responsesSSEToJSON(body []byte) []byte {
+	body = stripSentinelSSE(body)
 	asStr := func(v any) string {
 		s, _ := v.(string)
 		return s
@@ -1010,7 +1056,7 @@ func responsesSSEToJSON(body []byte) []byte {
 		"created_at": created,
 		"model":      model,
 		"status":     status,
-		"output":     output,
+		"output":     stripFoldedSentinel(output),
 		"usage":      usage,
 	}
 	if b, err := json.Marshal(out); err == nil {
@@ -1019,10 +1065,64 @@ func responsesSSEToJSON(body []byte) []byte {
 	return body
 }
 
+// stripFoldedSentinel removes the internal wait marker from folded
+// /responses text parts. split-across-delta sentinels reassemble during
+// the fold, so the raw pre-strip can't catch them.
+func stripFoldedSentinel(output []map[string]any) []map[string]any {
+	for _, item := range output {
+		content, _ := item["content"].([]any)
+		for _, c := range content {
+			part, _ := c.(map[string]any)
+			if part == nil {
+				continue
+			}
+			if t, _ := part["type"].(string); t != "output_text" && t != "text" {
+				continue
+			}
+			if s, _ := part["text"].(string); strings.Contains(s, waitSentinel) {
+				part["text"] = strings.ReplaceAll(s, waitSentinel, "")
+			}
+		}
+	}
+	return output
+}
+
+// oaiToolNames pulls the tool names a chat/completions or /responses request
+// declared, so response translators can restore the client's spelling. used by
+// the OpenAI-format path; /v1/messages gets its names from the anthropic parse.
+func oaiToolNames(body []byte) toolNames {
+	var m struct {
+		Tools []struct {
+			Name     string `json:"name"`
+			Function *struct {
+				Name string `json:"name"`
+			} `json:"function"`
+		} `json:"tools"`
+	}
+	if json.Unmarshal(body, &m) != nil {
+		return nil
+	}
+	var tn toolNames
+	for _, t := range m.Tools {
+		name := t.Name
+		if t.Function != nil && t.Function.Name != "" {
+			name = t.Function.Name
+		}
+		if strings.TrimSpace(name) != "" {
+			tn = append(tn, name)
+		}
+	}
+	return tn
+}
+
 // streamResponsesToChat converts a Responses API SSE stream to chat/completions SSE.
-func streamResponsesToChat(w http.ResponseWriter, body []byte) (written int64, promptT, compT int) {
+func streamResponsesToChat(w http.ResponseWriter, body []byte, tnames toolNames) (written int64, promptT, compT int) {
 	fl, _ := w.(http.Flusher)
 
+	// proxy-internal marker must never reach the client.
+	body = stripSentinelSSE(body)
+
+	var strip sentinelStripper
 	lines := strings.Split(string(body), "\n")
 	for _, line := range lines {
 		line = strings.TrimSpace(line)
@@ -1065,11 +1165,13 @@ func streamResponsesToChat(w http.ResponseWriter, body []byte) (written int64, p
 		switch evt.Type {
 		case "response.output_text.delta":
 			if evt.Delta != "" {
-				chunk := fmt.Sprintf(`{"choices":[{"index":0,"delta":{"content":%s},"finish_reason":null}],"usage":null}`, jsonStr(evt.Delta))
-				n, _ := fmt.Fprintf(w, "data: %s\n\n", chunk)
-				written += int64(n)
-				if fl != nil {
-					fl.Flush()
+				if clean := strip.push(evt.Delta); clean != "" {
+					chunk := fmt.Sprintf(`{"choices":[{"index":0,"delta":{"content":%s},"finish_reason":null}],"usage":null}`, jsonStr(clean))
+					n, _ := fmt.Fprintf(w, "data: %s\n\n", chunk)
+					written += int64(n)
+					if fl != nil {
+						fl.Flush()
+					}
 				}
 			}
 		case "response.output_item.added":
@@ -1078,7 +1180,7 @@ func streamResponsesToChat(w http.ResponseWriter, body []byte) (written int64, p
 				if tid == "" {
 					tid = "toolu_" + randHex(24)
 				}
-				chunk := fmt.Sprintf(`{"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":%s,"type":"function","function":{"name":%s,"arguments":""}}]},"finish_reason":null}],"usage":null}`, jsonStr(tid), jsonStr(evt.Item.Name))
+				chunk := fmt.Sprintf(`{"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":%s,"type":"function","function":{"name":%s,"arguments":""}}]},"finish_reason":null}],"usage":null}`, jsonStr(tid), jsonStr(tnames.resolve(evt.Item.Name)))
 				n, _ := fmt.Fprintf(w, "data: %s\n\n", chunk)
 				written += int64(n)
 				if fl != nil {
@@ -1095,6 +1197,11 @@ func streamResponsesToChat(w http.ResponseWriter, body []byte) (written int64, p
 				}
 			}
 		case "response.completed":
+			if tail := strip.flush(); tail != "" {
+				chunk := fmt.Sprintf(`{"choices":[{"index":0,"delta":{"content":%s},"finish_reason":null}],"usage":null}`, jsonStr(tail))
+				n, _ := fmt.Fprintf(w, "data: %s\n\n", chunk)
+				written += int64(n)
+			}
 			if evt.Response != nil && evt.Response.Usage != nil {
 				promptT = evt.Response.Usage.InputTokens
 				compT = evt.Response.Usage.OutputTokens
@@ -1112,6 +1219,11 @@ func streamResponsesToChat(w http.ResponseWriter, body []byte) (written int64, p
 		}
 	}
 	// stream ended without response.completed
+	if tail := strip.flush(); tail != "" {
+		chunk := fmt.Sprintf(`{"choices":[{"index":0,"delta":{"content":%s},"finish_reason":null}],"usage":null}`, jsonStr(tail))
+		n, _ := fmt.Fprintf(w, "data: %s\n\n", chunk)
+		written += int64(n)
+	}
 	n, _ := w.Write([]byte("data: [DONE]\n\n"))
 	written += int64(n)
 	if fl != nil {
@@ -1158,26 +1270,42 @@ func mergeResponsesSSE(bodies [][]byte) []byte {
 	return out.Bytes()
 }
 
-// nudgePostResponses re-POSTs a body to zen with the same proxy failover as
-// handleOpenCode. best effort: nil on any failure.
-func (p *Pool) nudgePostResponses(r *http.Request, target string, nb []byte, sessionID *string) []byte {
+// nudgePostResponses re-POSTs a body to zen on the caller's lane, with the
+// same pacing, cooldown and rotation policy as the main request. best
+// effort: nil on any failure.
+func (p *Pool) nudgePostResponses(r *http.Request, target string, nb []byte, sessionID *string, lane *zenLane) []byte {
+	if lane == nil {
+		return nil
+	}
 	var cl *http.Client
 	lastProxy := ""
 	rotating := true
 	for zenRetries := 0; zenRetries < 5; zenRetries++ {
+		if !laneHealthy(lane) {
+			if nl := laneFailover(lane); nl != nil {
+				lane = nl
+				*sessionID = laneSession(lane)
+			}
+		} else {
+			laneGate(lane)
+		}
 		proxy := ""
-		if zenRetries == 0 {
-			proxy, cl = firstClient(sessionID)
-			lastProxy = proxy
-		} else if rotating {
-			proxy = pickFastProxy()
-			if proxy == "" {
+		if rotating {
+			proxy = laneProxyFor(lane)
+			if proxy == "" && cfg().Zen.AlwaysProxy {
+				if nl := laneFailover(lane); nl != nil {
+					lane = nl
+					*sessionID = laneSession(lane)
+					proxy = laneProxyFor(lane)
+				}
+			}
+			if proxy == "" && cfg().Zen.AlwaysProxy {
 				continue
 			}
 			cl = zenClient(proxy)
 			lastProxy = proxy
-			*sessionID = zenSession()
 		} else {
+			// service overloaded: retry on the same lane proxy + session.
 			proxy = lastProxy
 			cl = zenClient(proxy)
 		}
@@ -1267,9 +1395,9 @@ func nudgeEnabled(model string) bool {
 	return strings.Contains(strings.ToLower(model), "spark")
 }
 
-func (p *Pool) maybeNudgeResponses(r *http.Request, target string, posted, rb []byte, sessionID *string, clientModel string) []byte {
+func (p *Pool) maybeNudgeResponses(r *http.Request, target string, posted, rb []byte, sessionID *string, clientModel string, lane *zenLane) []byte {
 	post := func(nb []byte) []byte {
-		return p.nudgePostResponses(r, target, nb, sessionID)
+		return p.nudgePostResponses(r, target, nb, sessionID, lane)
 	}
 	if retry := tryNudgeResponses(clientModel, posted, rb, post); retry != nil {
 		_, nHasCalls := scanResponsesSSE(retry)
@@ -1294,7 +1422,7 @@ func (p *Pool) handleModels(w http.ResponseWriter, r *http.Request) {
 	p.mu.RUnlock()
 
 	var nvModels []string
-	if key != nil {
+	if key != nil && nvidiaEnabled() {
 		mc := &http.Client{Timeout: 10 * time.Second}
 		req, _ := http.NewRequest("GET", nvidiaBase+"/models", nil)
 		req.Header.Set("Authorization", "Bearer "+key.Key)
@@ -1319,10 +1447,7 @@ func (p *Pool) handleModels(w http.ResponseWriter, r *http.Request) {
 	var out struct {
 		Data []openRouterModel `json:"data"`
 	}
-	// keyless: nim models would 503, list opencode/* only.
-	if len(p.keys) == 0 {
-		nvModels = nil
-	}
+	out.Data = []openRouterModel{}
 	seen := make(map[string]bool)
 	for _, mid := range nvModels {
 		if seen[mid] {
@@ -1348,7 +1473,7 @@ func (p *Pool) handleModels(w http.ResponseWriter, r *http.Request) {
 		}
 		name := modelDisplayName(mid)
 		out.Data = append(out.Data, openRouterModel{
-			ID:            mid,
+			ID:            "nvidia/" + mid,
 			Name:          name,
 			Description:   desc,
 			ContextLength: cl,
@@ -1366,8 +1491,8 @@ func (p *Pool) handleModels(w http.ResponseWriter, r *http.Request) {
 			PerRequestLimits: nil,
 		})
 	}
-	// keyless: nim models would 503, skip the params fallback too.
-	if len(out.Data) == 0 && len(p.keys) > 0 {
+	// disabled or keyless: no nim models, skip the params fallback too.
+	if len(out.Data) == 0 && nvidiaEnabled() {
 		modelMu.RLock()
 		for _, e := range modelParams {
 			cl := 131072
@@ -1384,6 +1509,15 @@ func (p *Pool) handleModels(w http.ResponseWriter, r *http.Request) {
 				desc, _ = v.(string)
 			}
 			p := strings.ReplaceAll(e.pattern, "*", "")
+			// zen models list from the live api below; the nim
+			// fallback only covers nim-side patterns.
+			pl := strings.ToLower(p)
+			if strings.HasSuffix(pl, "-free") || pl == "big-pickle" || strings.HasPrefix(pl, "muse-spark") {
+				continue
+			}
+			if !strings.Contains(p, "/") {
+				p = "nvidia/" + p
+			}
 			out.Data = append(out.Data, openRouterModel{
 				ID:               p,
 				Name:             modelDisplayName(p),
@@ -1399,60 +1533,58 @@ func (p *Pool) handleModels(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// opencode zen free models (no auth) -> opencode/<id>
-	ocClient := &http.Client{Timeout: 10 * time.Second}
-	if ocResp, err := ocClient.Get(OpencodeBase + "/models"); err == nil {
-		func() {
-			defer ocResp.Body.Close()
-			var oc struct {
-				Data []struct {
-					ID string `json:"id"`
-				} `json:"data"`
-			}
-			if json.NewDecoder(ocResp.Body).Decode(&oc) != nil {
-				return
-			}
-			ocSeen := make(map[string]bool)
-			for _, m := range oc.Data {
-				if (!strings.HasSuffix(m.ID, "-free") && m.ID != "big-pickle") || ocSeen[m.ID] {
-					continue
+	var liveIDs []string
+	if zenEnabled() {
+		liveIDs = fetchZenModelIDs()
+	}
+	ocSeen := make(map[string]bool)
+	for _, m := range liveIDs {
+		if (!strings.HasSuffix(m, "-free") && m != "big-pickle") || ocSeen[m] {
+			continue
+		}
+		ocSeen[m] = true
+		cl := 131072
+		desc := ""
+		if e := matchesModelParams(m); e != nil {
+			if v, ok := e.params["context_length"]; ok {
+				switch n := v.(type) {
+				case float64:
+					cl = int(n)
+				case int:
+					cl = n
 				}
-				ocSeen[m.ID] = true
-				cl := 131072
-				desc := ""
-				if e := matchesModelParams(m.ID); e != nil {
-					if v, ok := e.params["context_length"]; ok {
-						switch n := v.(type) {
-						case float64:
-							cl = int(n)
-						case int:
-							cl = n
-						}
-					}
-					if v, ok := e.params["description"]; ok {
-						desc, _ = v.(string)
-					}
-				}
-				ocID := "opencode/" + m.ID
-				out.Data = append(out.Data, openRouterModel{
-					ID:            ocID,
-					Name:          modelDisplayName(ocID),
-					Description:   desc,
-					ContextLength: cl,
-					Pricing:       map[string]string{"prompt": "0", "completion": "0", "request": "0"},
-					Architecture:  map[string]any{"modality": "text->text", "tokenizer": "Other", "instruct_type": nil},
-					TopProvider:   map[string]any{"context_length": cl, "max_completion_tokens": nil, "is_moderated": false},
-				})
 			}
-		}()
+			if v, ok := e.params["description"]; ok {
+				desc, _ = v.(string)
+			}
+		}
+		ocID := "opencode/" + m
+		out.Data = append(out.Data, openRouterModel{
+			ID:            ocID,
+			Name:          modelDisplayName(ocID),
+			Description:   desc,
+			ContextLength: cl,
+			Pricing:       map[string]string{"prompt": "0", "completion": "0", "request": "0"},
+			Architecture:  map[string]any{"modality": "text->text", "tokenizer": "Other", "instruct_type": nil},
+			TopProvider:   map[string]any{"context_length": cl, "max_completion_tokens": nil, "is_moderated": false},
+		})
 	}
 
-	// hard-coded extra free models (don't end in "-free", not in /models list)
+	// hard-coded extra free models, listed only when the live api still
+	// serves them (dead entries 404 upstream and confuse clients).
 	seenIDs := make(map[string]bool, len(out.Data))
 	for _, e := range out.Data {
 		seenIDs[e.ID] = true
 	}
+	live := make(map[string]bool, len(liveIDs))
+	for _, m := range liveIDs {
+		live[m] = true
+	}
 	for _, id := range extraFreeModels {
 		if seenIDs["opencode/"+id] {
+			continue
+		}
+		if !zenEnabled() || (len(liveIDs) > 0 && !live[id]) {
 			continue
 		}
 		seenIDs["opencode/"+id] = true
@@ -1708,6 +1840,16 @@ func reqModel(body []byte) string {
 		return j.Model
 	}
 	return ""
+}
+
+// setReqModel rewrites the model field, preserving the rest of the body.
+func setReqModel(body []byte, model string) ([]byte, error) {
+	var m map[string]any
+	if err := json.Unmarshal(body, &m); err != nil {
+		return nil, err
+	}
+	m["model"] = model
+	return json.Marshal(m)
 }
 
 // --- Guardrail removal ---
@@ -2135,14 +2277,14 @@ func (p *Pool) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	injectParams(&body)
 	injectHelpfulLine(&body)
 
-	// anonymize before anything upstream sees the body; the wrapped
-	// writer swaps masks back on every response path below. the
+	// mask pii before anything upstream sees the body; the wrapped
+	// writer restores surrogates on every response path below. the
 	// disclose line goes in before masking so terms inside it (if
 	// any) are masked like everything else.
 	injectDiscloseLine(&body)
-	am := anonForRequest()
-	body = am.anonymize(body)
-	if dw := wrapDeanon(w, am); dw != nil {
+	pg := guardForRequest(r)
+	body = pg.MaskBody(body)
+	if dw := wrapPII(w, pg); dw != nil {
 		w = dw
 		defer dw.finish()
 	}
@@ -2161,11 +2303,30 @@ func (p *Pool) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	acclog.Printf("-> %s %s model=%s stream=%v bytes=%d", r.Method, r.URL.Path, model, isStream, len(body))
 
 	if strings.HasPrefix(model, "opencode/") {
+		if !zenEnabled() {
+			acclog.Printf("<- 503 %s %s model=%s (zen disabled)", r.Method, r.URL.Path, model)
+			http.Error(w, `{"error":"opencode zen is disabled; set zen.enabled: true in config.yml"}`, http.StatusServiceUnavailable)
+			return
+		}
 		p.handleOpenCode(w, r, body, model, isStream, start)
 		return
 	}
 
-	// keyless mode serves opencode/* only; nim models need keys.
+	// nvidia/ prefix is the listed form; bare ids stay nvidia for compat.
+	// the prefix never reaches nim: it names the backend, not the model.
+	if strings.HasPrefix(model, "nvidia/") {
+		model = strings.TrimPrefix(model, "nvidia/")
+		if b, err := setReqModel(body, model); err == nil {
+			body = b
+		}
+	}
+
+	// disabled or keyless mode serves opencode/* only; nim models need keys.
+	if !cfg().Nvidia.Enabled {
+		acclog.Printf("<- 503 %s %s model=%s (nvidia disabled)", r.Method, r.URL.Path, model)
+		http.Error(w, `{"error":"nvidia backend is disabled; set nvidia.enabled: true in config.yml"}`, http.StatusServiceUnavailable)
+		return
+	}
 	if len(p.keys) == 0 {
 		acclog.Printf("<- 503 %s %s model=%s (keyless: no nvidia keys)", r.Method, r.URL.Path, model)
 		http.Error(w, `{"error":"no nvidia keys configured; use an opencode/<model> free model or add nvidia_keys to config.yml"}`, http.StatusServiceUnavailable)
@@ -2403,21 +2564,13 @@ func (p *Pool) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 // handleOpenCode routes opencode/<model> requests to the opencode zen API
 // (OpenAI-compatible, no auth for -free models).
-// Muse Spark models use /responses endpoint; union-alpha uses /messages
-// (anthropic-native, only served via /v1/messages); all others use
+// Muse Spark models use /responses endpoint; all others use
 // /chat/completions.
 func (p *Pool) handleOpenCode(w http.ResponseWriter, r *http.Request, body []byte, model string, isStream bool, start time.Time) {
 	realModel := strings.TrimPrefix(model, "opencode/")
-	isMessages := endpointForModel(realModel) == "/messages"
-	if isMessages {
-		// /messages models (union-alpha) are anthropic-native on zen:
-		// translate the OAI request and serve it back as OAI.
-		if b, err := oaiRequestToAnthropic(body, realModel); err == nil {
-			body = b
-		}
-	}
+	tnames := oaiToolNames(body)
 	var m map[string]any
-	if !isMessages && json.Unmarshal(body, &m) == nil {
+	if json.Unmarshal(body, &m) == nil {
 		m["model"] = realModel
 		stripCacheFields(m)
 		ensureZenTools(m)
@@ -2428,6 +2581,8 @@ func (p *Pool) handleOpenCode(w http.ResponseWriter, r *http.Request, body []byt
 		}
 		if endpointForModel(realModel) == "/responses" {
 			convertToResponses(m)
+		} else {
+			sanitizeZenChatMessages(m)
 		}
 		if b, err := json.Marshal(m); err == nil {
 			body = b
@@ -2448,29 +2603,50 @@ func (p *Pool) handleOpenCode(w http.ResponseWriter, r *http.Request, body []byt
 	var prompT, compT, totalT int
 	var recErr string
 
-	sessionID := ""
-	if s := r.Header.Get("x-session-id"); s != "" {
-		sessionID = s
-	} else {
-		sessionID = zenSession()
-	}
+	lane := laneFor(r.Header.Get("x-session-id"), body)
+	sessionID := laneSession(lane)
 	var usedProxy string
 	rotating := true
 	for zenRetries := 0; zenRetries < 5; zenRetries++ {
+		// lane failover: a cooling lane yields to the healthiest lane,
+		// keeping this request off a 429-backed exit. when every lane is
+		// cooling, wait out the shortest backoff instead of failing fast.
+		// otherwise pace: never hit one exit faster than lane_min_gap_ms.
+		if !laneHealthy(lane) {
+			if nl := laneFailover(lane); nl != nil {
+				lane = nl
+				sessionID = laneSession(lane)
+			} else if zenRetries > 0 {
+				if wait := laneWait(); wait > 0 {
+					acclog.Printf("  opencode all lanes cooling, waiting %v (retry %d/4)", wait, zenRetries)
+					time.Sleep(wait)
+				}
+			}
+		} else {
+			laneGate(lane)
+		}
 		proxy := ""
 		if zenRetries == 0 {
-			proxy, cl = firstClient(&sessionID)
+			proxy = laneProxyFor(lane)
+			cl = zenClient(proxy)
 			usedProxy = proxy
 		} else if rotating {
-			proxy = pickFastProxy()
-			if proxy == "" {
+			proxy = laneProxyFor(lane)
+			if proxy == "" && cfg().Zen.AlwaysProxy {
+				// pool dry and proxied mode: try another lane's exit.
+				if nl := laneFailover(lane); nl != nil {
+					lane = nl
+					sessionID = laneSession(lane)
+					proxy = laneProxyFor(lane)
+				}
+			}
+			if proxy == "" && cfg().Zen.AlwaysProxy {
 				continue
 			}
 			cl = zenClient(proxy)
 			usedProxy = proxy
-			sessionID = zenSession()
 		} else {
-			// service overloaded: retry on the same proxy + session.
+			// service overloaded: retry on the same lane proxy + session.
 			proxy = usedProxy
 			cl = zenClient(proxy)
 		}
@@ -2480,11 +2656,8 @@ func (p *Pool) handleOpenCode(w http.ResponseWriter, r *http.Request, body []byt
 			return
 		}
 		setZenHeaders(req, sessionID)
-		if isMessages {
-			req.Header.Set("anthropic-version", "2023-06-01")
-		}
 		if zenRetries > 0 {
-			acclog.Printf("  opencode retry %d/4 session=%s proxy=%s", zenRetries, sessionID, proxy)
+			acclog.Printf("  opencode retry %d/4 session=%s proxy=%s lane=%s", zenRetries, sessionID, proxy, lane.id)
 		}
 		for k, v := range r.Header {
 			switch strings.ToLower(k) {
@@ -2504,7 +2677,7 @@ func (p *Pool) handleOpenCode(w http.ResponseWriter, r *http.Request, body []byt
 			logZenNetErr(zenRetries, model, proxy, target, err)
 			if noteZenNetworkError() {
 				acclog.Printf("  3+ consecutive network errors, refreshing proxy pool")
-				refreshZenProxies()
+				refreshZenProxiesAsync()
 				resetZenNetworkErrors()
 			}
 			if zenRetries < 4 {
@@ -2520,9 +2693,16 @@ func (p *Pool) handleOpenCode(w http.ResponseWriter, r *http.Request, body []byt
 
 		if resp.StatusCode == http.StatusTooManyRequests || resp.StatusCode == 529 {
 			resp.Body.Close()
-			acclog.Printf("  opencode rate-limited %d (retry %d/4) model=%s country=%s proxy=%s, switching proxy",
-				resp.StatusCode, zenRetries, model, proxyCountry(proxy), proxy)
-			dropProxy(proxy)
+			acclog.Printf("  opencode rate-limited %d (retry %d/4) model=%s country=%s proxy=%s lane=%s, cooling lane",
+				resp.StatusCode, zenRetries, model, proxyCountry(proxy), proxy, lane.id)
+			if proxy == "" {
+				laneEscalate(lane) // direct got limited: give the lane an exit
+			}
+			laneCool(lane)
+			if nl := laneFailover(lane); nl != nil {
+				lane = nl
+				sessionID = laneSession(lane)
+			}
 			rotating = true
 			zenBackoff(zenRetries)
 			continue
@@ -2543,10 +2723,15 @@ func (p *Pool) handleOpenCode(w http.ResponseWriter, r *http.Request, body []byt
 			if zenGeoBlocked(eb) {
 				logZenBlocked("geo", zenRetries, resp.StatusCode, model, proxy, "", eb)
 				dropProxy(proxy)
+				laneCoolSoft(lane)
+				if nl := laneFailover(lane); nl != nil {
+					lane = nl
+					sessionID = laneSession(lane)
+				}
 				rotating = true
 				if noteZenGeoErr() {
 					acclog.Printf("  3+ geo-blocks, refreshing proxy pool")
-					refreshZenProxies()
+					refreshZenProxiesAsync()
 					resetZenGeoErrs()
 				}
 				if zenRetries < 4 {
@@ -2557,11 +2742,39 @@ func (p *Pool) handleOpenCode(w http.ResponseWriter, r *http.Request, body []byt
 			if zenUserBlocked(eb) {
 				logZenBlocked("user", zenRetries, resp.StatusCode, model, proxy, "", eb)
 				dropProxy(proxy)
+				laneBlock(lane)
+				if nl := laneFailover(lane); nl != nil {
+					lane = nl
+					sessionID = laneSession(lane)
+				}
 				rotating = true
 				if noteZenBlockErr() {
 					acclog.Printf("  3+ user-blocks, refreshing proxy pool")
-					refreshZenProxies()
+					refreshZenProxiesAsync()
 					resetZenBlockErrs()
+				}
+				if zenRetries < 4 {
+					zenBackoff(zenRetries)
+					continue
+				}
+			}
+			if zenFreeTierBlocked(eb) {
+				acclog.Printf("  opencode free-tier-blocked %d (retry %d/4) model=%s country=%s proxy=%s lane=%s, switching lane",
+					resp.StatusCode, zenRetries, model, proxyCountry(proxy), proxy, lane.id)
+				dropProxy(proxy)
+				if proxy == "" {
+					laneEscalate(lane) // direct is flagged: give the lane an exit
+				}
+				laneBlock(lane)
+				if nl := laneFailover(lane); nl != nil {
+					lane = nl
+					sessionID = laneSession(lane)
+				}
+				rotating = true
+				if noteZenFreeTierErr() {
+					acclog.Printf("  3+ free-tier blocks, refreshing proxy pool")
+					refreshZenProxiesAsync()
+					resetZenFreeTierErrs()
 				}
 				if zenRetries < 4 {
 					zenBackoff(zenRetries)
@@ -2575,6 +2788,7 @@ func (p *Pool) handleOpenCode(w http.ResponseWriter, r *http.Request, body []byt
 		resetZenNetworkErrors()
 		if resp.StatusCode == http.StatusOK {
 			p.noteZenSuccess(sessionID, usedProxy)
+			laneTouch(lane, usedProxy)
 		}
 		break
 	}
@@ -2586,7 +2800,7 @@ func (p *Pool) handleOpenCode(w http.ResponseWriter, r *http.Request, body []byt
 	}
 
 	if usedProxy != "" {
-		acclog.Printf("  opencode session=%s proxy=%s", sessionID, usedProxy)
+		acclog.Printf("  opencode session=%s proxy=%s lane=%s", sessionID, usedProxy, lane.id)
 	}
 
 	if isStream && resp.StatusCode == http.StatusOK {
@@ -2603,7 +2817,7 @@ func (p *Pool) handleOpenCode(w http.ResponseWriter, r *http.Request, body []byt
 			// same no-tools continue as the stream branch, on the raw
 			// SSE before folding.
 			post := func(nb []byte) []byte {
-				return p.nudgePostResponses(r, target, nb, &sessionID)
+				return p.nudgePostResponses(r, target, nb, &sessionID, lane)
 			}
 			if retry := tryNudgeResponses(model, body, rb, post); retry != nil {
 				_, nHasCalls := scanResponsesSSE(retry)
@@ -2611,12 +2825,8 @@ func (p *Pool) handleOpenCode(w http.ResponseWriter, r *http.Request, body []byt
 				rb = mergeResponsesSSE([][]byte{rb, retry})
 			}
 			rb = responsesToChat(responsesSSEToJSON(rb))
-		} else if isMessages && resp.StatusCode == http.StatusOK {
-			rb = anthropicToOpenAI(foldAnthropicSSE(rb, realModel), realModel)
-		} else if isMessages {
-			rb = anthropicErrToOAI(rb, resp.StatusCode)
 		} else if !isStream && resp.StatusCode == http.StatusOK {
-			rb = sseToNonStream(rb, realModel)
+			rb = sseToNonStream(rb, realModel, tnames)
 		}
 		resp.Body = io.NopCloser(bytes.NewReader(rb))
 		if resp.StatusCode != http.StatusOK {
@@ -2649,13 +2859,7 @@ func (p *Pool) handleOpenCode(w http.ResponseWriter, r *http.Request, body []byt
 	for k, v := range resp.Header {
 		w.Header()[k] = v
 	}
-	if isMessages {
-		// body rewritten (fold, error wrap, or sse rechunk) — stale length lied
-		w.Header().Del("Content-Length")
-		if !(isStream && resp.StatusCode == http.StatusOK) {
-			w.Header().Set("Content-Type", "application/json")
-		}
-	} else if !isStream && resp.StatusCode == http.StatusOK {
+	if !isStream && resp.StatusCode == http.StatusOK {
 		w.Header().Set("Content-Type", "application/json")
 	}
 	w.WriteHeader(resp.StatusCode)
@@ -2670,17 +2874,8 @@ func (p *Pool) handleOpenCode(w http.ResponseWriter, r *http.Request, body []byt
 				os.WriteFile(rp, rb, 0o644)
 				acclog.Printf("ZEN_DUMP raw responses SSE %d bytes -> %s", len(rb), rp)
 			}
-			rb = p.maybeNudgeResponses(r, target, body, rb, &sessionID, model)
-			written, prompT, compT = streamResponsesToChat(w, rb)
-		} else if isMessages {
-			rb, _ := io.ReadAll(resp.Body)
-			resp.Body.Close()
-			if os.Getenv("ZEN_DUMP") != "" {
-				rp := fmt.Sprintf("/tmp/zenraw_%d.sse", time.Now().UnixNano())
-				os.WriteFile(rp, rb, 0o644)
-				acclog.Printf("ZEN_DUMP raw messages SSE %d bytes -> %s", len(rb), rp)
-			}
-			written, prompT, compT = streamAnthropicToOpenAI(w, rb, realModel)
+			rb = p.maybeNudgeResponses(r, target, body, rb, &sessionID, model, lane)
+			written, prompT, compT = streamResponsesToChat(w, rb, tnames)
 		} else if fl, ok := w.(http.Flusher); ok {
 			buf := make([]byte, 4096)
 			for {
@@ -2744,9 +2939,10 @@ func zenGateTool(name string) any {
 	}}
 }
 
-// ensureZenTools appends any missing gate tools. clients like claude code send
-// capitalized names (Bash, Read, ...) which the gate does not accept, so a
-// presence check by exact name is required rather than a skip when non-empty.
+// ensureZenTools appends any missing gate tools. the gate matches exact
+// lowercase names, so a client Bash does not satisfy a gate bash: the
+// lowercase stub is added beside the client's own spelling and response
+// translators map the call back via tnames.resolve.
 // bodies with no tools at all (title gen, compact summaries) are left alone:
 // giving the summarizer a callable read stub makes it emit tool calls that
 // opencode rejects with "tool call not allowed while generating summary".
@@ -2783,6 +2979,126 @@ func ensureZenTools(m map[string]any) {
 	m["tools"] = t
 }
 
+// sanitizeZenChatMessages repairs tool call/result pairing for zen's
+// /chat/completions models (space-bunny): upstream 400s a bare
+// [invalid_request_error] on dangling tool_calls, orphan tool messages,
+// user text interleaved between a call and its result, or empty ids.
+// matched results move directly behind their assistant message; dangling
+// calls are stripped; orphan/empty-id tool messages become user text.
+// responses-path models are untouched.
+func sanitizeZenChatMessages(m map[string]any) {
+	raw, ok := m["messages"].([]any)
+	if !ok || len(raw) == 0 {
+		return
+	}
+	toolText := func(rm map[string]any) string {
+		switch c := rm["content"].(type) {
+		case string:
+			return c
+		case nil:
+			return ""
+		default:
+			if b, err := json.Marshal(c); err == nil {
+				return string(b)
+			}
+			return ""
+		}
+	}
+	callID := func(t any) string {
+		tm, _ := t.(map[string]any)
+		if tm == nil {
+			return ""
+		}
+		id, _ := tm["id"].(string)
+		fn, _ := tm["function"].(map[string]any)
+		name, _ := fn["name"].(string)
+		if id == "" || strings.TrimSpace(name) == "" {
+			return ""
+		}
+		return id
+	}
+	// first result index per call id wins.
+	resIdx := map[string]int{}
+	for i, r := range raw {
+		rm, ok := r.(map[string]any)
+		if !ok || rm["role"] != "tool" {
+			continue
+		}
+		id, _ := rm["tool_call_id"].(string)
+		if id == "" {
+			continue
+		}
+		if _, seen := resIdx[id]; !seen {
+			resIdx[id] = i
+		}
+	}
+	// match each assistant's calls to later results. dangling (no later
+	// result) and empty-id calls are stripped.
+	taken := map[int]bool{}    // result indices emitted behind an assistant
+	kept := map[int][]any{}    // assistant index -> kept tool_calls
+	emitIdx := map[int][]int{} // assistant index -> result indices to emit
+	for i, r := range raw {
+		rm, ok := r.(map[string]any)
+		if !ok || rm["role"] != "assistant" {
+			continue
+		}
+		tc, ok := rm["tool_calls"].([]any)
+		if !ok || len(tc) == 0 {
+			continue
+		}
+		var kc []any
+		var ei []int
+		for _, t := range tc {
+			id := callID(t)
+			if id == "" {
+				continue
+			}
+			ri, found := resIdx[id]
+			if !found || ri <= i || taken[ri] {
+				continue
+			}
+			taken[ri] = true
+			kc = append(kc, t)
+			ei = append(ei, ri)
+		}
+		kept[i] = kc
+		emitIdx[i] = ei
+	}
+	out := make([]any, 0, len(raw))
+	for i, r := range raw {
+		rm, ok := r.(map[string]any)
+		if !ok {
+			out = append(out, r)
+			continue
+		}
+		if rm["role"] == "tool" {
+			if taken[i] {
+				continue // already emitted behind its assistant
+			}
+			out = append(out, map[string]any{"role": "user", "content": toolText(rm)})
+			continue
+		}
+		if kc, isA := kept[i]; isA {
+			cp := map[string]any{}
+			for k, v := range rm {
+				cp[k] = v
+			}
+			if len(kc) > 0 {
+				cp["tool_calls"] = kc
+			} else {
+				delete(cp, "tool_calls")
+			}
+			out = append(out, cp)
+			for _, ri := range emitIdx[i] {
+				out = append(out, raw[ri])
+			}
+			continue
+		}
+		out = append(out, r)
+	}
+	m["messages"] = out
+}
+
 // captureRequest dumps an inbound POST to /tmp/oc-capture so real client
 // traffic can be replayed. enabled with ZEN_CAPTURE=1.
 func captureRequest(r *http.Request) {
@@ -2812,7 +3128,7 @@ func captureRequest(r *http.Request) {
 }
 
 // sseToNonStream folds a chat/completions SSE stream into one completion body.
-func sseToNonStream(rb []byte, model string) []byte {
+func sseToNonStream(rb []byte, model string, tnames toolNames) []byte {
 	type tcall struct{ id, name, args string }
 	var content strings.Builder
 	calls := map[int]*tcall{}
@@ -2867,13 +3183,13 @@ func sseToNonStream(rb []byte, model string) []byte {
 					e.id = t.ID
 				}
 				if t.Function.Name != "" {
-					e.name = t.Function.Name
+					e.name = tnames.resolve(t.Function.Name)
 				}
 				e.args += t.Function.Arguments
 			}
 		}
 	}
-	msg := map[string]any{"role": "assistant", "content": content.String()}
+	msg := map[string]any{"role": "assistant", "content": stripWaitSentinel(content.String())}
 	if len(order) > 0 {
 		arr := make([]any, 0, len(order))
 		for _, idx := range order {

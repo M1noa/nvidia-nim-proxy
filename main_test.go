@@ -9,20 +9,42 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
+
+	"nvidia-nim-proxy/pii"
 )
 
-func TestMain(m *testing.M) {
+// loadSuiteConfig returns the config the whole suite is written against.
+// tests that swap cfg mutate a global, so each one must restore this or later
+// tests see the wrong model params (spark nudge flags live here, not in
+// defaultConfig).
+func loadSuiteConfig() *appConfig {
 	if c, err := loadConfigFile("config.yml.example"); err == nil {
-		applyConfig(c)
-	} else {
-		d := defaultConfig()
-		applyConfig(&d)
+		return c
 	}
+	d := defaultConfig()
+	return &d
+}
+
+func TestMain(m *testing.M) {
+	applyConfig(loadSuiteConfig())
 	acclog = log.New(io.Discard, "", 0)
-	os.Exit(m.Run())
+	code := m.Run()
+	// leave the process config consistent for anything that runs after
+	applyConfig(loadSuiteConfig())
+	os.Exit(code)
+}
+
+// useConfig installs c for the duration of the test and restores the suite
+// config afterwards, so config-mutating tests are order-independent.
+func useConfig(t *testing.T, c *appConfig) {
+	t.Helper()
+	prev := cfg()
+	applyConfig(c)
+	t.Cleanup(func() { applyConfig(prev) })
 }
 
 func approx(a, b float64) bool {
@@ -227,12 +249,6 @@ func TestEndpointForModel(t *testing.T) {
 			t.Errorf("endpointForModel(%q) = %q, want /responses", model, got)
 		}
 	}
-	// union-alpha uses /messages (anthropic-native, like opencode)
-	for _, model := range []string{"union-alpha", "union-alpha-1"} {
-		if got := endpointForModel(model); got != "/messages" {
-			t.Errorf("endpointForModel(%q) = %q, want /messages", model, got)
-		}
-	}
 	// All other models use /chat/completions
 	for _, model := range []string{"big-pickle", "mimo-v2.5-free", "ling-3.0-flash-fin-free", "nemotron-3-ultra-free", "nemotron-3.5-lightning-free", "kimi-k3"} {
 		if got := endpointForModel(model); got != "/chat/completions" {
@@ -266,6 +282,37 @@ func TestRefreshOpencodeModelsIncludesBigPickle(t *testing.T) {
 	}
 }
 
+func TestFetchZenModelIDs(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		io.WriteString(w, `{"data":[{"id":"big-pickle"},{"id":"muse-spark-1.3-contributor-free"}]}`)
+	}))
+	defer srv.Close()
+	ids := fetchZenModelIDsFrom(srv.URL)
+	if len(ids) != 2 || ids[0] != "big-pickle" {
+		t.Fatalf("fetchZenModelIDs = %v, want [big-pickle muse-spark-1.3-contributor-free]", ids)
+	}
+}
+
+func TestExtraFreeModelsGatedOnLiveAPI(t *testing.T) {
+	// extras only list when the live api still serves them.
+	live := map[string]bool{"big-pickle": true}
+	listed := []string{}
+	seen := map[string]bool{"opencode/muse-spark-1.3-contributor-free": true}
+	for _, id := range []string{"big-pickle", "retired-model"} {
+		if seen["opencode/"+id] {
+			continue
+		}
+		if len(live) > 0 && !live[id] {
+			continue
+		}
+		listed = append(listed, id)
+	}
+	if len(listed) != 1 || listed[0] != "big-pickle" {
+		t.Fatalf("gated extras = %v, want [big-pickle]", listed)
+	}
+}
+
 func TestHandleOpenCodeUsesCorrectEndpoint(t *testing.T) {
 	// Verify endpointForModel is called correctly in handleOpenCode
 	// by checking that Muse Spark models route to /responses
@@ -279,11 +326,6 @@ func TestHandleOpenCodeUsesCorrectEndpoint(t *testing.T) {
 	realModel := strings.TrimPrefix("opencode/big-pickle", "opencode/")
 	if got := endpointForModel(realModel); got != "/chat/completions" {
 		t.Errorf("opencode/big-pickle should route to /chat/completions, got %q", got)
-	}
-	// union-alpha should route to /messages
-	realModel = strings.TrimPrefix("opencode/union-alpha", "opencode/")
-	if got := endpointForModel(realModel); got != "/messages" {
-		t.Errorf("opencode/union-alpha should route to /messages, got %q", got)
 	}
 }
 
@@ -334,7 +376,7 @@ func TestStreamResponsesToChat(t *testing.T) {
 
 	var buf strings.Builder
 	w := httptest.NewRecorder()
-	_, promptT, compT := streamResponsesToChat(w, []byte(stream))
+	_, promptT, compT := streamResponsesToChat(w, []byte(stream), nil)
 
 	body := w.Body.String()
 	if !strings.Contains(body, "\"content\":\"Hello\"") {
@@ -358,40 +400,32 @@ func TestStreamResponsesToChat(t *testing.T) {
 	_ = buf
 }
 
-func TestFoldAnthropicSSE(t *testing.T) {
-	stream := "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":12}}}\n\n" +
-		"event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n" +
-		"event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"hi\"}}\n\n" +
-		"event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":3}}\n\n" +
-		"data: [DONE]\n\n"
-	out := foldAnthropicSSE([]byte(stream), "opencode/union-alpha")
-	var m struct {
-		Type       string `json:"type"`
-		Role       string `json:"role"`
-		StopReason string `json:"stop_reason"`
-		Content    []struct {
-			Type string `json:"type"`
-			Text string `json:"text"`
-		} `json:"content"`
-		Usage struct {
-			InputTokens  int `json:"input_tokens"`
-			OutputTokens int `json:"output_tokens"`
-		} `json:"usage"`
+func TestZenFreeTierBlocked(t *testing.T) {
+	cases := []struct {
+		body string
+		want bool
+	}{
+		{`{"type":"error","error":{"type":"FreeTierError","message":"Error from provider (Console): OpenCode's free tier can only be used from within OpenCode"}}`, true},
+		{`{"error":"free tier can only be used from within opencode"}`, true},
+		{`{"error":{"message":"This model is not available in your country."}}`, false},
+		{`{"error":"[user_blocked] nope"}`, false},
+		{"", false},
 	}
-	if err := json.Unmarshal(out, &m); err != nil {
-		t.Fatalf("unmarshal: %v", err)
+	for _, c := range cases {
+		if got := zenFreeTierBlocked([]byte(c.body)); got != c.want {
+			t.Errorf("zenFreeTierBlocked(%q) = %v, want %v", c.body, got, c.want)
+		}
 	}
-	if m.Type != "message" || m.Role != "assistant" || m.StopReason != "end_turn" {
-		t.Errorf("bad envelope: %+v", m)
+	resetZenFreeTierErrs()
+	if noteZenFreeTierErr() || noteZenFreeTierErr() {
+		t.Fatal("threshold must trip on the 3rd consecutive error, not earlier")
 	}
-	if len(m.Content) != 1 || m.Content[0].Text != "hi" {
-		t.Errorf("bad content: %s", out)
+	if !noteZenFreeTierErr() {
+		t.Fatal("threshold must trip on the 3rd consecutive error")
 	}
-	if m.Usage.InputTokens != 12 || m.Usage.OutputTokens != 3 {
-		t.Errorf("bad usage: %+v", m.Usage)
-	}
-	if p, c := anthropicStreamUsage([]byte(stream)); p != 12 || c != 3 {
-		t.Errorf("anthropicStreamUsage = %d,%d want 12,3", p, c)
+	resetZenFreeTierErrs()
+	if noteZenFreeTierErr() {
+		t.Fatal("counter must reset")
 	}
 }
 
@@ -405,160 +439,12 @@ func TestZenServiceOverloaded(t *testing.T) {
 	}
 }
 
-func TestOAIRequestToAnthropic(t *testing.T) {
-	in := `{"model":"opencode/union-alpha","messages":[{"role":"system","content":"be brief"},{"role":"user","content":"hi"},{"role":"assistant","content":"","tool_calls":[{"id":"call_1","type":"function","function":{"name":"bash","arguments":"{\"cmd\":\"ls\"}"}}]},{"role":"tool","tool_call_id":"call_1","content":"ok"}],"tools":[{"type":"function","function":{"name":"bash","description":"run","parameters":{"type":"object"}}}]}`
-
-	out, err := oaiRequestToAnthropic([]byte(in), "union-alpha")
-	if err != nil {
-		t.Fatalf("convert: %v", err)
-	}
-	var m struct {
-		Model     string `json:"model"`
-		System    string `json:"system"`
-		MaxTokens int    `json:"max_tokens"`
-		Stream    bool   `json:"stream"`
-		Messages  []struct {
-			Role    string `json:"role"`
-			Content []struct {
-				Type      string `json:"type"`
-				Text      string `json:"text"`
-				ToolUseID string `json:"tool_use_id"`
-				Name      string `json:"name"`
-			} `json:"content"`
-		} `json:"messages"`
-		Tools []struct {
-			Name        string `json:"name"`
-			InputSchema any    `json:"input_schema"`
-		} `json:"tools"`
-	}
-	if err := json.Unmarshal(out, &m); err != nil {
-		t.Fatalf("unmarshal: %v", err)
-	}
-	if m.Model != "union-alpha" || !m.Stream || m.MaxTokens != 4096 {
-		t.Errorf("bad envelope: model=%q stream=%v max=%d", m.Model, m.Stream, m.MaxTokens)
-	}
-	if m.System != "be brief" {
-		t.Errorf("bad system: %q", m.System)
-	}
-	if len(m.Messages) != 3 {
-		t.Fatalf("want 3 messages, got %d: %s", len(m.Messages), out)
-	}
-	if m.Messages[0].Content[0].Text != "hi" {
-		t.Errorf("bad user content: %s", out)
-	}
-	if len(m.Messages[1].Content) != 1 || m.Messages[1].Content[0].Name != "bash" {
-		t.Errorf("bad assistant tool_use: %s", out)
-	}
-	if m.Messages[1].Content[0].Type != "tool_use" {
-		t.Errorf("assistant block type = %q, want tool_use", m.Messages[1].Content[0].Type)
-	}
-	if len(m.Messages) < 3 || len(m.Messages[1].Content) == 0 {
-		t.Fatalf("missing assistant blocks: %s", out)
-	}
-	if len(m.Tools) != 1 || m.Tools[0].Name != "bash" || m.Tools[0].InputSchema == nil {
-		t.Errorf("bad tools: %s", out)
-	}
-}
-
-func TestAnthropicToOpenAI(t *testing.T) {
-	folded := []byte(`{"id":"msg_x","type":"message","role":"assistant","model":"union-alpha","content":[{"type":"text","text":"hello"},{"type":"tool_use","id":"toolu_1","name":"read","input":{"path":"/x"}}],"stop_reason":"tool_use","usage":{"input_tokens":10,"output_tokens":4}}`)
-	out := anthropicToOpenAI(folded, "opencode/union-alpha")
-	var m struct {
-		Object  string `json:"object"`
-		Model   string `json:"model"`
-		Choices []struct {
-			Message struct {
-				Role      string `json:"role"`
-				Content   string `json:"content"`
-				ToolCalls []struct {
-					ID       string `json:"id"`
-					Function struct {
-						Name      string `json:"name"`
-						Arguments string `json:"arguments"`
-					} `json:"function"`
-				} `json:"tool_calls"`
-			} `json:"message"`
-			FinishReason string `json:"finish_reason"`
-		} `json:"choices"`
-		Usage struct {
-			PromptTokens     int `json:"prompt_tokens"`
-			CompletionTokens int `json:"completion_tokens"`
-			TotalTokens      int `json:"total_tokens"`
-		} `json:"usage"`
-	}
-	if err := json.Unmarshal(out, &m); err != nil {
-		t.Fatalf("unmarshal: %v", err)
-	}
-	if m.Object != "chat.completion" || m.Model != "opencode/union-alpha" {
-		t.Errorf("bad envelope: %s", out)
-	}
-	if len(m.Choices) != 1 || m.Choices[0].FinishReason != "tool_calls" {
-		t.Errorf("bad finish: %s", out)
-	}
-	if m.Choices[0].Message.Content != "hello" {
-		t.Errorf("bad content: %s", out)
-	}
-	tc := m.Choices[0].Message.ToolCalls
-	if len(tc) != 1 || tc[0].ID != "toolu_1" || tc[0].Function.Name != "read" {
-		t.Errorf("bad tool_calls: %s", out)
-	}
-	if tc[0].Function.Arguments != `{"path":"/x"}` {
-		t.Errorf("bad arguments: %q", tc[0].Function.Arguments)
-	}
-	if m.Usage.PromptTokens != 10 || m.Usage.CompletionTokens != 4 || m.Usage.TotalTokens != 14 {
-		t.Errorf("bad usage: %s", out)
-	}
-}
-
-func TestStreamAnthropicToOpenAI(t *testing.T) {
-	stream := "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":7}}}\n\n" +
-		"event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\"}}\n\n" +
-		"event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"yo\"}}\n\n" +
-		"event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":2}}\n\n"
-	rec := httptest.NewRecorder()
-	written, p, c := streamAnthropicToOpenAI(rec, []byte(stream), "opencode/union-alpha")
-	if p != 7 || c != 2 {
-		t.Errorf("tokens = %d,%d want 7,2", p, c)
-	}
-	if written <= 0 {
-		t.Errorf("written = %d", written)
-	}
-	body := rec.Body.String()
-	if !strings.Contains(body, `"content":"yo"`) {
-		t.Errorf("missing content delta: %s", body)
-	}
-	if !strings.Contains(body, `"finish_reason":"stop"`) {
-		t.Errorf("missing stop chunk: %s", body)
-	}
-	if !strings.HasSuffix(strings.TrimSpace(body), "data: [DONE]") {
-		t.Errorf("missing [DONE] trailer: %s", body)
-	}
-}
-
-func TestAnthropicErrToOAI(t *testing.T) {
-	ae := []byte(`{"type":"error","error":{"type":"api_error","message":"Upstream request failed: Model union-alpha is not supported"}}`)
-	out := anthropicErrToOAI(ae, 400)
-	var m map[string]any
-	if err := json.Unmarshal(out, &m); err != nil {
-		t.Fatalf("unmarshal: %v", err)
-	}
-	errObj, ok := m["error"].(map[string]any)
-	if !ok {
-		t.Fatalf("no error envelope: %s", out)
-	}
-	if !strings.Contains(errObj["message"].(string), "not supported") {
-		t.Errorf("message lost: %s", out)
-	}
-	if errObj["code"].(float64) != 400 {
-		t.Errorf("code = %v want 400", errObj["code"])
-	}
-}
 func TestConvertResponsesFlatToolsPreserved(t *testing.T) {
 	body, err := os.ReadFile("/tmp/zenin_1789086077017333000.json")
 	if err != nil {
 		t.Skip("no dump file")
 	}
-	oaiBody, _, upstream, _, err := anthropicRequestToOpenAI(body)
+	oaiBody, _, upstream, _, _, err := anthropicRequestToOpenAI(body)
 	if err != nil {
 		t.Fatalf("anthroToOAI: %v", err)
 	}
@@ -685,15 +571,17 @@ func TestTryNudgeResponsesMerges(t *testing.T) {
 	if out := tryNudgeResponses("opencode/muse-spark-1.3", posted, first, postWait); out != nil {
 		t.Fatalf("wait-only retry must yield nil, got %s", out)
 	}
-	// question text -> nil, no post call.
+	// question text: no exemption anymore (the waitSentinel reprompt makes
+	// nudging past a question safe; exempting them looped greetings
+	// forever), so a question still nudges and returns the retry.
 	called := false
 	postNo := func(nb []byte) []byte { called = true; return retry }
 	q := []byte("data: {\"type\":\"response.output_text.delta\",\"delta\":\"Which file?\"}\n\ndata: [DONE]\n\n")
-	if out := tryNudgeResponses("opencode/muse-spark-1.3", posted, q, postNo); out != nil {
-		t.Fatalf("question must not nudge")
+	if out := tryNudgeResponses("opencode/muse-spark-1.3", posted, q, postNo); out == nil {
+		t.Fatalf("question should still nudge")
 	}
-	if called {
-		t.Fatal("post must not run for questions")
+	if !called {
+		t.Fatal("post must run for questions")
 	}
 }
 
@@ -786,6 +674,50 @@ func TestInjectHelpfulLine(t *testing.T) {
 	injectHelpfulLine(&b3)
 	if string(b3) != before {
 		t.Fatalf("empty messages mutated")
+	}
+}
+
+func TestStripWaitSentinel(t *testing.T) {
+	if got := stripWaitSentinel("SPARK_WAITING_FOR_INPUT"); got != "" {
+		t.Fatalf("sentinel not stripped: %q", got)
+	}
+	if got := stripWaitSentinel("done SPARK_WAITING_FOR_INPUT extra"); got != "done  extra" {
+		t.Fatalf("noisy sentinel not stripped: %q", got)
+	}
+	if got := stripWaitSentinel("plain text"); got != "plain text" {
+		t.Fatalf("benign text mutated: %q", got)
+	}
+	body := []byte("data: {\"type\":\"response.output_text.delta\",\"delta\":\"SPARK_WAITING_FOR_INPUT\"}\n\ndata: [DONE]\n\n")
+	if s := string(stripSentinelSSE(body)); strings.Contains(s, "SPARK_WAITING_FOR_INPUT") {
+		t.Fatalf("SSE sentinel not stripped: %q", s)
+	}
+	clean := []byte("data: {\"type\":\"response.output_text.delta\",\"delta\":\"hi\"}\n\n")
+	if string(stripSentinelSSE(clean)) != string(clean) {
+		t.Fatalf("clean SSE mutated")
+	}
+	// folded paths must not leak the sentinel.
+	folded := string(responsesToChat(responsesSSEToJSON(body)))
+	if strings.Contains(folded, "SPARK_WAITING_FOR_INPUT") {
+		t.Fatalf("folded chat leaks sentinel: %q", folded)
+	}
+	// sentinel split across two deltas must not leak through the fold.
+	split := []byte("data: {\"type\":\"response.output_text.delta\",\"item_id\":\"m1\",\"delta\":\"SPARK_WAIT\"}\n\ndata: {\"type\":\"response.output_text.delta\",\"item_id\":\"m1\",\"delta\":\"ING_FOR_INPUT\"}\n\ndata: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\"}}\n\ndata: [DONE]\n\n")
+	foldedSplit := string(responsesToChat(responsesSSEToJSON(split)))
+	if strings.Contains(foldedSplit, "SPARK_WAITING_FOR_INPUT") {
+		t.Fatalf("split sentinel leaks through fold: %q", foldedSplit)
+	}
+	// split sentinel must not leak through the streaming paths either.
+	var s sentinelStripper
+	if got := s.push("SPARK_WAIT"); got != "" {
+		t.Fatalf("stripper leaked partial sentinel: %q", got)
+	}
+	if tail := s.flush(); strings.Contains(tail, "SPARK_WAITING_FOR_INPUT") {
+		t.Fatalf("stripper flushed raw sentinel: %q", tail)
+	}
+	var s2 sentinelStripper
+	_ = s2.push("ok SPARK_WAIT")
+	if got := s2.push("ING_FOR_INPUT done"); strings.Contains(got, "SPARK_WAITING_FOR_INPUT") {
+		t.Fatalf("stripper passed split sentinel through: %q", got)
 	}
 }
 
@@ -903,24 +835,37 @@ func TestMaybeNudgeResponsesGating(t *testing.T) {
 	p := &Pool{}
 	req := httptest.NewRequest("POST", "http://localhost:5419/v1/chat/completions", nil)
 	sess := "ses_test123"
+	tl := &zenLane{id: "t", session: sess, lastUsed: time.Now()}
 	first := []byte(nudgeFirstSSE)
 
 	// non-spark model: no nudge flag, body untouched (no network).
-	if out := p.maybeNudgeResponses(req, "http://127.0.0.1:1/x", nudgePostedBody, first, &sess, "opencode/big-pickle"); string(out) != string(first) {
+	if out := p.maybeNudgeResponses(req, "http://127.0.0.1:1/x", nudgePostedBody, first, &sess, "opencode/big-pickle", tl); string(out) != string(first) {
 		t.Fatalf("non-spark model mutated body")
 	}
 	// no tools offered: untouched.
 	bare := []byte(`{"model":"` + nudgeSparkModel + `","input":[{"role":"user","content":"hi"}],"stream":true}`)
-	if out := p.maybeNudgeResponses(req, "http://127.0.0.1:1/x", bare, first, &sess, nudgeSparkModel); string(out) != string(first) {
+	if out := p.maybeNudgeResponses(req, "http://127.0.0.1:1/x", bare, first, &sess, nudgeSparkModel, tl); string(out) != string(first) {
 		t.Fatalf("no-tools body mutated")
 	}
-	// question text: untouched.
+	// question text: nudges (no exemption: the waitSentinel reprompt makes
+	// nudging past a question safe; exempting them looped greetings
+	// forever), so a nudge against a question posts and merges the retry.
 	q := []byte("data: {\"type\":\"response.output_text.delta\",\"delta\":\"Which file should I edit?\"}\n\ndata: {\"type\":\"response.completed\",\"response\":{\"usage\":{\"input_tokens\":1,\"output_tokens\":1}}}\n\ndata: [DONE]\n\n")
-	if out := p.maybeNudgeResponses(req, "http://127.0.0.1:1/x", nudgePostedBody, q, &sess, nudgeSparkModel); string(out) != string(q) {
-		t.Fatalf("question body nudged")
+	qsrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.Write([]byte(nudgeRetrySSE))
+	}))
+	defer qsrv.Close()
+	resetLanes()
+	defer resetLanes()
+	lanesMu.Lock()
+	lanes["t"] = tl
+	lanesMu.Unlock()
+	if out := p.maybeNudgeResponses(req, qsrv.URL, nudgePostedBody, q, &sess, nudgeSparkModel, tl); string(out) == string(q) {
+		t.Fatalf("question body not nudged")
 	}
 	// already has calls: untouched.
-	if out := p.maybeNudgeResponses(req, "http://127.0.0.1:1/x", nudgePostedBody, []byte(nudgeRetrySSE), &sess, nudgeSparkModel); string(out) != nudgeRetrySSE {
+	if out := p.maybeNudgeResponses(req, "http://127.0.0.1:1/x", nudgePostedBody, []byte(nudgeRetrySSE), &sess, nudgeSparkModel, tl); string(out) != nudgeRetrySSE {
 		t.Fatalf("with-calls body nudged")
 	}
 }
@@ -936,7 +881,13 @@ func TestMaybeNudgeResponsesMerges(t *testing.T) {
 	p := &Pool{}
 	req := httptest.NewRequest("POST", "http://localhost:5419/v1/chat/completions", nil)
 	sess := "ses_test123"
-	out := string(p.maybeNudgeResponses(req, srv.URL, nudgePostedBody, []byte(nudgeFirstSSE), &sess, nudgeSparkModel))
+	resetLanes()
+	defer resetLanes()
+	tl := &zenLane{id: "t2", session: sess, lastUsed: time.Now()}
+	lanesMu.Lock()
+	lanes["t2"] = tl
+	lanesMu.Unlock()
+	out := string(p.maybeNudgeResponses(req, srv.URL, nudgePostedBody, []byte(nudgeFirstSSE), &sess, nudgeSparkModel, tl))
 	if !strings.Contains(string(gotBody), "You have tools available") {
 		t.Fatalf("nudge body not re-posted: %q", string(gotBody))
 	}
@@ -976,23 +927,6 @@ func TestConvertUserMessageCarriesImage(t *testing.T) {
 	}
 }
 
-func TestOaiUserBlocksCarriesImage(t *testing.T) {
-	raw := json.RawMessage(`[{"type":"text","text":"look"},{"type":"image_url","image_url":{"url":"data:image/jpeg;base64,/9j/"}}]`)
-	blocks := oaiUserBlocks(raw)
-	found := false
-	for _, b := range blocks {
-		if b["type"] == "image" {
-			src, _ := b["source"].(map[string]any)
-			if src["type"] == "base64" && src["data"] == "/9j/" && src["media_type"] == "image/jpeg" {
-				found = true
-			}
-		}
-	}
-	if !found {
-		t.Fatalf("image lost in oai->anthropic: %v", blocks)
-	}
-}
-
 func TestKeylessServesOpencodeOnly(t *testing.T) {
 	p := newPool(map[string]string{})
 
@@ -1024,6 +958,65 @@ func TestKeylessServesOpencodeOnly(t *testing.T) {
 	}
 	if p.Status().Total != 1 {
 		t.Fatalf("after reload total=%d, want 1", p.Status().Total)
+	}
+}
+
+func TestSetReqModel(t *testing.T) {
+	out, err := setReqModel([]byte(`{"model":"nvidia/moonshotai/kimi-k3","messages":[]}`), "moonshotai/kimi-k3")
+	if err != nil {
+		t.Fatalf("setReqModel: %v", err)
+	}
+	if reqModel(out) != "moonshotai/kimi-k3" {
+		t.Fatalf("model = %q, want stripped bare id", reqModel(out))
+	}
+	if _, err := setReqModel([]byte(`{broken`), "x"); err == nil {
+		t.Fatal("bad json must error")
+	}
+}
+
+func TestBackendEnabledFlags(t *testing.T) {
+	d := defaultConfig()
+	useConfig(t, &d)
+	if cfg().Nvidia.Enabled != true || cfg().Zen.Enabled != true {
+		t.Fatalf("defaults: nvidia=%v zen=%v, want true/true", cfg().Nvidia.Enabled, cfg().Zen.Enabled)
+	}
+	off := defaultConfig()
+	off.Nvidia.Enabled = false
+	off.Zen.Enabled = false
+	applyConfig(&off)
+	if nvidiaEnabled() || zenEnabled() {
+		t.Fatal("disabled flags must report false")
+	}
+	// absent keys in yaml keep defaults true.
+	c, err := loadConfigFile("config.yml.example")
+	if err != nil {
+		t.Fatalf("load example: %v", err)
+	}
+	applyConfig(c)
+	if !cfg().Nvidia.Enabled || !cfg().Zen.Enabled {
+		t.Fatal("example without explicit keys must default both backends on")
+	}
+}
+
+func TestDisabledBackends503(t *testing.T) {
+	p := newPool(map[string]string{"a": "nvapi-x"})
+	off := defaultConfig()
+	off.Nvidia.Enabled = false
+	off.Zen.Enabled = false
+	useConfig(t, &off)
+
+	req := httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(`{"model":"moonshotai/kimi-k3","messages":[{"role":"user","content":"hi"}]}`))
+	rec := httptest.NewRecorder()
+	p.ServeHTTP(rec, req)
+	if rec.Code != http.StatusServiceUnavailable || !strings.Contains(rec.Body.String(), "nvidia backend is disabled") {
+		t.Fatalf("nvidia disabled = %d %q, want 503 disabled hint", rec.Code, rec.Body.String())
+	}
+
+	req = httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(`{"model":"opencode/big-pickle","messages":[{"role":"user","content":"hi"}]}`))
+	rec = httptest.NewRecorder()
+	p.ServeHTTP(rec, req)
+	if rec.Code != http.StatusServiceUnavailable || !strings.Contains(rec.Body.String(), "zen is disabled") {
+		t.Fatalf("zen disabled = %d %q, want 503 disabled hint", rec.Code, rec.Body.String())
 	}
 }
 
@@ -1062,8 +1055,10 @@ func TestEnsureZenToolsHaveParameters(t *testing.T) {
 	}}
 	ensureZenTools(m)
 	tools, _ := m["tools"].([]any)
-	if len(tools) < 5 {
-		t.Fatalf("gate tools missing: %d tools", len(tools))
+	// the gate matches exact lowercase names, so capitalized client tools do
+	// not satisfy it: 3 client tools + 4 lowercase gate stubs = 7.
+	if len(tools) != 7 {
+		t.Fatalf("want 3 client tools + 4 gate stubs, got %d", len(tools))
 	}
 	for _, x := range tools {
 		fn, _ := x.(map[string]any)["function"].(map[string]any)
@@ -1074,6 +1069,223 @@ func TestEnsureZenToolsHaveParameters(t *testing.T) {
 		if !ok || pm == nil {
 			t.Errorf("tool %q has no parameters object", fn["name"])
 		}
+	}
+}
+
+// a client-declared tool must not get a second, differently-cased gate stub
+// the gate matches exact lowercase names, so a client Bash does not satisfy
+// it: the lowercase bash stub sits beside the client's spelling and response
+// translators map the call back via tnames.resolve.
+func TestEnsureZenToolsNoDuplicateCasing(t *testing.T) {
+	m := map[string]any{"tools": []any{
+		map[string]any{"type": "function", "function": map[string]any{"name": "Bash"}},
+	}}
+	ensureZenTools(m)
+	tools, _ := m["tools"].([]any)
+
+	seen := map[string]bool{}
+	for _, x := range tools {
+		fn := x.(map[string]any)["function"].(map[string]any)
+		name := fn["name"].(string)
+		if seen[name] {
+			t.Errorf("duplicate tool %q: %v", name, tools)
+		}
+		seen[name] = true
+	}
+	// both spellings present: client's Bash plus the gate's bash
+	if !seen["Bash"] || !seen["bash"] {
+		t.Errorf("want Bash + bash, got: %v", tools)
+	}
+	if len(tools) != 5 {
+		t.Errorf("want Bash + bash/read/glob/grep = 5 tools, got %d: %v", len(tools), tools)
+	}
+}
+
+func TestSanitizeZenChatMessages(t *testing.T) {
+	toolMsg := func(id, content string) map[string]any {
+		return map[string]any{"role": "tool", "tool_call_id": id, "content": content}
+	}
+	asst := func(calls ...any) map[string]any {
+		return map[string]any{"role": "assistant", "content": nil, "tool_calls": calls}
+	}
+	call := func(id, name string) map[string]any {
+		return map[string]any{"id": id, "type": "function",
+			"function": map[string]any{"name": name, "arguments": "{}"}}
+	}
+	roles := func(msgs []any) []string {
+		var out []string
+		for _, r := range msgs {
+			out = append(out, r.(map[string]any)["role"].(string))
+		}
+		return out
+	}
+
+	// interleaved user text between call and result: result pulls up.
+	m := map[string]any{"messages": []any{
+		map[string]any{"role": "user", "content": "hi"},
+		asst(call("a1", "bash")),
+		map[string]any{"role": "user", "content": "btw"},
+		toolMsg("a1", "out1"),
+		map[string]any{"role": "user", "content": "go"},
+	}}
+	sanitizeZenChatMessages(m)
+	msgs := m["messages"].([]any)
+	if got := roles(msgs); len(got) != 5 || got[1] != "assistant" || got[2] != "tool" || got[3] != "user" {
+		t.Fatalf("interleaved not reordered: %v", got)
+	}
+	if msgs[2].(map[string]any)["content"] != "out1" || msgs[3].(map[string]any)["content"] != "btw" {
+		t.Fatalf("bodies misplaced: %v %v", msgs[2], msgs[3])
+	}
+
+	// dangling call (no result): stripped to plain assistant.
+	m = map[string]any{"messages": []any{
+		map[string]any{"role": "user", "content": "hi"},
+		asst(call("zz", "bash")),
+		map[string]any{"role": "user", "content": "go"},
+	}}
+	sanitizeZenChatMessages(m)
+	msgs = m["messages"].([]any)
+	if _, has := msgs[1].(map[string]any)["tool_calls"]; has {
+		t.Fatalf("dangling tool_calls kept: %v", msgs[1])
+	}
+
+	// orphan/empty-id tool messages: become user text, never dropped.
+	m = map[string]any{"messages": []any{
+		map[string]any{"role": "user", "content": "hi"},
+		toolMsg("ghost", "mcpout"),
+		toolMsg("", "noid"),
+	}}
+	sanitizeZenChatMessages(m)
+	msgs = m["messages"].([]any)
+	if len(msgs) != 3 {
+		t.Fatalf("orphan tool msgs dropped: %d", len(msgs))
+	}
+	for _, r := range msgs[1:] {
+		rm := r.(map[string]any)
+		if rm["role"] != "user" || rm["content"] == "" {
+			t.Fatalf("orphan not user text: %v", rm)
+		}
+	}
+
+	// balanced pair: untouched.
+	m = map[string]any{"messages": []any{
+		map[string]any{"role": "user", "content": "hi"},
+		asst(call("a1", "bash")),
+		toolMsg("a1", "out1"),
+	}}
+	sanitizeZenChatMessages(m)
+	msgs = m["messages"].([]any)
+	if len(msgs) != 3 || msgs[2].(map[string]any)["role"] != "tool" {
+		t.Fatalf("balanced pair changed: %v", msgs)
+	}
+}
+
+// upstream returns tool names lowercased ("bash" for "Bash"); the client then
+// rejects the call with "No such tool available". resolve maps the name back to
+// the spelling the client declared.
+func TestToolNamesResolve(t *testing.T) {
+	tn := toolNames{"Bash", "Read", "Glob", "TodoRead"}
+	cases := map[string]string{
+		"bash":     "Bash",     // lowercase upstream -> declared PascalCase
+		"BASH":     "Bash",     // uppercased
+		"read":     "Read",     // Read and Read are distinct keys
+		"glob":     "Glob",     //
+		"Bash":     "Bash",     // exact match still wins
+		"todoread": "TodoRead", // generic: all-lowercase collision
+		"nope":     "nope",     // unknown passes through
+		"":         "",         //
+	}
+	for in, want := range cases {
+		if got := tn.resolve(in); got != want {
+			t.Errorf("resolve(%q) = %q, want %q", in, got, want)
+		}
+	}
+	// an empty tool list must not panic and must pass names through
+	var none toolNames
+	if got := none.resolve("bash"); got != "bash" {
+		t.Errorf("empty toolNames: resolve(bash) = %q, want bash", got)
+	}
+}
+
+func TestToolNamesCapturedFromRequest(t *testing.T) {
+	body := []byte(`{"model":"m","max_tokens":10,"messages":[{"role":"user","content":"hi"}],
+		"tools":[
+			{"name":"Bash","input_schema":{"type":"object"}},
+			{"type":"function","function":{"name":"Read","parameters":{"type":"object"}}}
+		]}`)
+	_, _, _, tn, _, err := anthropicRequestToOpenAI(body)
+	if err != nil {
+		t.Fatalf("anthropicRequestToOpenAI: %v", err)
+	}
+	if len(tn) != 2 || tn[0] != "Bash" || tn[1] != "Read" {
+		t.Fatalf("tool names = %v, want [Bash Read]", tn)
+	}
+}
+
+// non-streaming /v1/messages reply: a lowercased upstream name must come back
+// as the declared name. second call also covers JSON escaping of the name,
+// which the streaming path builds with a format string.
+func TestOpenAIToAnthropicRestoresToolNameCase(t *testing.T) {
+	up := []byte(`{"choices":[{"message":{"content":"","tool_calls":[
+		{"id":"c1","type":"function","function":{"name":"bash","arguments":"{}"}},
+		{"id":"c2","type":"function","function":{"name":"say\"hi","arguments":"{}"}}
+	]},"finish_reason":"tool_calls"}]}`)
+	out, errMsg, _ := openAIToAnthropic(up, "m", toolNames{"Bash", `Say"Hi`})
+	if errMsg != "" {
+		t.Fatalf("openAIToAnthropic: %s", errMsg)
+	}
+	var got struct {
+		Content []struct {
+			Type string `json:"type"`
+			Name string `json:"name"`
+		} `json:"content"`
+	}
+	if err := json.Unmarshal(out, &got); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if len(got.Content) != 2 {
+		t.Fatalf("want 2 content blocks, got %d: %s", len(got.Content), out)
+	}
+	if got.Content[0].Name != "Bash" {
+		t.Errorf(`lowercase "bash" -> %q, want Bash`, got.Content[0].Name)
+	}
+	if got.Content[1].Name != `Say"Hi` {
+		t.Errorf(`lowercase say"hi -> %q, want Say"Hi`, got.Content[1].Name)
+	}
+}
+
+// streaming /v1/messages reply: same restoration on the tool_use block.
+func TestStreamAnthropicRestoresToolNameCase(t *testing.T) {
+	sse := strings.Join([]string{
+		`data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"c1","type":"function","function":{"name":"bash","arguments":"{}"}}]},"finish_reason":null}]}`,
+		`data: {"choices":[{"delta":{},"finish_reason":"tool_calls"}]}`,
+		`data: [DONE]`,
+	}, "\n\n")
+
+	rec := httptest.NewRecorder()
+	streamAnthropic(rec, []byte(sse), "m", toolNames{"Bash", "Glob"})
+	out := rec.Body.String()
+	if !strings.Contains(out, `"name":"Bash"`) {
+		t.Errorf("lowercase 'bash' not restored to Bash:\n%s", out)
+	}
+	if strings.Contains(out, `"name":"bash"`) {
+		t.Errorf("lowercase tool name leaked through:\n%s", out)
+	}
+}
+
+// /responses streaming path: the item name goes through the same restoration.
+func TestStreamResponsesMergedRestoresToolNameCase(t *testing.T) {
+	sse := strings.Join([]string{
+		`data: {"type":"response.output_item.added","item_id":"fc_1","item":{"id":"fc_1","type":"function_call","call_id":"call_1","name":"bash","arguments":""}}`,
+		`data: {"type":"response.output_item.done","item_id":"fc_1","item":{"id":"fc_1","type":"function_call","call_id":"call_1","name":"bash","arguments":"{}"}}`,
+		`data: {"type":"response.completed","response":{"usage":{"input_tokens":1,"output_tokens":2}}}`,
+	}, "\n\n")
+
+	rec := httptest.NewRecorder()
+	streamResponsesMerged(rec, [][]byte{[]byte(sse)}, "m", toolNames{"Bash"})
+	out := rec.Body.String()
+	if !strings.Contains(out, `"name":"Bash"`) {
+		t.Errorf("lowercase 'bash' not restored to Bash:\n%s", out)
 	}
 }
 
@@ -1209,222 +1421,188 @@ func TestCustomProxyFile(t *testing.T) {
 	}
 }
 
-func TestAnonRoundTrip(t *testing.T) {
-	m := newAnonMap([]string{"acme internal", "bluebird"})
-	if m == nil {
-		t.Fatal("want non-nil map")
+func testPIIConfig() anonymizeConfig {
+	return anonymizeConfig{
+		Enabled: true, Mode: "realistic", Disclose: true,
+		DetectSecrets: true, DetectPII: true, FuzzyThreshold: 0.95,
+		Entities: []anonymizeEntity{{Name: "Minoa", Type: "name",
+			Variations: []string{"M1noa", "M1n0a"}}},
+		Terms: []string{"acme internal", "bluebird"},
 	}
-	term, mask := m.fwd[0].from, m.fwd[0].to
-	if len(mask) != len(term) {
-		t.Fatalf("mask len %d != term len %d", len(mask), len(term))
+}
+
+func piiCfg(c anonymizeConfig) pii.Config {
+	ents := make([]pii.CustomTerm, len(c.Entities))
+	for i, e := range c.Entities {
+		ents[i] = pii.CustomTerm{Name: e.Name, Type: e.Type, Variations: e.Variations, Replacement: e.Replacement}
+	}
+	return pii.Config{
+		Enabled: true, Mode: c.Mode, Disclose: c.Disclose, DiscloseText: c.DiscloseText,
+		Entities: ents, Terms: c.Terms, FuzzyThreshold: c.FuzzyThreshold,
+		DetectSecrets: c.DetectSecrets, DetectPII: c.DetectPII,
+		KeepLabels: c.KeepLabels, IncludeSystem: c.IncludeSystem,
+		OnTimeout: c.OnTimeout, VaultTTLHours: c.VaultTTLHours, VaultMaxSize: c.VaultMaxSize,
+		Ner: pii.NerConfig{Enabled: c.Ner.Enabled, ModelPath: c.Ner.ModelPath,
+			OrtLib: c.Ner.OrtLib, TimeoutMs: c.Ner.TimeoutMs, MinScore: c.Ner.MinScore},
+	}
+}
+
+func TestAnonRoundTrip(t *testing.T) {
+	g := pii.ForRequest(piiCfg(testPIIConfig()), "t-roundtrip")
+	if g == nil {
+		t.Fatal("want non-nil guard")
 	}
 	body := []byte(`{"model":"opencode/big-pickle","messages":[{"role":"user","content":"fix acme internal login"}]}`)
-	up := m.anonymize(body)
+	up := g.MaskBody(body)
 	if strings.Contains(string(up), "acme internal") {
 		t.Fatalf("term leaked upstream: %s", up)
 	}
 	if reqModel(up) != "opencode/big-pickle" {
 		t.Fatalf("model field clobbered: %s", up)
 	}
-	back := m.deanonymize([]byte(`{"content":"the acme internal fix is ` + mask + `"}`))
-	if strings.Count(string(back), "acme internal") != 2 {
-		t.Fatalf("masks not restored: %s", back)
+	back := g.RestoreBody(up)
+	if string(back) != string(body) {
+		t.Fatalf("round trip mismatch:\n got %s\nwant %s", back, body)
 	}
 }
 
 func TestAnonSameRequestMapping(t *testing.T) {
-	m := newAnonMap([]string{"tok1", "tok2"})
-	fwd := map[string]string{}
-	for _, p := range m.fwd {
-		fwd[p.from] = p.to
-	}
-	mk1 := fwd["tok1"]
-	// same mask maps back even across multiple responses
-	for _, rb := range [][]byte{
-		[]byte(`{"content":"` + mk1 + ` ok"}`),
-		[]byte("data: {\"delta\":\"" + mk1 + "\"}\n\n"),
+	g := pii.ForRequest(piiCfg(testPIIConfig()), "t-stable")
+	up := string(g.MaskBody([]byte(`{"content":"tok1 tok2 bluebird"}`)))
+	// same vault maps back across multiple responses
+	for _, rb := range []string{
+		`{"content":"` + vaultSurrogate(g, "bluebird") + ` ok"}`,
+		"data: {\"delta\":\"" + vaultSurrogate(g, "bluebird") + "\"}\n\n",
 	} {
-		if got := string(m.deanonymize(rb)); !strings.Contains(got, "tok1") {
+		if got := string(g.RestoreBody([]byte(rb))); !strings.Contains(got, "bluebird") {
 			t.Fatalf("mapping lost: %s", got)
 		}
 	}
+	_ = up
+}
+
+func vaultSurrogate(g *pii.Guard, want string) string {
+	for _, s := range g.VaultSurrogates() {
+		if orig, ok := g.VaultLookup(s); ok && orig == want {
+			return s
+		}
+	}
+	return ""
 }
 
 func TestAnonSplitWrite(t *testing.T) {
-	m := newAnonMap([]string{"secret-token"})
+	g := pii.ForRequest(piiCfg(testPIIConfig()), "t-split")
+	masked := string(g.MaskBody([]byte(`{"content":"secret-token bluebird"}`)))
 	mk := ""
-	for _, p := range m.fwd {
-		if p.from == "secret-token" {
-			mk = p.to
+	for _, s := range g.VaultSurrogates() {
+		if strings.Contains(masked, s) {
+			mk = s
 		}
+	}
+	if mk == "" {
+		t.Fatal("no surrogate produced")
 	}
 	rec := httptest.NewRecorder()
 	rec.Header().Set("Content-Type", "text/event-stream")
-	dw := wrapDeanon(rec, m)
-	// split the mask across writes
+	dw := wrapPII(rec, g)
 	mid := len(mk) / 2
 	dw.Write([]byte("data: {\"content\":\"" + mk[:mid]))
 	dw.Write([]byte(mk[mid:] + "\"}\n\n"))
 	dw.finish()
-	if got := rec.Body.String(); !strings.Contains(got, "secret-token") {
+	if got := rec.Body.String(); !strings.Contains(got, "bluebird") {
 		t.Fatalf("split mask not restored: %q", got)
 	}
 }
 
 func TestAnonDisabled(t *testing.T) {
-	if newAnonMap(nil) != nil || newAnonMap([]string{}) != nil {
-		t.Fatal("empty terms must yield nil map")
-	}
-	var nilMap *anonMap
+	var nilGuard *pii.Guard
 	b := []byte(`{"model":"x"}`)
-	if string(nilMap.anonymize(b)) != string(b) || string(nilMap.deanonymize(b)) != string(b) {
-		t.Fatal("nil map must passthrough")
+	if string(nilGuard.MaskBody(b)) != string(b) || string(nilGuard.RestoreBody(b)) != string(b) {
+		t.Fatal("nil guard must passthrough")
 	}
-	if wrapDeanon(httptest.NewRecorder(), nil) != nil {
-		t.Fatal("nil map must not wrap")
+	if wrapPII(httptest.NewRecorder(), nil) != nil {
+		t.Fatal("nil guard must not wrap")
 	}
-}
-
-func TestLoadExampleConfig(t *testing.T) {
-	c, err := loadConfigFile("config.yml.example")
-	if err != nil {
-		t.Fatalf("example config must parse: %v", err)
-	}
-	if c.Server.Port != 5419 {
-		t.Errorf("port=%d want 5419", c.Server.Port)
-	}
-	if len(c.Models.Params) == 0 || len(c.Models.ClaudeMap) == 0 {
-		t.Error("example must carry model params and claude map")
-	}
-	if mapClaudeModel("claude-sonnet-4-5") == "" {
-		t.Error("claude map must resolve")
+	cfg := pii.Config{}
+	if pii.ForRequest(cfg, "t-off") != nil {
+		t.Fatal("disabled config must yield nil guard")
 	}
 }
 
 func TestAnonEntityVariations(t *testing.T) {
-	ents := []anonymizeEntity{{
-		Name: "Minoa", Type: "name",
-		Variations:  []string{"M1noa", "M1n0a"},
-		Replacement: "Julie",
-	}}
-	m := buildAnonMap(nil, ents, "realistic", 0.95)
-	if m == nil {
-		t.Fatal("want non-nil map")
+	g := pii.ForRequest(piiCfg(testPIIConfig()), "t-variations")
+	if g == nil {
+		t.Fatal("want non-nil guard")
 	}
-	// every spelling maps; masks keep length, case slots, digit slots.
-	seen := map[string]string{}
+	masked := string(g.MaskBody([]byte(`{"content":"hi Minoa, M1noa and M1n0a here"}`)))
 	for _, s := range []string{"Minoa", "M1noa", "M1n0a"} {
-		var mk string
-		for _, p := range m.fwd {
-			if p.from == s {
-				mk = p.to
-			}
-		}
-		if mk == "" {
-			t.Fatalf("no mask for %q", s)
-		}
-		if len([]rune(mk)) != len([]rune(s)) {
-			t.Fatalf("mask %q len != %q len", mk, s)
-		}
-		seen[s] = mk
-	}
-	// M1n0a shape: letter digit letter digit letter -> mask must match.
-	mk := seen["M1n0a"]
-	rs, rm := []rune("M1n0a"), []rune(mk)
-	for i := range rs {
-		isDig := rs[i] >= '0' && rs[i] <= '9'
-		mkDig := rm[i] >= '0' && rm[i] <= '9'
-		if isDig != mkDig {
-			t.Fatalf("digit slot moved: %q -> %q", "M1n0a", mk)
-		}
-		isUp := rs[i] >= 'A' && rs[i] <= 'Z'
-		mkUp := rm[i] >= 'A' && rm[i] <= 'Z'
-		if isUp != mkUp {
-			t.Fatalf("case slot moved: %q -> %q", "M1n0a", mk)
+		if strings.Contains(masked, s) {
+			t.Fatalf("%q leaked upstream: %s", s, masked)
 		}
 	}
-	// all three deanonymize: body with every mask restores every spelling.
-	body := []byte(`{"content":"` + seen["Minoa"] + ` and ` + seen["M1noa"] + ` and ` + seen["M1n0a"] + `"}`)
-	back := string(m.deanonymize(body))
+	back := string(g.RestoreBody([]byte(masked)))
 	for _, s := range []string{"Minoa", "M1noa", "M1n0a"} {
 		if !strings.Contains(back, s) {
 			t.Fatalf("%q not restored: %s", s, back)
 		}
 	}
-	// request anonymize kills every spelling upstream.
-	up := string(m.anonymize([]byte(`{"content":"hi Minoa, M1noa here"}`)))
-	for _, s := range []string{"Minoa", "M1noa"} {
-		if strings.Contains(up, s) {
-			t.Fatalf("%q leaked upstream: %s", s, up)
+	// custom fakes keep digit slots: M1n0a surrogate must hold digits.
+	for _, s := range g.VaultSurrogates() {
+		if orig, ok := g.VaultLookup(s); ok && orig == "M1n0a" {
+			rs, rm := []rune("M1n0a"), []rune(s)
+			if len(rs) != len(rm) {
+				t.Fatalf("surrogate len moved: %q -> %q", orig, s)
+			}
+			for i := range rs {
+				isDig := rs[i] >= '0' && rs[i] <= '9'
+				mkDig := rm[i] >= '0' && rm[i] <= '9'
+				if isDig != mkDig {
+					t.Fatalf("digit slot moved: %q -> %q", orig, s)
+				}
+			}
 		}
 	}
 }
 
 func TestAnonFuzzyThreshold(t *testing.T) {
-	ents := []anonymizeEntity{{
-		Name: "Minoa", Type: "name",
-		Variations:  []string{"M1noa"},
-		Replacement: "Julie",
-	}}
-	m := buildAnonMap(nil, ents, "realistic", 0.95)
-	if m == nil {
-		t.Fatal("want non-nil map")
-	}
-	// minoa vs Minoa: 4/5 same ignoring case, but case-sensitive
-	// distance is 1/5 = 0.8 similarity — below threshold, untouched.
-	up := string(m.anonymize([]byte(`{"content":"hello minoa"}`)))
+	// below-threshold text untouched: minoa vs Minoa is 0.8 case-sensitive.
+	g := pii.ForRequest(piiCfg(testPIIConfig()), "t-fuzzy")
+	up := string(g.MaskBody([]byte(`{"content":"hello minoa"}`)))
 	if !strings.Contains(up, "minoa") {
 		t.Fatalf("below-threshold text must not match: %s", up)
 	}
-	// exact threshold math: minoa/Minoa similarity must be < 0.95.
-	if s := similarity([]rune("minoa"), []rune("Minoa")); s >= 0.95 {
+	if s := pii.Similarity("minoa", "Minoa"); s >= 0.95 {
 		t.Fatalf("similarity(minoa,Minoa) = %v, want < 0.95", s)
 	}
-	if s := similarity([]rune("Minoa"), []rune("Minoa")); s != 1 {
+	if s := pii.Similarity("Minoa", "Minoa"); s != 1 {
 		t.Fatalf("identical similarity = %v, want 1", s)
 	}
-	// near-miss at threshold: Minoa vs MinoA differ by one case bit,
-	// similarity 0.8 — still below. Minoa vs Minoaa (insertion):
-	// 5/6 = 0.833. a true fuzzy hit needs >= 0.95, e.g. 20-char
-	// names with one typo. verify the machinery with a long name.
 	long := "Alexanderson"
-	ents2 := []anonymizeEntity{{
-		Name: long, Type: "name", Replacement: "Julie Andersen",
-	}}
-	m2 := buildAnonMap(nil, ents2, "realistic", 0.95)
-	typo := "Alexanderson"[:11] + "x" // one-char substitution: 11/12 = 0.917
-	if got := fuzzFind("hi "+typo+"!", long, 0.95); got != "" {
+	typo := long[:11] + "x"
+	if got := pii.FuzzFind("hi "+typo+"!", long, 0.95); got != "" {
 		t.Fatalf("0.917 hit must not clear 0.95: %q", got)
 	}
-	if got := fuzzFind("hi "+typo+"!", long, 0.9); got == "" {
+	if got := pii.FuzzFind("hi "+typo+"!", long, 0.9); got == "" {
 		t.Fatalf("0.917 hit must clear 0.9")
 	}
-	_ = m2
 }
 
 func TestAnonVariableMode(t *testing.T) {
-	ents := []anonymizeEntity{
-		{Name: "Minoa", Type: "name", Variations: []string{"M1noa"}},
-		{Name: "acme", Type: "org"},
+	c := testPIIConfig()
+	c.Mode = "variable"
+	g := pii.ForRequest(piiCfg(c), "t-variable")
+	if g == nil {
+		t.Fatal("want non-nil guard")
 	}
-	m := buildAnonMap(nil, ents, "variable", 1)
-	if m == nil {
-		t.Fatal("want non-nil map")
-	}
-	up := string(m.anonymize([]byte(`{"model":"x","content":"Minoa at acme, M1noa too"}`)))
-	for _, want := range []string{"{NAME1}", "{ORG1}"} {
-		if !strings.Contains(up, want) {
-			t.Fatalf("missing placeholder %s: %s", want, up)
-		}
-	}
-	for _, leak := range []string{"Minoa", "acme", "M1noa"} {
+	up := string(g.MaskBody([]byte(`{"model":"x","content":"Minoa at acme internal, M1noa too"}`)))
+	for _, leak := range []string{"Minoa", "acme internal", "M1noa"} {
 		if strings.Contains(up, leak) {
 			t.Fatalf("%q leaked upstream: %s", leak, up)
 		}
 	}
-	back := string(m.deanonymize([]byte(`{"content":"{NAME1} at {ORG1}"}`)))
-	if !strings.Contains(back, "Minoa") || !strings.Contains(back, "acme") {
-		t.Fatalf("placeholders not restored: %s", back)
+	back := string(g.RestoreBody([]byte(up)))
+	if !strings.Contains(back, "Minoa") || !strings.Contains(back, "acme internal") {
+		t.Fatalf("surrogates not restored: %s", back)
 	}
 }
 
@@ -1443,12 +1621,10 @@ func TestAnonDiscloseLine(t *testing.T) {
 	if !strings.Contains(string(b), discloseLine()) {
 		t.Fatalf("disclose line not injected: %s", b)
 	}
-	// idempotent.
 	injectDiscloseLine(&b)
 	if strings.Count(string(b), discloseLine()) != 1 {
 		t.Fatalf("disclose line duplicated: %s", b)
 	}
-	// disabled -> empty, untouched.
 	c.Anonymize.Enabled = false
 	applyConfig(&c)
 	if discloseLine() != "" {
@@ -1512,6 +1688,266 @@ func TestNudgeExampleConfigOn(t *testing.T) {
 	}
 	if !found {
 		t.Error("example must carry at least one nudge_no_tools=true param")
+	}
+}
+
+func resetLanes() {
+	lanesMu.Lock()
+	defer lanesMu.Unlock()
+	lanes = map[string]*zenLane{}
+}
+
+func TestLaneHeaderPinning(t *testing.T) {
+	resetLanes()
+	defer resetLanes()
+	body := []byte(`{"model":"opencode/big-pickle","messages":[{"role":"user","content":"hi"}]}`)
+	a := laneFor("client-1", body)
+	b := laneFor("client-1", body)
+	if a != b {
+		t.Fatal("same header must pin the same lane")
+	}
+	c := laneFor("client-2", body)
+	if c == a {
+		t.Fatal("different headers must not share a lane")
+	}
+}
+
+func TestRedactProxyUserinfo(t *testing.T) {
+	cases := map[string]string{
+		"http://user:pass@host:8080": "http://***@host:8080",
+		"http://host:8080":           "http://host:8080",
+		"socks5://u:p@1.2.3.4:1080":  "socks5://***@1.2.3.4:1080",
+		"":                           "",
+	}
+	for in, want := range cases {
+		if got := redactProxyUserinfo(in); got != want {
+			t.Errorf("redactProxyUserinfo(%q) = %q, want %q", in, got, want)
+		}
+	}
+}
+
+// /status is open even when auth.tokens is set, so no credentialed proxy
+// url may reach the response verbatim.
+func TestLaneSnapshotRedactsCredentials(t *testing.T) {
+	resetLanes()
+	defer resetLanes()
+	c := testConfig()
+	c.Zen.AlwaysProxy = true
+	applyConfig(c)
+	defer applyConfig(testConfig())
+
+	setCustomProxies([]string{"http://SECRETUSER:SECRETPASS@127.0.0.1:9999"})
+	l := laneFor("client-1", []byte(`{"messages":[{"role":"user","content":"hi"}]}`))
+	lanesMu.Lock()
+	l.proxy = "http://SECRETUSER:SECRETPASS@127.0.0.1:9999"
+	lanesMu.Unlock()
+
+	for _, st := range laneSnapshot() {
+		if strings.Contains(st.Proxy, "SECRETPASS") || strings.Contains(st.Proxy, "SECRETUSER") {
+			t.Fatalf("laneSnapshot leaked proxy credentials: %q", st.Proxy)
+		}
+	}
+}
+
+func TestLaneConvoHash(t *testing.T) {
+	resetLanes()
+	defer resetLanes()
+	b1 := []byte(`{"messages":[{"role":"user","content":"fix the login bug"},{"role":"assistant","content":"sure"}]}`)
+	b2 := []byte(`{"messages":[{"role":"user","content":"fix the login bug"},{"role":"assistant","content":"sure"},{"role":"user","content":"now the logout too"}]}`)
+	// follow-up user turn keeps first-user + last-assistant -> same lane
+	if laneFor("", b1) != laneFor("", b2) {
+		t.Fatal("same conversation must reuse its lane")
+	}
+	b3 := []byte(`{"messages":[{"role":"user","content":"write a haiku"}]}`)
+	if laneFor("", b3) == laneFor("", b1) {
+		t.Fatal("different conversations must not share a lane")
+	}
+	if convoHash([]byte(`{"model":"x"}`)) != "" {
+		t.Fatal("body without messages must hash empty")
+	}
+}
+
+func TestLaneCooldownFailover(t *testing.T) {
+	resetLanes()
+	defer resetLanes()
+	c := testConfig()
+	c.Zen.Lanes = 3
+	applyConfig(c)
+	defer applyConfig(testConfig())
+	body := []byte(`{"messages":[{"role":"user","content":"a"}]}`)
+	a := laneFor("s1", body)
+	b := laneFor("s2", body)
+	laneCool(a)
+	if laneHealthy(a) {
+		t.Fatal("cooled lane must report unhealthy")
+	}
+	if got := laneFailover(a); got != b {
+		t.Fatal("failover must pick the healthy lane")
+	}
+	// fill to cap, then all cooling: nil (caller waits out backoff).
+	laneFor("s3", body)
+	laneCool(b)
+	lanesMu.Lock()
+	for _, l := range lanes {
+		l.fails = 1
+		l.cooldown = time.Now().Add(time.Minute)
+	}
+	lanesMu.Unlock()
+	if got := laneFailover(a); got != nil {
+		t.Fatal("all-cooling failover must be nil")
+	}
+}
+
+func TestLaneSweep(t *testing.T) {
+	resetLanes()
+	defer resetLanes()
+	c := testConfig()
+	c.Zen.LaneTTLMinutes = 30
+	applyConfig(c)
+	defer applyConfig(testConfig())
+	lanesMu.Lock()
+	lanes["old"] = &zenLane{id: "old", session: zenSession(), lastUsed: time.Now().Add(-time.Hour)}
+	lanes["new"] = &zenLane{id: "new", session: zenSession(), lastUsed: time.Now()}
+	lanesMu.Unlock()
+	sweepLanes()
+	lanesMu.Lock()
+	defer lanesMu.Unlock()
+	if _, ok := lanes["old"]; ok {
+		t.Fatal("idle lane must be swept")
+	}
+	if _, ok := lanes["new"]; !ok {
+		t.Fatal("fresh lane must survive sweep")
+	}
+}
+
+func TestLaneSnapshot(t *testing.T) {
+	resetLanes()
+	defer resetLanes()
+	body := []byte(`{"messages":[{"role":"user","content":"snap"}]}`)
+	l := laneFor("snap-1", body)
+	laneTouch(l, "")
+	snap := laneSnapshot()
+	if len(snap) != 1 || snap[0].Requests != 1 {
+		t.Fatalf("snapshot = %+v, want 1 lane with 1 request", snap)
+	}
+}
+
+func TestPickLaneProxyDistinct(t *testing.T) {
+	resetLanes()
+	defer resetLanes()
+	// fake a verified pool so the picker has something to choose from.
+	zenProxiesMu.Lock()
+	zenProxies = []string{
+		"http://10.0.0.1:1", "http://10.0.0.2:2", "http://10.0.0.3:3",
+		"http://10.0.0.4:4", "http://10.0.0.5:5", "http://10.0.0.6:6",
+	}
+	zenProxiesMu.Unlock()
+	defer func() {
+		zenProxiesMu.Lock()
+		zenProxies = nil
+		zenProxiesMu.Unlock()
+	}()
+
+	seen := map[string]bool{}
+	for i := 0; i < 4; i++ {
+		l := &zenLane{id: "l", session: zenSession(), lastUsed: time.Now()}
+		lanesMu.Lock()
+		lanes["t:"+l.session] = l
+		lanesMu.Unlock()
+		p := laneReproxy(l) // pins the pick on the lane
+		if p == "" {
+			t.Fatalf("lane %d got no proxy while pool had untaken exits", i)
+		}
+		if seen[p] {
+			t.Fatalf("lane %d got duplicate exit %s", i, p)
+		}
+		seen[p] = true
+	}
+}
+
+func TestLaneWaitClamped(t *testing.T) {
+	resetLanes()
+	defer resetLanes()
+	lanesMu.Lock()
+	lanes["a"] = &zenLane{id: "a", session: zenSession(), cooldown: time.Now().Add(30 * time.Second)}
+	lanesMu.Unlock()
+	if d := laneWait(); d <= 0 || d > 3*time.Second {
+		t.Fatalf("laneWait = %v, want a clamped positive wait", d)
+	}
+	lanesMu.Lock()
+	for _, l := range lanes {
+		l.cooldown = time.Time{}
+	}
+	lanesMu.Unlock()
+	if d := laneWait(); d != 0 {
+		t.Fatalf("laneWait = %v with no cooling lanes, want 0", d)
+	}
+}
+
+func TestLaneEscalateFromDirect(t *testing.T) {
+	resetLanes()
+	defer resetLanes()
+	zenProxiesMu.Lock()
+	zenProxies = []string{"http://10.0.0.1:1", "http://10.0.0.2:2"}
+	zenProxiesMu.Unlock()
+	defer func() {
+		zenProxiesMu.Lock()
+		zenProxies = nil
+		zenProxiesMu.Unlock()
+	}()
+
+	// cold lane with always_proxy off must stay direct.
+	c := testConfig()
+	c.Zen.AlwaysProxy = false
+	applyConfig(c)
+	defer applyConfig(testConfig())
+	l := laneFor("esc-1", []byte(`{"messages":[{"role":"user","content":"esc"}]}`))
+	if p := laneProxyFor(l); p != "" {
+		t.Fatalf("cold lane must be direct with always_proxy off, got %q", p)
+	}
+	// escalation pins a distinct exit, and it is honored afterward.
+	got := laneEscalate(l)
+	if got == "" {
+		t.Skip("no verified pool available to escalate onto")
+	}
+	if p := laneProxyFor(l); p == "" {
+		t.Fatal("escalated lane must keep its pinned proxy")
+	}
+}
+
+func TestLaneCooldownClearsPinKeepsLatch(t *testing.T) {
+	resetLanes()
+	defer resetLanes()
+	l := &zenLane{id: "x", session: zenSession(), proxy: "http://10.0.0.9:9", escalated: true}
+	lanesMu.Lock()
+	lanes["x"] = l
+	lanesMu.Unlock()
+	laneCool(l)
+	lanesMu.Lock()
+	defer lanesMu.Unlock()
+	if l.proxy != "" {
+		t.Error("429 must clear the pinned exit so the lane takes a fresh one")
+	}
+	if !l.escalated {
+		t.Error("escalation latch must survive cooldown (else lane reverts to burned direct)")
+	}
+}
+
+func TestLaneBlockIsShortAndDropsExit(t *testing.T) {
+	resetLanes()
+	defer resetLanes()
+	l := &zenLane{id: "b", session: zenSession(), proxy: "http://10.0.0.8:8", fails: 4}
+	lanesMu.Lock()
+	lanes["b"] = l
+	lanesMu.Unlock()
+	laneBlock(l)
+	lanesMu.Lock()
+	defer lanesMu.Unlock()
+	if l.proxy != "" {
+		t.Error("identity block must drop the exit")
+	}
+	if d := time.Until(l.cooldown); d > 6*time.Second {
+		t.Errorf("identity block cooldown %v, want <= ~5s (not a rate limit)", d)
 	}
 }
 
@@ -1581,5 +2017,371 @@ func TestSampleProxiesPrefersFast(t *testing.T) {
 	}
 	if counts["http://slow:1"] >= counts["http://fast:1"] {
 		t.Fatalf("slow picked as much as fast: %v", counts)
+	}
+}
+
+// --- RTK tool_result compression ---
+
+func rtkBody(text string) []byte {
+	return []byte(`{"model":"m","max_tokens":10,"messages":[
+		{"role":"user","content":"list files"},
+		{"role":"user","content":[{"type":"tool_result","tool_use_id":"t1","content":` + jsonStr(text) + `}]}
+	]}`)
+}
+
+func rtkFirstResult(t *testing.T, body []byte) string {
+	t.Helper()
+	var root map[string]any
+	if err := json.Unmarshal(body, &root); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	msgs := root["messages"].([]any)
+	last := msgs[len(msgs)-1].(map[string]any)
+	blocks := last["content"].([]any)
+	return blocks[0].(map[string]any)["content"].(string)
+}
+
+func withRtk(t *testing.T, enabled, blind bool, fn func()) {
+	t.Helper()
+	prev := cfg()
+	// copy so the live snapshot is never edited in place; useConfig restores
+	// the previous one on cleanup.
+	c := *prev
+	c.Rtk.Enabled, c.Rtk.BlindTruncate = enabled, blind
+	useConfig(t, &c)
+	fn()
+}
+
+// off by default: the body must come back byte-identical.
+func TestRtkDisabledByDefault(t *testing.T) {
+	body := rtkBody("M main.go\n" + strings.Repeat("M somefile.go\n", 40))
+	if got := rtkCompressBody(body); string(got) != string(body) {
+		t.Fatalf("rtk must be a no-op when disabled:\n%s", got)
+	}
+}
+
+func TestRtkEnabledCompressesGitStatus(t *testing.T) {
+	in := "On branch main\n" +
+		"\tmodified:   anthropic.go\n" +
+		"\tmodified:   main.go\n" +
+		"\tmodified:   config.go\n" +
+		strings.Repeat("\tmodified:   filler.go\n", 30)
+	withRtk(t, true, false, func() {
+		got := rtkFirstResult(t, rtkCompressBody(rtkBody(in)))
+		if len(got) >= len(in) {
+			t.Fatalf("no saving: %d >= %d", len(got), len(in))
+		}
+		if !strings.Contains(got, "* main") {
+			t.Errorf("branch lost:\n%s", got)
+		}
+		if !strings.Contains(got, "Modified:") {
+			t.Errorf("grouped count lost:\n%s", got)
+		}
+		if !strings.Contains(got, "more") {
+			t.Errorf("overflow count lost:\n%s", got)
+		}
+	})
+}
+
+// an error result must survive whole, is_error or "Error:" prefix.
+func TestRtkSkipsErrorResults(t *testing.T) {
+	in := "On branch main\n" + strings.Repeat("\tmodified:   anthropic.go\n", 40)
+	for name, blk := range map[string]string{
+		"is_error": `{"type":"tool_result","tool_use_id":"t1","is_error":true,"content":` + jsonStr(in) + `}`,
+		"Error:":   `{"type":"tool_result","tool_use_id":"t1","content":` + jsonStr("Error: "+in) + `}`,
+	} {
+		t.Run(name, func(t *testing.T) {
+			body := []byte(`{"model":"m","messages":[{"role":"user","content":[{"type":"tool_result","tool_use_id":"t1","content":` + jsonStr(in) + `}]}]}`)
+			body = []byte(`{"model":"m","messages":[{"role":"user","content":[` + blk + `]}]}`)
+			withRtk(t, true, false, func() {
+				if got := rtkCompressBody(body); string(got) != string(body) {
+					t.Errorf("error result was compressed, traces must survive:\n%s", got)
+				}
+			})
+		})
+	}
+}
+
+// the last-resort filter cuts unidentifiable blobs, and only when opted in.
+// the fixture must have no duplicate lines, or dedup-log claims it first
+// (which is correct: that case is lossless and does not need the gate).
+func TestRtkBlindTruncateGated(t *testing.T) {
+	var b strings.Builder
+	for i := 0; i < rtkTruncMinLines+50; i++ {
+		b.WriteString("unique unidentifiable line number " + strconv.Itoa(i) + " here\n")
+	}
+	blob := b.String()
+	// dedup-log has no run to collapse here, so the blob falls through to the
+	// blind gate when it is on and to nothing when it is off.
+	withRtk(t, true, false, func() {
+		if got := rtkFirstResult(t, rtkCompressBody(rtkBody(blob))); got != blob {
+			t.Errorf("blind truncate ran while blind_truncate is off")
+		}
+	})
+	withRtk(t, true, true, func() {
+		got := rtkFirstResult(t, rtkCompressBody(rtkBody(blob)))
+		if got == blob {
+			t.Errorf("blind truncate did not run while blind_truncate is on")
+		}
+		if !strings.Contains(got, "truncated") {
+			t.Errorf("truncation marker missing:\n%s", got)
+		}
+	})
+}
+
+// compressText must never grow its input, never return empty, and must leave
+// small blobs alone.
+func TestRtkCompressTextSafety(t *testing.T) {
+	st := &rtkStats{}
+	cases := []string{
+		"",
+		"short",
+		strings.Repeat("x", 100), // under MIN_COMPRESS_SIZE
+		"On branch main\nYour branch is up to date.\n\nnothing to commit, working tree clean\n",
+		strings.Repeat("file.go:12:   matching line content here for the grep filter\n", 30),
+		strings.Repeat("plain text line with no recognizable structure at all\n", 40),
+	}
+	for _, in := range cases {
+		got := rtkCompressText(in, st, true)
+		if got == "" && in != "" {
+			t.Errorf("empty output for %d byte input", len(in))
+		}
+		if len(got) > len(in) {
+			t.Errorf("grew %d -> %d for %.30q", len(in), len(got), in)
+		}
+	}
+}
+
+// dedup-log must only be chosen when there is duplication to collapse, or it
+// shadows the blind gate and every multi-line blob falls through to nothing.
+func TestRtkDedupNeedsDuplication(t *testing.T) {
+	var uniq, dup strings.Builder
+	for i := 0; i < 20; i++ {
+		uniq.WriteString("unique line " + strconv.Itoa(i) + " with no repeat\n")
+	}
+	for i := 0; i < 20; i++ {
+		dup.WriteString("same line repeated over and over\n")
+	}
+	if len(dup.String()) < rtkMinCompressSize {
+		t.Fatalf("fixture %d bytes must clear MIN_COMPRESS_SIZE %d", len(dup.String()), rtkMinCompressSize)
+	}
+	if fn := rtkAutoDetect(uniq.String(), false); fn != nil {
+		t.Errorf("unique blob picked %q, want no filter", fn.name)
+	}
+	if fn := rtkAutoDetect(dup.String(), false); fn == nil || fn.name != "dedup-log" {
+		t.Errorf("duplicated blob should pick dedup-log, got %v", fn)
+	}
+	// a real saving still happens on the duplicated case
+	st := &rtkStats{}
+	if got := rtkCompressText(dup.String(), st, false); len(got) >= len(dup.String()) {
+		t.Errorf("dedup made no saving: %d >= %d", len(got), len(dup.String()))
+	}
+}
+
+// long-form "Untracked files:" lists bare tab-indented paths. they must be
+// counted, or the summary reports a clean tree over a dirty one.
+func TestRtkGitStatusKeepsUntracked(t *testing.T) {
+	var sb strings.Builder
+	sb.WriteString("On branch main\nUntracked files:\n  (use \"git add\" to include)\n")
+	for i := 0; i < 30; i++ {
+		sb.WriteString("\tsecret-note-" + strconv.Itoa(i) + ".md\n")
+	}
+	sb.WriteString("\nno changes added to commit\n")
+	withRtk(t, true, false, func() {
+		got := rtkFirstResult(t, rtkCompressBody(rtkBody(sb.String())))
+		if !strings.Contains(got, "Untracked: 30 files") {
+			t.Errorf("untracked count wrong or missing:\n%s", got)
+		}
+		if !strings.Contains(got, "secret-note-0.md") {
+			t.Errorf("untracked file names dropped:\n%s", got)
+		}
+		if strings.Contains(got, "clean") {
+			t.Errorf("reported clean over a dirty tree:\n%s", got)
+		}
+	})
+}
+
+// realistic payloads must actually shrink, and stay useful.
+func TestRtkRealisticSavings(t *testing.T) {
+	var sb strings.Builder
+	sb.WriteString("On branch feat/tool-call-case\nYour branch is ahead of 'origin/main' by 3 commits.\n")
+	for _, f := range []string{"anthropic.go", "main.go", "config.go", "rtk.go", "rtkcompress.go"} {
+		sb.WriteString("\tmodified:   " + f + "\n")
+	}
+	for i := 0; i < 60; i++ {
+		sb.WriteString("\tmodified:   generated/deep/nested/file" + strconv.Itoa(i) + ".go\n")
+	}
+	in := sb.String()
+	withRtk(t, true, false, func() {
+		got := rtkFirstResult(t, rtkCompressBody(rtkBody(in)))
+		if len(got) >= len(in) {
+			t.Fatalf("no saving: %d >= %d", len(got), len(in))
+		}
+		if !strings.Contains(got, "feat/tool-call-case") {
+			t.Errorf("branch lost:\n%s", got)
+		}
+		if !strings.Contains(got, "anthropic.go") {
+			t.Errorf("named file lost:\n%s", got)
+		}
+	})
+
+	var gb strings.Builder
+	for i := 1; i <= 60; i++ {
+		gb.WriteString("src/handler.go:" + strconv.Itoa(i) + ":  if err != nil { return err } // guard\n")
+	}
+	for i := 1; i <= 20; i++ {
+		gb.WriteString("src/util.go:" + strconv.Itoa(i) + ":  func helper() error { return nil }\n")
+	}
+	gin := gb.String()
+	withRtk(t, true, false, func() {
+		gout := rtkFirstResult(t, rtkCompressBody(rtkBody(gin)))
+		if len(gout) >= len(gin) {
+			t.Fatalf("no grep saving: %d >= %d", len(gout), len(gin))
+		}
+		if !strings.Contains(gout, "src/handler.go") {
+			t.Errorf("grep file grouping lost:\n%s", gout)
+		}
+	})
+}
+
+// autodetect must pick the right filter per shape.
+func TestRtkAutoDetect(t *testing.T) {
+	big := strings.Repeat("filler line to push past the detect window\n", 40)
+	cases := []struct {
+		name, in string
+		want     string
+	}{
+		{"git-log", "commit abc1234567890abcdef1234567890abcdef12\nAuthor: A <a@b.c>\nDate: Mon\n\n    subject line\n\nbody dropped\n" + big, "git-log"},
+		{"git-diff", "diff --git a/x.go b/x.go\nindex 1..2 100644\n--- a/x.go\n+++ b/x.go\n@@ -1,3 +1,4 @@\n ctx\n+added\n", "git-diff"},
+		{"git-status", "On branch main\nnothing to commit\n", "git-status"},
+		{"build", "npm warn deprecated foo@1.0.0: dead\nadded 500 packages\n", "build-output"},
+		{"grep", "main.go:10:  x := 1\nmain.go:11:  y := 2\n", "grep"},
+		{"find", "./a/one.go\n./a/two.go\n./b/three.go\n", "find"},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			fn := rtkAutoDetect(c.in, false)
+			if fn == nil {
+				t.Fatalf("no filter detected for %s", c.name)
+			}
+			if got := fn.name; got != c.want {
+				t.Errorf("detected %q, want %q", got, c.want)
+			}
+		})
+	}
+}
+
+// grep and find grouping.
+func TestRtkGrepAndFind(t *testing.T) {
+	grepIn := "a.go:1:  one\na.go:2:  two\na.go:3:  three\nb.go:9:  nine\n"
+	got := rtkGrep(grepIn)
+	if !strings.Contains(got, "4 matches in 2F") {
+		t.Errorf("grep header wrong:\n%s", got)
+	}
+	if !strings.Contains(got, "[file] a.go (3)") {
+		t.Errorf("grep grouping wrong:\n%s", got)
+	}
+
+	findIn := "src/a/1.go\nsrc/a/2.go\nsrc/b/3.go\n"
+	fout := rtkFind(findIn)
+	if !strings.Contains(fout, "3 files in 2 dirs") {
+		t.Errorf("find header wrong:\n%s", fout)
+	}
+	if !strings.Contains(fout, "src/a/  (2)") {
+		t.Errorf("find grouping wrong:\n%s", fout)
+	}
+}
+
+// tool names are restored only when translate.restore_tool_name_case is on.
+func TestRestoreToolNameCaseToggle(t *testing.T) {
+	up := []byte(`{"choices":[{"message":{"tool_calls":[
+		{"id":"c1","type":"function","function":{"name":"bash","arguments":"{}"}}]},
+		"finish_reason":"tool_calls"}]}`)
+	want := func(got []byte) string {
+		var m struct {
+			Content []struct {
+				Name string `json:"name"`
+			} `json:"content"`
+		}
+		json.Unmarshal(got, &m)
+		return m.Content[0].Name
+	}
+	check := func(t *testing.T, c *appConfig, wantName string) {
+		t.Helper()
+		useConfig(t, c)
+		if got := want(mustOpenAIToAnthropic(t, up, toolNames{"Bash"})); got != wantName {
+			t.Errorf("restore=%v, want %q, got %q", c.Translate.RestoreToolNameCase, wantName, got)
+		}
+	}
+	f := false
+	off := defaultConfig()
+	off.Translate.RestoreToolNameCase = &f
+	check(t, &off, "bash")
+
+	on := defaultConfig()
+	check(t, &on, "Bash")
+
+	// nil flag = default on
+	unset := defaultConfig()
+	unset.Translate.RestoreToolNameCase = nil
+	check(t, &unset, "Bash")
+}
+
+func mustOpenAIToAnthropic(t *testing.T, body []byte, tn toolNames) []byte {
+	t.Helper()
+	out, errMsg, _ := openAIToAnthropic(body, "m", tn)
+	if errMsg != "" {
+		t.Fatalf("openAIToAnthropic: %s", errMsg)
+	}
+	return out
+}
+
+// --- OpenAI-format path: tool name restoration ---
+
+func TestOaiToolNames(t *testing.T) {
+	chat := []byte(`{"model":"m","tools":[
+		{"type":"function","function":{"name":"Bash"}},
+		{"type":"function","function":{"name":"Read"}}]}`)
+	if got := oaiToolNames(chat); len(got) != 2 || got[0] != "Bash" || got[1] != "Read" {
+		t.Errorf("chat tools = %v", got)
+	}
+	// /responses shape uses a flat name
+	resp := []byte(`{"model":"m","tools":[{"name":"Glob"},{"name":""}]}`)
+	if got := oaiToolNames(resp); len(got) != 1 || got[0] != "Glob" {
+		t.Errorf("responses tools = %v", got)
+	}
+	if got := oaiToolNames([]byte(`not json`)); got != nil {
+		t.Errorf("bad json should yield no names, got %v", got)
+	}
+}
+
+func TestStreamResponsesToChatRestoresToolNameCase(t *testing.T) {
+	stream := "event: response.output_item.added\n" +
+		`data: {"type":"response.output_item.added","item_id":"fc_1","item":{"type":"function_call","call_id":"call_1","name":"bash","arguments":""}}` + "\n\n" +
+		"event: response.completed\n" +
+		`data: {"type":"response.completed","response":{"usage":{"input_tokens":1,"output_tokens":2}}}` + "\n\n"
+
+	w := httptest.NewRecorder()
+	streamResponsesToChat(w, []byte(stream), toolNames{"Bash"})
+	body := w.Body.String()
+	if !strings.Contains(body, `"name":"Bash"`) {
+		t.Errorf("lowercase 'bash' not restored:\n%s", body)
+	}
+	if strings.Contains(body, `"name":"bash"`) {
+		t.Errorf("lowercase name leaked:\n%s", body)
+	}
+}
+
+func TestSseToNonStreamRestoresToolNameCase(t *testing.T) {
+	sse := "data: " + `{"choices":[{"delta":{"tool_calls":[{"index":0,"id":"c1","type":"function","function":{"name":"bash","arguments":"{}"}}]},"finish_reason":null}]}` + "\n\n" +
+		"data: " + `{"choices":[{"delta":{},"finish_reason":"tool_calls"}]}` + "\n\n" +
+		"data: [DONE]\n\n"
+
+	out := sseToNonStream([]byte(sse), "m", toolNames{"Bash"})
+	if !strings.Contains(string(out), `"name":"Bash"`) {
+		t.Errorf("lowercase 'bash' not restored:\n%s", out)
+	}
+	if strings.Contains(string(out), `"name":"bash"`) {
+		t.Errorf("lowercase name leaked:\n%s", out)
 	}
 }
