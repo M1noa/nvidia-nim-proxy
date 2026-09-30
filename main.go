@@ -867,6 +867,174 @@ func convertToResponses(m map[string]any) {
 	}
 }
 
+// chatFromResponses rewrites a /responses-shaped body (input array) into
+// chat.completions shape (messages array). mirror of convertToResponses,
+// for clients that speak responses to a chat-only model like space-bunny.
+func chatFromResponses(m map[string]any) {
+	// string input (plus optional instructions) is the simple responses
+	// shape: one user message, instructions as the system message.
+	if s, ok := m["input"].(string); ok {
+		msgs := []any{}
+		if ins, _ := m["instructions"].(string); ins != "" {
+			msgs = append(msgs, map[string]any{"role": "system", "content": ins})
+		}
+		msgs = append(msgs, map[string]any{"role": "user", "content": s})
+		m["messages"] = msgs
+		delete(m, "input")
+		delete(m, "instructions")
+		if mt, ok := m["max_output_tokens"]; ok {
+			m["max_tokens"] = mt
+			delete(m, "max_output_tokens")
+		}
+		delete(m, "reasoning")
+		delete(m, "text")
+		return
+	}
+	in, ok := m["input"].([]any)
+	if !ok {
+		return
+	}
+	msgs := make([]any, 0, len(in)+1)
+	if ins, _ := m["instructions"].(string); ins != "" {
+		msgs = append(msgs, map[string]any{"role": "system", "content": ins})
+	}
+	delete(m, "instructions")
+	for _, raw := range in {
+		it, ok := raw.(map[string]any)
+		if !ok {
+			continue
+		}
+		typ, _ := it["type"].(string)
+		switch typ {
+		case "function_call_output":
+			out, _ := it["output"].(string)
+			cid, _ := it["call_id"].(string)
+			msgs = append(msgs, map[string]any{
+				"role": "tool", "content": out, "tool_call_id": cid,
+			})
+		case "function_call":
+			name, _ := it["name"].(string)
+			args, _ := it["arguments"].(string)
+			cid, _ := it["call_id"].(string)
+			if cid == "" {
+				cid = "call_" + randHex(12)
+			}
+			msgs = append(msgs, map[string]any{
+				"role": "assistant", "content": nil,
+				"tool_calls": []any{map[string]any{
+					"id": cid, "type": "function",
+					"function": map[string]any{"name": name, "arguments": args},
+				}},
+			})
+		default:
+			role, _ := it["role"].(string)
+			if role == "" {
+				role = "user"
+			}
+			if role != "system" && role != "developer" && role != "assistant" && role != "user" {
+				continue
+			}
+			msg := map[string]any{"role": role}
+			switch c := it["content"].(type) {
+			case string:
+				msg["content"] = c
+			case []any:
+				var parts []any
+				for _, p := range c {
+					pm, ok := p.(map[string]any)
+					if !ok {
+						continue
+					}
+					pt, _ := pm["type"].(string)
+					if t, ok := pm["text"].(string); ok && (pt == "input_text" || pt == "output_text" || pt == "text") {
+						parts = append(parts, map[string]any{"type": "text", "text": t})
+					}
+				}
+				msg["content"] = parts
+			default:
+				msg["content"] = ""
+			}
+			msgs = append(msgs, msg)
+		}
+	}
+	m["messages"] = msgs
+	delete(m, "input")
+	if mt, ok := m["max_output_tokens"]; ok {
+		m["max_tokens"] = mt
+		delete(m, "max_output_tokens")
+	}
+	// chat shape carries these flat, not nested.
+	delete(m, "reasoning")
+	delete(m, "text")
+}
+
+// chatToResponses wraps a chat.completions result body in /responses shape
+// (output array with a message item + usage.input/output_tokens). clients
+// that posted to /v1/responses get a responses body back even when the model
+// only speaks chat upstream.
+func chatToResponses(rb []byte) []byte {
+	var c struct {
+		ID      string `json:"id"`
+		Created int64  `json:"created"`
+		Model   string `json:"model"`
+		Choices []struct {
+			Message struct {
+				Content   any `json:"content"`
+				ToolCalls []struct {
+					ID       string `json:"id"`
+					Function struct {
+						Name      string `json:"name"`
+						Arguments string `json:"arguments"`
+					} `json:"function"`
+				} `json:"tool_calls"`
+			} `json:"message"`
+		} `json:"choices"`
+		Usage struct {
+			PromptTokens     int `json:"prompt_tokens"`
+			CompletionTokens int `json:"completion_tokens"`
+			TotalTokens      int `json:"total_tokens"`
+		} `json:"usage"`
+	}
+	if err := json.Unmarshal(rb, &c); err != nil || len(c.Choices) == 0 {
+		return rb
+	}
+	text := ""
+	switch t := c.Choices[0].Message.Content.(type) {
+	case string:
+		text = t
+	case []any:
+		for _, p := range t {
+			if pm, ok := p.(map[string]any); ok {
+				if s, _ := pm["text"].(string); s != "" {
+					text += s
+				}
+			}
+		}
+	}
+	output := []any{map[string]any{
+		"type": "message", "role": "assistant",
+		"content": []any{map[string]any{"type": "output_text", "text": text}},
+	}}
+	for _, tc := range c.Choices[0].Message.ToolCalls {
+		output = append(output, map[string]any{
+			"type": "function_call", "call_id": tc.ID,
+			"name": tc.Function.Name, "arguments": tc.Function.Arguments,
+		})
+	}
+	out := map[string]any{
+		"id": c.ID, "object": "response", "created_at": c.Created,
+		"model": c.Model, "status": "completed", "output": output,
+		"usage": map[string]any{
+			"input_tokens": c.Usage.PromptTokens, "output_tokens": c.Usage.CompletionTokens,
+			"total_tokens": c.Usage.TotalTokens,
+		},
+	}
+	if b, err := json.Marshal(out); err == nil {
+		return b
+	}
+	return rb
+}
+
 // responsesToChat converts an OpenAI /responses body to /chat/completions shape.
 func responsesToChat(rb []byte) []byte {
 	var r struct {
@@ -2568,6 +2736,13 @@ func (p *Pool) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 // /chat/completions.
 func (p *Pool) handleOpenCode(w http.ResponseWriter, r *http.Request, body []byte, model string, isStream bool, start time.Time) {
 	realModel := strings.TrimPrefix(model, "opencode/")
+	// shape follows the client path, not the model: a responses-shaped body
+	// to a chat-only model (or vice versa) is converted so zen sees the
+	// shape its endpoint accepts and the client gets its own shape back.
+	wantResponses := strings.HasPrefix(r.URL.Path, "/v1/responses")
+	if strings.HasPrefix(r.URL.Path, "/v1/chat/completions") {
+		wantResponses = false
+	}
 	tnames := oaiToolNames(body)
 	var m map[string]any
 	if json.Unmarshal(body, &m) == nil {
@@ -2579,9 +2754,13 @@ func (p *Pool) handleOpenCode(w http.ResponseWriter, r *http.Request, body []byt
 			m["stream"] = true
 			m["stream_options"] = map[string]any{"include_usage": true}
 		}
+		// upstream shape follows the model, not the client path: a
+		// responses-shaped body to a chat model is rewritten to chat
+		// (and vice versa), so zen always sees its native shape.
 		if endpointForModel(realModel) == "/responses" {
 			convertToResponses(m)
 		} else {
+			chatFromResponses(m)
 			sanitizeZenChatMessages(m)
 		}
 		if b, err := json.Marshal(m); err == nil {
@@ -2589,6 +2768,9 @@ func (p *Pool) handleOpenCode(w http.ResponseWriter, r *http.Request, body []byt
 		}
 	}
 
+	// wrapBack reshapes a chat result into responses shape when the client
+	// posted to /v1/responses but the model only speaks chat upstream.
+	wrapBack := wantResponses && endpointForModel(realModel) != "/responses"
 	endpoint := endpointForModel(realModel)
 	target := OpencodeBase + endpoint
 	if !strings.HasPrefix(r.URL.Path, "/v1/chat/completions") && !strings.HasPrefix(r.URL.Path, "/v1/responses") {
@@ -2654,6 +2836,11 @@ func (p *Pool) handleOpenCode(w http.ResponseWriter, r *http.Request, body []byt
 		if err != nil {
 			http.Error(w, fmt.Sprintf(`{"error":"%s"}`, err), http.StatusInternalServerError)
 			return
+		}
+		if os.Getenv("ZEN_DUMP") != "" && zenRetries == 0 {
+			dp := fmt.Sprintf("/tmp/zenoai_%d.json", time.Now().UnixNano())
+			os.WriteFile(dp, body, 0o644)
+			acclog.Printf("ZEN_DUMP oai request %d bytes -> %s", len(body), dp)
 		}
 		setZenHeaders(req, sessionID)
 		if zenRetries > 0 {
@@ -2827,6 +3014,9 @@ func (p *Pool) handleOpenCode(w http.ResponseWriter, r *http.Request, body []byt
 			rb = responsesToChat(responsesSSEToJSON(rb))
 		} else if !isStream && resp.StatusCode == http.StatusOK {
 			rb = sseToNonStream(rb, realModel, tnames)
+			if wrapBack {
+				rb = chatToResponses(rb)
+			}
 		}
 		resp.Body = io.NopCloser(bytes.NewReader(rb))
 		if resp.StatusCode != http.StatusOK {
@@ -2876,6 +3066,18 @@ func (p *Pool) handleOpenCode(w http.ResponseWriter, r *http.Request, body []byt
 			}
 			rb = p.maybeNudgeResponses(r, target, body, rb, &sessionID, model, lane)
 			written, prompT, compT = streamResponsesToChat(w, rb, tnames)
+		} else if wrapBack {
+			// responses client on a chat model with stream=true: fold the
+			// upstream chat SSE to one chat body, wrap to responses shape,
+			// and return it buffered (no true responses stream exists).
+			rb, _ := io.ReadAll(resp.Body)
+			resp.Body.Close()
+			folded := sseToNonStream(rb, realModel, tnames)
+			prompT, compT, _ = respTokens(folded)
+			rb = chatToResponses(folded)
+			w.Header().Set("Content-Type", "application/json")
+			n, _ := w.Write(rb)
+			written = int64(n)
 		} else if fl, ok := w.(http.Flusher); ok {
 			buf := make([]byte, 4096)
 			for {

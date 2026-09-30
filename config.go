@@ -400,8 +400,12 @@ func watchConfig(p *Pool, path string) {
 			applyConfig(c)
 			added, removed := p.Reload(c.NvidiaKeys)
 			stat := p.Status()
+			ng := len(guardrailPrefixes)
+			if !c.Guardrails.Enabled {
+				ng = 0
+			}
 			log.Printf("  %s reloaded: keys +%d -%d = %d (%d available), guardrails=%d, params=%d",
-				path, added, removed, stat.Total, stat.Available, len(guardrailPrefixes), len(modelParams))
+				path, added, removed, stat.Total, stat.Available, ng, len(modelParams))
 		}
 	}
 }

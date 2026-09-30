@@ -87,13 +87,13 @@ func laneGate(l *zenLane) time.Duration {
 	wait := time.Duration(0)
 	if gap := laneMinGap(); gap > 0 {
 		lanesMu.Lock()
-		var since time.Duration
-		if !l.lastSend.IsZero() {
-			since = time.Since(l.lastSend)
-		}
+		sent := !l.lastSend.IsZero()
+		since := time.Since(l.lastSend)
 		lanesMu.Unlock()
-		if w := gap - since; w > 0 {
-			wait = w
+		if sent {
+			if w := gap - since; w > 0 {
+				wait = w
+			}
 		}
 	}
 	if w := laneCooldownLeft(l); w > wait {

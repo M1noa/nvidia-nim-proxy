@@ -367,6 +367,82 @@ func TestConvertToResponsesReasoningEffort(t *testing.T) {
 	}
 }
 
+// string input + instructions becomes system + user messages.
+func TestChatFromResponsesString(t *testing.T) {
+	m := map[string]any{
+		"model": "space-bunny-free", "instructions": "be brief",
+		"input": "ping", "max_output_tokens": 64,
+		"reasoning": map[string]any{"effort": "medium"},
+		"text":      map[string]any{"verbosity": "low"},
+	}
+	chatFromResponses(m)
+	msgs, ok := m["messages"].([]any)
+	if !ok || len(msgs) != 2 {
+		t.Fatalf("want system+user messages, got %v", m["messages"])
+	}
+	if msgs[0].(map[string]any)["role"] != "system" || msgs[1].(map[string]any)["role"] != "user" {
+		t.Fatalf("roles wrong: %v", msgs)
+	}
+	if m["max_tokens"] != 64 {
+		t.Errorf("max_tokens = %v, want 64", m["max_tokens"])
+	}
+	for _, k := range []string{"input", "instructions", "reasoning", "text", "max_output_tokens"} {
+		if _, ok := m[k]; ok {
+			t.Errorf("%s should be deleted", k)
+		}
+	}
+}
+
+// array input: function_call_output becomes a tool message, plain items keep roles.
+func TestChatFromResponsesArray(t *testing.T) {
+	m := map[string]any{
+		"input": []any{
+			map[string]any{"role": "user", "content": "hi"},
+			map[string]any{"type": "function_call_output", "call_id": "c1", "output": "out"},
+			map[string]any{"type": "function_call", "call_id": "c2", "name": "bash", "arguments": "{}"},
+		},
+	}
+	chatFromResponses(m)
+	msgs := m["messages"].([]any)
+	if len(msgs) != 3 {
+		t.Fatalf("want 3 messages, got %v", msgs)
+	}
+	tm := msgs[1].(map[string]any)
+	if tm["role"] != "tool" || tm["tool_call_id"] != "c1" || tm["content"] != "out" {
+		t.Errorf("tool msg wrong: %v", tm)
+	}
+	am := msgs[2].(map[string]any)
+	tc := am["tool_calls"].([]any)[0].(map[string]any)
+	if tc["id"] != "c2" || tc["function"].(map[string]any)["name"] != "bash" {
+		t.Errorf("assistant call wrong: %v", am)
+	}
+}
+
+// chat result wraps to responses shape with output message + token usage.
+func TestChatToResponses(t *testing.T) {
+	rb := []byte(`{"id":"chatcmpl-1","created":100,"model":"space-bunny-free",` +
+		`"choices":[{"message":{"role":"assistant","content":"PONG"},"finish_reason":"stop"}],` +
+		`"usage":{"prompt_tokens":10,"completion_tokens":3,"total_tokens":13}}`)
+	out := chatToResponses(rb)
+	var r map[string]any
+	if err := json.Unmarshal(out, &r); err != nil {
+		t.Fatalf("bad json: %v", err)
+	}
+	if r["object"] != "response" || r["status"] != "completed" {
+		t.Errorf("envelope wrong: %v", r)
+	}
+	items := r["output"].([]any)
+	msg := items[0].(map[string]any)
+	parts := msg["content"].([]any)
+	if parts[0].(map[string]any)["text"] != "PONG" {
+		t.Errorf("text wrong: %v", msg)
+	}
+	u := r["usage"].(map[string]any)
+	if u["input_tokens"] != float64(10) || u["output_tokens"] != float64(3) {
+		t.Errorf("usage wrong: %v", u)
+	}
+}
+
 func TestStreamResponsesToChat(t *testing.T) {
 	// Simulate a Responses API SSE stream
 	stream := "event: response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"delta\":\"Hello\"}\n\n" +
@@ -1948,6 +2024,82 @@ func TestLaneBlockIsShortAndDropsExit(t *testing.T) {
 	}
 	if d := time.Until(l.cooldown); d > 6*time.Second {
 		t.Errorf("identity block cooldown %v, want <= ~5s (not a rate limit)", d)
+	}
+}
+
+func TestLaneGatePaces(t *testing.T) {
+	resetLanes()
+	defer resetLanes()
+	c := testConfig()
+	c.Zen.LaneMinGapMs = 120
+	applyConfig(c)
+	defer applyConfig(testConfig())
+	l := &zenLane{id: "p", session: zenSession(), lastUsed: time.Now()}
+	if w := laneGate(l); w != 0 {
+		t.Fatalf("first send must not wait, waited %v", w)
+	}
+	// immediate second send on the same lane must pace near the gap.
+	start := time.Now()
+	if w := laneGate(l); w < 80*time.Millisecond {
+		t.Fatalf("second send waited %v, want ~120ms pacing", w)
+	}
+	if d := time.Since(start); d < 80*time.Millisecond {
+		t.Fatalf("gate slept %v, want ~120ms", d)
+	}
+}
+
+func TestLaneGateDisabled(t *testing.T) {
+	resetLanes()
+	defer resetLanes()
+	c := testConfig()
+	c.Zen.LaneMinGapMs = 0
+	applyConfig(c)
+	defer applyConfig(testConfig())
+	l := &zenLane{id: "p", session: zenSession(), lastUsed: time.Now()}
+	laneGate(l)
+	if w := laneGate(l); w != 0 {
+		t.Fatalf("gap 0 must not pace, waited %v", w)
+	}
+}
+
+func TestSweepReleasesIdleProxy(t *testing.T) {
+	resetLanes()
+	defer resetLanes()
+	c := testConfig()
+	c.Zen.LaneTTLMinutes = 30
+	c.Zen.LaneReleaseSecs = 60
+	applyConfig(c)
+	defer applyConfig(testConfig())
+	lanesMu.Lock()
+	lanes["cold"] = &zenLane{id: "cold", session: zenSession(), proxy: "http://10.0.0.7:7", lastUsed: time.Now().Add(-2 * time.Minute)}
+	lanes["hot"] = &zenLane{id: "hot", session: zenSession(), proxy: "http://10.0.0.8:8", lastUsed: time.Now()}
+	lanesMu.Unlock()
+	sweepLanes()
+	lanesMu.Lock()
+	defer lanesMu.Unlock()
+	if lanes["cold"].proxy != "" {
+		t.Error("idle exit must be released on sweep")
+	}
+	if lanes["hot"].proxy == "" {
+		t.Error("fresh exit must survive sweep")
+	}
+}
+
+func TestLanesRevalidate(t *testing.T) {
+	resetLanes()
+	defer resetLanes()
+	lanesMu.Lock()
+	lanes["a"] = &zenLane{id: "a", session: zenSession(), proxy: "http://10.0.0.1:1"}
+	lanes["b"] = &zenLane{id: "b", session: zenSession(), proxy: "http://10.0.0.9:9"}
+	lanesMu.Unlock()
+	lanesRevalidate([]string{"http://10.0.0.1:1", "http://10.0.0.2:2"})
+	lanesMu.Lock()
+	defer lanesMu.Unlock()
+	if lanes["a"].proxy == "" {
+		t.Error("verified exit must survive a refresh")
+	}
+	if lanes["b"].proxy != "" {
+		t.Error("unverified exit must be cleared on refresh")
 	}
 }
 
