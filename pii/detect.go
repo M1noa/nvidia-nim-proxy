@@ -96,8 +96,12 @@ var textRules = []struct {
 	re    *regexp.Regexp
 }{
 	{LEmail, regexp.MustCompile(`[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}`)},
-	{LURL, regexp.MustCompile(`https?://[^\s<>"'\])}]+`)},
-	{LURL, regexp.MustCompile(`www\.[A-Za-z0-9.\-]+\.[A-Za-z]{2,}(?:/[^\s<>"'\])}]*)?`)},
+	// exclude backslash too: bodies are raw json, so a url directly before
+	// an escaped quote (https://x/y\") would otherwise swallow the escape
+	// and the surrogate replacement would leave the quote unescaped,
+	// producing invalid json upstream.
+	{LURL, regexp.MustCompile(`https?://[^\s<>"'\\\])}]+`)},
+	{LURL, regexp.MustCompile(`www\.[A-Za-z0-9.\-]+\.[A-Za-z]{2,}(?:/[^\s<>"'\\\])}]*)?`)},
 	{LIPAddress, regexp.MustCompile(`(?:(?:25[0-5]|2[0-4][0-9]|1?[0-9]?[0-9])\.){3}(?:25[0-5]|2[0-4][0-9]|1?[0-9]?[0-9])`)},
 	{LIPAddress, regexp.MustCompile(`(?:[0-9A-Fa-f]{2}[:-]){5}[0-9A-Fa-f]{2}`)},
 	{LJWT, regexp.MustCompile(`eyJ[A-Za-z0-9_-]+\.eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_\-]+`)},

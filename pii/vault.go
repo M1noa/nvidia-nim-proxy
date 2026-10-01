@@ -5,6 +5,7 @@ import (
 	"crypto/hmac"
 	"crypto/sha256"
 	"encoding/binary"
+	"fmt"
 	"strings"
 	"sync"
 	"time"
@@ -90,12 +91,19 @@ func (v *Vault) For(label Label, original string) string {
 		}
 		v.remove(e)
 	}
+	// bound the salt loop: small labels (url has 5 fakes, phone ~7M) can
+	// exhaust their pool, and an unbounded loop then spins forever at 100%
+	// cpu, hanging the request. after maxSurrogateSalts tries, uniquify
+	// mints a free surrogate deterministically.
 	var surr string
-	for salt := uint32(0); ; salt++ {
+	for salt := uint32(0); salt < maxSurrogateSalts; salt++ {
 		surr = v.derive(label, original, salt)
 		if _, taken := v.bySurr[surr]; !taken {
 			break
 		}
+	}
+	if _, taken := v.bySurr[surr]; taken {
+		surr = v.uniquify(label, original)
 	}
 	e := &vaultEntry{original: original, surrogate: surr, label: label, expires: time.Now().Add(v.ttl)}
 	e.elem = v.lru.PushFront(k)
@@ -114,6 +122,23 @@ func (v *Vault) For(label Label, original string) string {
 		}
 	}
 	return surr
+}
+
+// maxSurrogateSalts caps the hmac salt-retry loop in Vault.For.
+const maxSurrogateSalts = 64
+
+// uniquify mints a free surrogate when derive's fake pool is exhausted:
+// the base fake plus a "~n" index. deterministic for a given (label,
+// original) and vault state, and the index space is unbounded so a free
+// candidate always exists.
+func (v *Vault) uniquify(label Label, original string) string {
+	base := v.derive(label, original, 0)
+	for n := 2; ; n++ {
+		cand := base + "~" + fmt.Sprint(n)
+		if _, taken := v.bySurr[cand]; !taken {
+			return cand
+		}
+	}
 }
 
 func (v *Vault) remove(e *vaultEntry) {

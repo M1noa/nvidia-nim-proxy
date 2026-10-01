@@ -2,6 +2,7 @@ package pii
 
 import (
 	"crypto/sha256"
+	"encoding/json"
 	"strings"
 	"sync"
 	"time"
@@ -122,7 +123,15 @@ func (g *Guard) MaskBody(body []byte) []byte {
 	if g == nil {
 		return body
 	}
-	return g.scanner.maskBody(body, g.vault, g.cfg.IncludeSystem)
+	masked := g.scanner.maskBody(body, g.vault, g.cfg.IncludeSystem)
+	// safety net: masking works on raw bytes, so a detector span that
+	// crosses a json structural character can silently corrupt the body
+	// and the request would die as invalid json upstream. if masking
+	// broke a body that was valid json, ship the original instead.
+	if json.Valid(body) && !json.Valid(masked) {
+		return body
+	}
+	return masked
 }
 
 func (g *Guard) RestoreBody(body []byte) []byte {

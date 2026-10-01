@@ -121,6 +121,10 @@ type zenConfig struct {
 	// PoolRefresh429s triggers a full pool refresh once this many lanes
 	// have been rate-limited since the last one. 0 disables.
 	PoolRefresh429s int `yaml:"pool_refresh_429s"`
+	// ExitBurnMinutes keeps an exit that 403s FreeTierError for a model
+	// out of that model's rotation. per (exit, model): the exit can still
+	// serve other models. 0 disables (never burn).
+	ExitBurnMinutes int `yaml:"exit_burn_minutes"`
 }
 
 type nvidiaConfig struct {
@@ -132,6 +136,13 @@ type statusConfig struct {
 	ShowOpencodeModels bool `yaml:"show_opencode_models"`
 	ShowZen            bool `yaml:"show_zen"`
 	ShowLocks          bool `yaml:"show_locks"`
+	ShowUsage          bool `yaml:"show_usage"`
+}
+
+// usageConfig gates the per-request tracker. off = no file, no counters.
+type usageConfig struct {
+	Enabled bool   `yaml:"enabled"`
+	Path    string `yaml:"path"`
 }
 
 type modelParamYAML struct {
@@ -162,6 +173,7 @@ type appConfig struct {
 	Translate  translateConfig   `yaml:"translate"`
 	Zen        zenConfig         `yaml:"zen"`
 	Status     statusConfig      `yaml:"status"`
+	Usage      usageConfig       `yaml:"usage"`
 	Models     modelsConfig      `yaml:"models"`
 }
 
@@ -222,12 +234,18 @@ func defaultConfig() appConfig {
 			LaneMinGapMs:     1500,
 			LaneReleaseSecs:  90,
 			PoolRefresh429s:  2,
+			ExitBurnMinutes:  30,
 		},
 		Status: statusConfig{
 			ShowKeys:           true,
 			ShowOpencodeModels: true,
 			ShowZen:            true,
 			ShowLocks:          true,
+			ShowUsage:          true,
+		},
+		Usage: usageConfig{
+			Enabled: true,
+			Path:    "nim-usage.jsonl",
 		},
 	}
 }
@@ -266,6 +284,25 @@ func loadConfigFile(path string) (*appConfig, error) {
 			}
 		} else {
 			c.Zen.Enabled = true
+		}
+		if u, ok := doc["usage"].(map[string]any); ok {
+			if _, has := u["enabled"]; !has {
+				c.Usage.Enabled = true
+			}
+		} else {
+			c.Usage.Enabled = true
+		}
+		if _, ok := doc["status"].(map[string]any); ok {
+			if s, ok := doc["status"].(map[string]any); ok {
+				if _, has := s["show_usage"]; !has {
+					c.Status.ShowUsage = true
+				}
+			}
+		} else {
+			c.Status.ShowUsage = true
+		}
+		if c.Usage.Path == "" {
+			c.Usage.Path = "nim-usage.jsonl"
 		}
 	}
 	if c.NvidiaKeys == nil {
@@ -490,10 +527,14 @@ func (p *Pool) StatusFor(authed bool) StatusResponse {
 	if sr.Opencode != nil && !c.Status.ShowOpencodeModels {
 		sr.Opencode.Models = nil
 	}
+	if !c.Status.ShowUsage {
+		sr.Usage = nil
+	}
 	if authRequired() && !authed {
 		sr.Keys, sr.Locks = nil, nil
 		sr.ZenSession, sr.ZenProxy, sr.ZenAgo = "", "", ""
 		sr.ZenLanes = nil
+		sr.Usage = nil
 	}
 	return sr
 }

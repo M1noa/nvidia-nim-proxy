@@ -106,6 +106,9 @@ type Pool struct {
 	lastZenSession string
 	lastZenProxy   string
 	lastZenAt      time.Time
+	// per-backend in-flight counts: nvidia keys vs opencode zen lanes.
+	concurrentNV  atomic.Int64
+	concurrentZen atomic.Int64
 }
 
 func newPool(entries map[string]string) *Pool {
@@ -154,10 +157,6 @@ func (p *Pool) Reload(entries map[string]string) (added, removed int) {
 	sort.Slice(fresh, func(i, j int) bool { return fresh[i].Name < fresh[j].Name })
 	p.keys = fresh
 	return
-}
-
-func (p *Pool) Pick(exclude map[string]bool, model string) *Key {
-	return p.PickSticky(exclude, model, "")
 }
 
 // PickSticky picks a key, preferring the last key that served model (sticky)
@@ -259,7 +258,13 @@ func (p *Pool) rateLimit(k *Key) {
 	k.Consec429++
 	k.FailCount++
 	k.LastFail = time.Now()
-	d := cooldown429 << (k.Consec429 - 1)
+	// clamp the shift: unbounded Consec429 overflows the duration into the
+	// negative (past) after ~31 doublings, silently disabling backoff.
+	shift := k.Consec429 - 1
+	if shift > 8 {
+		shift = 8
+	}
+	d := cooldown429 << shift
 	if d > maxBackoff {
 		d = maxBackoff
 	}
@@ -324,7 +329,13 @@ func (p *Pool) callUpstream(method, target string, body []byte, fwd http.Header,
 			p.locks.lock(key.Name, model, modelLockout)
 			resp.Body.Close()
 			rh := rlHeaders(resp.Header)
-			cd := cooldown429 << (key.Consec429 - 1)
+			// clamp before shifting: see rateLimit — unbounded shifts overflow
+			// the duration negative, disabling backoff entirely.
+			shift := key.Consec429 - 1
+			if shift > 8 {
+				shift = 8
+			}
+			cd := cooldown429 << shift
 			if cd > maxBackoff {
 				cd = maxBackoff
 			}
@@ -380,20 +391,31 @@ type KeyStatus struct {
 }
 
 type StatusResponse struct {
-	OK         bool          `json:"ok"`
-	Version    string        `json:"version"`
-	Uptime     string        `json:"uptime"`
-	Total      int           `json:"total"`
-	Available  int           `json:"available"`
-	Concurrent int           `json:"concurrent"`
-	SemLimit   int           `json:"sem_limit"`
-	Keys       []KeyStatus   `json:"keys,omitempty"`
-	Locks      interface{}   `json:"model_locks,omitempty"`
-	Opencode   *OpencodeInfo `json:"opencode,omitempty"`
-	ZenSession string        `json:"zen_session,omitempty"`
-	ZenProxy   string        `json:"zen_proxy,omitempty"`
-	ZenAgo     string        `json:"zen_ago,omitempty"`
-	ZenLanes   []laneStatus  `json:"zen_lanes,omitempty"`
+	OK            bool          `json:"ok"`
+	Version       string        `json:"version"`
+	Uptime        string        `json:"uptime"`
+	Total         int           `json:"total"`
+	Available     int           `json:"available"`
+	Concurrent    int           `json:"concurrent"`
+	ConcurrentNV  int           `json:"concurrent_nvidia"`
+	ConcurrentZen int           `json:"concurrent_opencode"`
+	SemLimit      int           `json:"sem_limit"`
+	Keys          []KeyStatus   `json:"keys,omitempty"`
+	Locks         interface{}   `json:"model_locks,omitempty"`
+	Opencode      *OpencodeInfo `json:"opencode,omitempty"`
+	ZenSession    string        `json:"zen_session,omitempty"`
+	ZenProxy      string        `json:"zen_proxy,omitempty"`
+	ZenAgo        string        `json:"zen_ago,omitempty"`
+	ZenLanes      []laneStatus  `json:"zen_lanes,omitempty"`
+	Usage         *usageSummary `json:"usage,omitempty"`
+}
+
+// usageSummary is the /status view of the in-memory counters.
+type usageSummary struct {
+	Requests   int                    `json:"requests"`
+	Prompt     int                    `json:"prompt_tokens"`
+	Completion int                    `json:"completion_tokens"`
+	ByModel    map[string]usageTotals `json:"by_model,omitempty"`
 }
 
 type OpencodeInfo struct {
@@ -418,12 +440,14 @@ func (p *Pool) Status() StatusResponse {
 	defer p.mu.RUnlock()
 	now := time.Now()
 	sr := StatusResponse{
-		OK:         true,
-		Version:    versionStr,
-		Uptime:     now.Sub(p.start).Round(time.Second).String(),
-		Total:      len(p.keys),
-		Concurrent: int(p.concurrent.Load()),
-		SemLimit:   cap(p.sem),
+		OK:            true,
+		Version:       versionStr,
+		Uptime:        now.Sub(p.start).Round(time.Second).String(),
+		Total:         len(p.keys),
+		Concurrent:    int(p.concurrent.Load()),
+		ConcurrentNV:  int(p.concurrentNV.Load()),
+		ConcurrentZen: int(p.concurrentZen.Load()),
+		SemLimit:      cap(p.sem),
 	}
 	if len(p.keys) > 0 {
 		sr.Keys = make([]KeyStatus, len(p.keys))
@@ -467,6 +491,10 @@ func (p *Pool) Status() StatusResponse {
 		sr.ZenProxy = redactProxyUserinfo(p.lastZenProxy)
 		sr.ZenAgo = now.Sub(p.lastZenAt).Round(time.Second).String()
 	}
+	if cfg().Usage.Enabled && cfg().Status.ShowUsage {
+		reqs, prompt, comp, byModel := usageSnapshot()
+		sr.Usage = &usageSummary{Requests: reqs, Prompt: prompt, Completion: comp, ByModel: byModel}
+	}
 	return sr
 }
 
@@ -485,6 +513,10 @@ var (
 	dbglog    *log.Logger = log.New(io.Discard, "", 0)
 	debugMode bool
 )
+
+// reqSeq hands every inbound model request a short id so verbose log lines
+// can be followed from arrival through routing to the final response.
+var reqSeq atomic.Int64
 
 // ocInfo caches the opencode zen free-model list fetched at startup.
 var ocInfo atomic.Pointer[OpencodeInfo]
@@ -559,43 +591,6 @@ func short(s string) string {
 		return s[len(s)-8:]
 	}
 	return s
-}
-
-// usage tracking
-
-var (
-	usageMu  sync.Mutex
-	usageOut *json.Encoder
-	usageFd  *os.File
-)
-
-type UsageRecord struct {
-	Ts               string            `json:"ts"`
-	Model            string            `json:"model"`
-	KeyName          string            `json:"key"`
-	Method           string            `json:"method"`
-	Path             string            `json:"path"`
-	StatusCode       int               `json:"status"`
-	DurationMs       int64             `json:"duration_ms"`
-	PromptTokens     int               `json:"prompt_tokens,omitempty"`
-	CompletionTokens int               `json:"completion_tokens,omitempty"`
-	TotalTokens      int               `json:"total_tokens,omitempty"`
-	Stream           bool              `json:"stream"`
-	RetryAttempt     int               `json:"retry_attempt"`
-	RateLimited      bool              `json:"rate_limited"`
-	CooldownSecs     int               `json:"cooldown_secs,omitempty"`
-	Error            string            `json:"error,omitempty"`
-	ContentBytes     int64             `json:"content_bytes"`
-	Headers          map[string]string `json:"headers,omitempty"`
-}
-
-func logUsage(r UsageRecord) {
-	usageMu.Lock()
-	defer usageMu.Unlock()
-	if usageOut == nil {
-		return
-	}
-	usageOut.Encode(r)
 }
 
 type modelParamEntry struct {
@@ -1459,12 +1454,12 @@ func (p *Pool) nudgePostResponses(r *http.Request, target string, nb []byte, ses
 		}
 		proxy := ""
 		if rotating {
-			proxy = laneProxyFor(lane)
+			proxy = laneProxyFor(lane, reqModel(nb))
 			if proxy == "" && cfg().Zen.AlwaysProxy {
 				if nl := laneFailover(lane); nl != nil {
 					lane = nl
 					*sessionID = laneSession(lane)
-					proxy = laneProxyFor(lane)
+					proxy = laneProxyFor(lane, reqModel(nb))
 				}
 			}
 			if proxy == "" && cfg().Zen.AlwaysProxy {
@@ -1483,12 +1478,7 @@ func (p *Pool) nudgePostResponses(r *http.Request, target string, nb []byte, ses
 		}
 		setZenHeaders(req, *sessionID)
 		for k, v := range r.Header {
-			switch strings.ToLower(k) {
-			case "authorization", "host", "content-type", "accept", "accept-encoding",
-				"connection", "content-length", "user-agent", "cookie",
-				"x-opencode-client", "x-opencode-session", "x-opencode-request", "x-opencode-project":
-				continue
-			default:
+			if zenHeaderForwarded(k) {
 				req.Header[k] = v
 			}
 		}
@@ -2394,6 +2384,9 @@ func (p *Pool) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	reqID := fmt.Sprintf("req-%d", reqSeq.Add(1))
+	acclog.Printf("%s --> %s %s from %s (%d bytes)", reqID, r.Method, r.URL.Path, r.RemoteAddr, r.ContentLength)
+
 	switch r.URL.Path {
 	case "/status", "/health":
 		w.Header().Set("Content-Type", "application/json")
@@ -2417,7 +2410,7 @@ func (p *Pool) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	// Anthropic Messages API — route to anthropic.go handler
 	if r.URL.Path == "/v1/messages" || r.URL.Path == "/v1/messages/count_tokens" {
-		p.handleAnthropic(w, r, start)
+		p.handleAnthropic(w, r, start, reqID)
 		return
 	}
 	// Permission classifier — Claude Code asks the gateway to classify tool-use
@@ -2427,6 +2420,9 @@ func (p *Pool) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	if p.sem != nil && len(p.sem) == cap(p.sem) {
+		acclog.Printf("%s ... all %d slots busy, queueing", reqID, cap(p.sem))
+	}
 	p.sem <- struct{}{}
 	p.concurrent.Add(1)
 	defer func() {
@@ -2466,9 +2462,22 @@ func (p *Pool) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			isStream = j.Stream
 		}
 	}
+	// usage chunks only arrive when asked: request them on streams so
+	// the tee in the nvidia path has tokens to count. harmless upstream.
+	if isStream && len(body) > 0 {
+		var m map[string]any
+		if json.Unmarshal(body, &m) == nil {
+			if _, ok := m["stream_options"]; !ok {
+				m["stream_options"] = map[string]any{"include_usage": true}
+				if b, err := json.Marshal(m); err == nil {
+					body = b
+				}
+			}
+		}
+	}
 
 	model := reqModel(body)
-	acclog.Printf("-> %s %s model=%s stream=%v bytes=%d", r.Method, r.URL.Path, model, isStream, len(body))
+	acclog.Printf("%s -> %s %s model=%s stream=%v bytes=%d", reqID, r.Method, r.URL.Path, model, isStream, len(body))
 
 	if strings.HasPrefix(model, "opencode/") {
 		if !zenEnabled() {
@@ -2476,7 +2485,10 @@ func (p *Pool) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, `{"error":"opencode zen is disabled; set zen.enabled: true in config.yml"}`, http.StatusServiceUnavailable)
 			return
 		}
-		p.handleOpenCode(w, r, body, model, isStream, start)
+		p.concurrentZen.Add(1)
+		defer p.concurrentZen.Add(-1)
+		acclog.Printf("%s routed to opencode model=%s", reqID, model)
+		p.handleOpenCode(w, r, body, model, isStream, start, reqID)
 		return
 	}
 
@@ -2509,6 +2521,9 @@ func (p *Pool) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if r.URL.RawQuery != "" {
 		target += "?" + r.URL.RawQuery
 	}
+	acclog.Printf("%s routed to nvidia target=%s model=%s", reqID, target, model)
+	p.concurrentNV.Add(1)
+	defer p.concurrentNV.Add(-1)
 
 	fwd := http.Header{}
 	for k, v := range r.Header {
@@ -2571,7 +2586,13 @@ func (p *Pool) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			p.locks.lock(key.Name, model, modelLockout)
 			resp.Body.Close()
 			rh := rlHeaders(resp.Header)
-			cd := cooldown429 << (key.Consec429 - 1)
+			// clamp before shifting: see rateLimit — unbounded shifts overflow
+			// the duration negative, disabling backoff entirely.
+			shift := key.Consec429 - 1
+			if shift > 8 {
+				shift = 8
+			}
+			cd := cooldown429 << shift
 			if cd > maxBackoff {
 				cd = maxBackoff
 			}
@@ -2656,24 +2677,27 @@ func (p *Pool) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	respHeaders := rlHeaders(lastResp.Header)
 	record := UsageRecord{
-		Ts:               time.Now().UTC().Format(time.RFC3339Nano),
-		Model:            model,
-		KeyName:          used.Name,
-		Method:           r.Method,
-		Path:             r.URL.Path,
-		StatusCode:       lastResp.StatusCode,
-		DurationMs:       elapsed.Milliseconds(),
-		PromptTokens:     prompT,
-		CompletionTokens: compT,
-		TotalTokens:      totalT,
-		Stream:           isStream,
-		RetryAttempt:     retries,
-		RateLimited:      rateLimited,
-		Error:            recErr,
-		ContentBytes:     int64(len(body)),
-		Headers:          respHeaders,
+		Ts:           time.Now().UTC().Format(time.RFC3339Nano),
+		Model:        model,
+		KeyName:      used.Name,
+		Method:       r.Method,
+		Path:         r.URL.Path,
+		StatusCode:   lastResp.StatusCode,
+		DurationMs:   elapsed.Milliseconds(),
+		Stream:       isStream,
+		RetryAttempt: retries,
+		RateLimited:  rateLimited,
+		Error:        recErr,
+		ContentBytes: int64(len(body)),
+		Headers:      respHeaders,
 	}
-	logUsage(record)
+	streamed := isStream && lastResp.StatusCode == http.StatusOK
+	if !streamed {
+		record.PromptTokens = prompT
+		record.CompletionTokens = compT
+		record.TotalTokens = totalT
+		logUsage(record)
+	}
 
 	for k, v := range lastResp.Header {
 		w.Header()[k] = v
@@ -2689,12 +2713,27 @@ func (p *Pool) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if isStream && lastResp.StatusCode == http.StatusOK {
 		if fl, ok := w.(http.Flusher); ok {
 			buf := make([]byte, 4096)
+			// carry: a usage chunk split across reads is still caught,
+			// usage json is small and lands wholly in one final chunk.
+			var carry []byte
 			for {
 				n, err := lastResp.Body.Read(buf)
 				if n > 0 {
 					w.Write(buf[:n])
 					if respBodyBuf != nil {
 						respBodyBuf.Write(buf[:n])
+					}
+					blk := buf[:n]
+					if len(carry) > 0 {
+						blk = append(carry, buf[:n]...)
+						carry = nil
+					}
+					if p, c := sseUsageTee(blk); p > 0 || c > 0 {
+						prompT, compT = p, c
+					} else if len(blk) > 512 {
+						carry = append(carry[:0], blk[len(blk)-512:]...)
+					} else {
+						carry = append(carry[:0], blk...)
 					}
 					fl.Flush()
 					written += int64(n)
@@ -2710,6 +2749,13 @@ func (p *Pool) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		written, _ = io.Copy(w, lastResp.Body)
 	}
 	lastResp.Body.Close()
+	if streamed {
+		record.DurationMs = time.Since(start).Milliseconds()
+		record.PromptTokens = prompT
+		record.CompletionTokens = compT
+		record.TotalTokens = prompT + compT
+		logUsage(record)
+	}
 	if lastResp.StatusCode == http.StatusOK {
 		p.Postpone(used, 1500*time.Millisecond)
 		p.Clear429(used)
@@ -2719,7 +2765,7 @@ func (p *Pool) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if used != nil {
 		sk = fmt.Sprintf(" [%s]", used.Name)
 	}
-	acclog.Printf("<- %d %s %s %v %d bytes%s", lastResp.StatusCode, r.Method, r.URL.Path, elapsed.Round(time.Millisecond), written, sk)
+	acclog.Printf("<- %d %s %s %v %d bytes%s model=%s %s", lastResp.StatusCode, r.Method, r.URL.Path, elapsed.Round(time.Millisecond), written, sk, model, reqID)
 
 	if debugMode {
 		respStr := ""
@@ -2734,7 +2780,7 @@ func (p *Pool) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 // (OpenAI-compatible, no auth for -free models).
 // Muse Spark models use /responses endpoint; all others use
 // /chat/completions.
-func (p *Pool) handleOpenCode(w http.ResponseWriter, r *http.Request, body []byte, model string, isStream bool, start time.Time) {
+func (p *Pool) handleOpenCode(w http.ResponseWriter, r *http.Request, body []byte, model string, isStream bool, start time.Time, reqID string) {
 	realModel := strings.TrimPrefix(model, "opencode/")
 	// shape follows the client path, not the model: a responses-shaped body
 	// to a chat-only model (or vice versa) is converted so zen sees the
@@ -2779,6 +2825,7 @@ func (p *Pool) handleOpenCode(w http.ResponseWriter, r *http.Request, body []byt
 	if r.URL.RawQuery != "" {
 		target += "?" + r.URL.RawQuery
 	}
+	acclog.Printf("%s routed to opencode model=%s endpoint=%s", reqID, realModel, endpoint)
 
 	cl := &http.Client{Timeout: 300 * time.Second}
 	var resp *http.Response
@@ -2809,17 +2856,29 @@ func (p *Pool) handleOpenCode(w http.ResponseWriter, r *http.Request, body []byt
 		}
 		proxy := ""
 		if zenRetries == 0 {
-			proxy = laneProxyFor(lane)
+			proxy = laneProxyFor(lane, realModel)
+			if proxy == "" && cfg().Zen.AlwaysProxy {
+				// pool dry: fail over once instead of burning a retry
+				// on direct, which always_proxy already ruled out.
+				if nl := laneFailover(lane); nl != nil {
+					lane = nl
+					sessionID = laneSession(lane)
+					proxy = laneProxyFor(lane, realModel)
+				}
+				if proxy == "" {
+					continue
+				}
+			}
 			cl = zenClient(proxy)
 			usedProxy = proxy
 		} else if rotating {
-			proxy = laneProxyFor(lane)
+			proxy = laneProxyFor(lane, realModel)
 			if proxy == "" && cfg().Zen.AlwaysProxy {
 				// pool dry and proxied mode: try another lane's exit.
 				if nl := laneFailover(lane); nl != nil {
 					lane = nl
 					sessionID = laneSession(lane)
-					proxy = laneProxyFor(lane)
+					proxy = laneProxyFor(lane, realModel)
 				}
 			}
 			if proxy == "" && cfg().Zen.AlwaysProxy {
@@ -2847,12 +2906,7 @@ func (p *Pool) handleOpenCode(w http.ResponseWriter, r *http.Request, body []byt
 			acclog.Printf("  opencode retry %d/4 session=%s proxy=%s lane=%s", zenRetries, sessionID, proxy, lane.id)
 		}
 		for k, v := range r.Header {
-			switch strings.ToLower(k) {
-			case "authorization", "host", "content-type", "accept", "accept-encoding",
-				"connection", "content-length", "user-agent", "cookie",
-				"x-opencode-client", "x-opencode-session", "x-opencode-request", "x-opencode-project":
-				continue
-			default:
+			if zenHeaderForwarded(k) {
 				req.Header[k] = v
 			}
 		}
@@ -2883,7 +2937,7 @@ func (p *Pool) handleOpenCode(w http.ResponseWriter, r *http.Request, body []byt
 			acclog.Printf("  opencode rate-limited %d (retry %d/4) model=%s country=%s proxy=%s lane=%s, cooling lane",
 				resp.StatusCode, zenRetries, model, proxyCountry(proxy), proxy, lane.id)
 			if proxy == "" {
-				laneEscalate(lane) // direct got limited: give the lane an exit
+				laneEscalate(lane, realModel) // direct got limited: give the lane an exit
 			}
 			laneCool(lane)
 			if nl := laneFailover(lane); nl != nil {
@@ -2949,8 +3003,9 @@ func (p *Pool) handleOpenCode(w http.ResponseWriter, r *http.Request, body []byt
 				acclog.Printf("  opencode free-tier-blocked %d (retry %d/4) model=%s country=%s proxy=%s lane=%s, switching lane",
 					resp.StatusCode, zenRetries, model, proxyCountry(proxy), proxy, lane.id)
 				dropProxy(proxy)
+				burnExit(proxy, realModel)
 				if proxy == "" {
-					laneEscalate(lane) // direct is flagged: give the lane an exit
+					laneEscalate(lane, realModel) // direct is flagged: give the lane an exit
 				}
 				laneBlock(lane)
 				if nl := laneFailover(lane); nl != nil {
@@ -2970,6 +3025,15 @@ func (p *Pool) handleOpenCode(w http.ResponseWriter, r *http.Request, body []byt
 			}
 			acclog.Printf("!! opencode upstream %d (retry %d/4) model=%s country=%s proxy=%s err=%q",
 				resp.StatusCode, zenRetries, model, proxyCountry(proxy), proxy, errSnippet(eb, 160))
+			if len(bytes.TrimSpace(eb)) == 0 {
+				// provider sometimes errors with no body; never hand the
+				// client a 0-byte error, synthesize a JSON one.
+				if resp.StatusCode == http.StatusForbidden {
+					eb = []byte(`{"type":"error","error":{"type":"FreeTierError","message":"OpenCode's free tier can only be used from within OpenCode"}}`)
+				} else {
+					eb = []byte(fmt.Sprintf(`{"error":"upstream status %d with empty body"}`, resp.StatusCode))
+				}
+			}
 			resp.Body = io.NopCloser(bytes.NewReader(eb))
 		}
 		resetZenNetworkErrors()
@@ -3030,21 +3094,26 @@ func (p *Pool) handleOpenCode(w http.ResponseWriter, r *http.Request, body []byt
 		}
 	}
 
-	logUsage(UsageRecord{
-		Ts:               time.Now().UTC().Format(time.RFC3339Nano),
-		Model:            model,
-		KeyName:          "opencode",
-		Method:           r.Method,
-		Path:             r.URL.Path,
-		StatusCode:       resp.StatusCode,
-		DurationMs:       time.Since(start).Milliseconds(),
-		PromptTokens:     prompT,
-		CompletionTokens: compT,
-		TotalTokens:      totalT,
-		Stream:           isStream,
-		Error:            recErr,
-		ContentBytes:     int64(len(body)),
-	})
+	// buffered paths (non-stream, responses stream, wrapback) have tokens
+	// now; log them. true chat passthrough streams below and logs after.
+	deferStream := isStream && resp.StatusCode == http.StatusOK
+	if !deferStream {
+		logUsage(UsageRecord{
+			Ts:               time.Now().UTC().Format(time.RFC3339Nano),
+			Model:            model,
+			KeyName:          "opencode",
+			Method:           r.Method,
+			Path:             r.URL.Path,
+			StatusCode:       resp.StatusCode,
+			DurationMs:       time.Since(start).Milliseconds(),
+			PromptTokens:     prompT,
+			CompletionTokens: compT,
+			TotalTokens:      totalT,
+			Stream:           isStream,
+			Error:            recErr,
+			ContentBytes:     int64(len(body)),
+		})
+	}
 
 	for k, v := range resp.Header {
 		w.Header()[k] = v
@@ -3080,10 +3149,23 @@ func (p *Pool) handleOpenCode(w http.ResponseWriter, r *http.Request, body []byt
 			written = int64(n)
 		} else if fl, ok := w.(http.Flusher); ok {
 			buf := make([]byte, 4096)
+			var carry []byte
 			for {
 				n, err := resp.Body.Read(buf)
 				if n > 0 {
 					w.Write(buf[:n])
+					blk := buf[:n]
+					if len(carry) > 0 {
+						blk = append(carry, buf[:n]...)
+						carry = nil
+					}
+					if p, c := sseUsageTee(blk); p > 0 || c > 0 {
+						prompT, compT = p, c
+					} else if len(blk) > 512 {
+						carry = append(carry[:0], blk[len(blk)-512:]...)
+					} else {
+						carry = append(carry[:0], blk...)
+					}
 					fl.Flush()
 					written += int64(n)
 				}
@@ -3098,11 +3180,43 @@ func (p *Pool) handleOpenCode(w http.ResponseWriter, r *http.Request, body []byt
 		written, _ = io.Copy(w, resp.Body)
 	}
 	resp.Body.Close()
-	acclog.Printf("<- %d %s %s %v %d bytes [opencode]", resp.StatusCode, r.Method, r.URL.Path, time.Since(start).Round(time.Millisecond), written)
+	if deferStream {
+		// stream branches parsed tokens above (responses fold, wrapback
+		// fold, or tee on passthrough); total follows the parsed pair.
+		totalT = prompT + compT
+		logUsage(UsageRecord{
+			Ts:               time.Now().UTC().Format(time.RFC3339Nano),
+			Model:            model,
+			KeyName:          "opencode",
+			Method:           r.Method,
+			Path:             r.URL.Path,
+			StatusCode:       resp.StatusCode,
+			DurationMs:       time.Since(start).Milliseconds(),
+			PromptTokens:     prompT,
+			CompletionTokens: compT,
+			TotalTokens:      totalT,
+			Stream:           true,
+			ContentBytes:     int64(len(body)),
+		})
+	}
+	acclog.Printf("<- %d %s %s %v %d bytes [opencode] model=%s %s", resp.StatusCode, r.Method, r.URL.Path, time.Since(start).Round(time.Millisecond), written, realModel, reqID)
 }
 
 func contains(s, substr string) bool {
 	return strings.Contains(strings.ToLower(s), strings.ToLower(substr))
+}
+
+// zenHeaderForwarded reports whether a client header should be copied onto
+// the zen upstream request. auth-bearing headers are always dropped so the
+// proxy's own credentials never leak to the third-party upstream.
+func zenHeaderForwarded(k string) bool {
+	switch strings.ToLower(k) {
+	case "authorization", "host", "content-type", "accept", "accept-encoding",
+		"connection", "content-length", "user-agent", "cookie", "x-api-key",
+		"x-opencode-client", "x-opencode-session", "x-opencode-request", "x-opencode-project":
+		return false
+	}
+	return true
 }
 
 // stripCacheFields removes anthropic cache fields and proxy-local model
@@ -3425,16 +3539,6 @@ func sseToNonStream(rb []byte, model string, tnames toolNames) []byte {
 
 // hot-reload is handled by watchConfig in config.go now (single file).
 
-func initUsageLog() {
-	f, err := os.OpenFile("nim-usage.jsonl", os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
-	if err != nil {
-		log.Printf("WARN: cannot open nim-usage.jsonl: %v", err)
-		return
-	}
-	usageFd = f
-	usageOut = json.NewEncoder(f)
-}
-
 func serverMain() {
 	initLogging()
 	initUsageLog()
@@ -3508,7 +3612,9 @@ func serverMain() {
 	if !c.Nudge.Enabled {
 		log.Printf("  nudge: disabled")
 	}
-	log.Printf("  Usage tracking -> nim-usage.jsonl")
+	if c.Usage.Enabled {
+		log.Printf("  Usage tracking -> %s", c.Usage.Path)
+	}
 	log.Printf("  Config hot-reload enabled (%s)", cpath)
 	log.Print()
 	log.Printf("Listening on %s", addr)
@@ -3539,9 +3645,7 @@ func serverMain() {
 		<-sig
 		log.Print("shutting down...")
 		srv.Close()
-		if usageFd != nil {
-			usageFd.Close()
-		}
+		closeUsageLog()
 	}()
 
 	if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
@@ -3714,9 +3818,7 @@ func runProbe() {
 	}
 	fmt.Println()
 
-	if usageFd != nil {
-		usageFd.Close()
-	}
+	closeUsageLog()
 }
 
 func main() {

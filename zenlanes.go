@@ -49,6 +49,53 @@ var (
 	lanes   = map[string]*zenLane{}
 )
 
+// exit burns: an exit that 403s FreeTierError for a model is skipped for
+// that model until the burn lapses. per (exit, model), not per exit: a
+// burned-for-pickle exit can still serve space-bunny. without this every
+// lane retries the same fast (and burned) exits and a servable model 403s.
+var (
+	burnMu sync.Mutex
+	burned = map[string]time.Time{}
+)
+
+func burnTTL() time.Duration {
+	if m := cfg().Zen.ExitBurnMinutes; m > 0 {
+		return time.Duration(m) * time.Minute
+	}
+	return 30 * time.Minute
+}
+
+func burnKey(proxy, model string) string { return proxy + "\x00" + model }
+
+// burnExit marks proxy as refusing model until the burn lapses. "" proxy
+// (direct) is not burnable: there is only one direct exit and laneBlock
+// already handles it.
+func burnExit(proxy, model string) {
+	if proxy == "" || model == "" {
+		return
+	}
+	burnMu.Lock()
+	burned[burnKey(proxy, model)] = time.Now().Add(burnTTL())
+	burnMu.Unlock()
+}
+
+func exitBurned(proxy, model string) bool {
+	if proxy == "" || model == "" {
+		return false
+	}
+	burnMu.Lock()
+	defer burnMu.Unlock()
+	until, ok := burned[burnKey(proxy, model)]
+	if !ok {
+		return false
+	}
+	if time.Now().After(until) {
+		delete(burned, burnKey(proxy, model))
+		return false
+	}
+	return true
+}
+
 func laneCap() int {
 	if n := cfg().Zen.Lanes; n > 0 {
 		return n
@@ -79,46 +126,33 @@ func laneRelease() time.Duration {
 }
 
 // laneGate blocks until the lane may send: pacing gap since its previous
-// send, plus any residual cooldown. without pacing a single conversation
-// can fire several requests at one exit inside a second and trip the
-// short-window rate limit. wait is capped so a lane never stalls a
-// request indefinitely.
+// send, plus any residual cooldown. the slot is claimed under the lane lock
+// before sleeping, so concurrent requests are spaced one gap apart instead
+// of all waking together and bursting the same exit. wait is capped so a
+// lane never stalls a request indefinitely.
 func laneGate(l *zenLane) time.Duration {
-	wait := time.Duration(0)
-	if gap := laneMinGap(); gap > 0 {
-		lanesMu.Lock()
-		sent := !l.lastSend.IsZero()
-		since := time.Since(l.lastSend)
-		lanesMu.Unlock()
-		if sent {
-			if w := gap - since; w > 0 {
-				wait = w
-			}
+	now := time.Now()
+	lanesMu.Lock()
+	var wait time.Duration
+	if gap := laneMinGap(); gap > 0 && !l.lastSend.IsZero() {
+		if w := gap - now.Sub(l.lastSend); w > 0 {
+			wait = w
 		}
 	}
-	if w := laneCooldownLeft(l); w > wait {
-		wait = w
+	if cd := l.cooldown.Sub(now); cd > wait {
+		wait = cd
 	}
+	if wait > 10*time.Second {
+		wait = 10 * time.Second
+	}
+	// claim: the next caller's gap is measured from this send's schedule,
+	// so two concurrent callers serialize one gap apart.
+	l.lastSend = now.Add(wait)
+	lanesMu.Unlock()
 	if wait > 0 {
-		if wait > 10*time.Second {
-			wait = 10 * time.Second
-		}
 		time.Sleep(wait)
 	}
-	lanesMu.Lock()
-	l.lastSend = time.Now()
-	lanesMu.Unlock()
 	return wait
-}
-
-// laneCooldownLeft is this lane's own remaining cooldown.
-func laneCooldownLeft(l *zenLane) time.Duration {
-	lanesMu.Lock()
-	defer lanesMu.Unlock()
-	if l.cooldown.IsZero() || time.Now().After(l.cooldown) {
-		return 0
-	}
-	return l.cooldown.Sub(time.Now())
 }
 
 // convoHash fingerprints a conversation from the first user text block and
@@ -274,6 +308,12 @@ func laneCool(l *zenLane) {
 	lanesMu.Lock()
 	l.fails++
 	l.rateLimit++
+	// cap before shifting: an unbounded fails count overflows the duration
+	// after ~31 doublings, producing a negative (past) cooldown and no
+	// backoff at all — the exact opposite of what 429 handling needs.
+	if l.fails > 8 {
+		l.fails = 8
+	}
 	d := laneCooldownBase() << (l.fails - 1)
 	if d > 10*time.Minute {
 		d = 10 * time.Minute
@@ -358,10 +398,14 @@ func laneTouch(l *zenLane, proxy string) {
 }
 
 // pickLaneProxy returns a verified proxy not already pinned by another
-// lane, so lanes actually spread across distinct exits. custom proxies win;
-// otherwise samples the latency-weighted pool and excludes taken exits.
-// "" only when every pool exit is taken or the pool is empty.
-func pickLaneProxy() string {
+// lane and not burned for model, so lanes actually spread across distinct
+// exits. custom proxies win; otherwise samples the latency-weighted pool
+// and excludes taken exits. "" only when every pool exit is taken or the
+// pool is empty.
+func pickLaneProxy() string { return pickLaneProxyFor("") }
+
+// pickLaneProxyFor is pickLaneProxy skipping exits burned for model.
+func pickLaneProxyFor(model string) string {
 	taken := map[string]bool{}
 	lanesMu.Lock()
 	for _, l := range lanes {
@@ -374,7 +418,7 @@ func pickLaneProxy() string {
 	if cps := getCustomProxies(); len(cps) > 0 {
 		var free []string
 		for _, c := range cps {
-			if !taken[c] {
+			if !taken[c] && !exitBurned(c, model) {
 				free = append(free, c)
 			}
 		}
@@ -398,10 +442,10 @@ func pickLaneProxy() string {
 	if q < 1 {
 		q = 1
 	}
-	// prefer untaken exits from the fastest quartile, then the rest.
+	// prefer untaken, unburned exits from the fastest quartile, then rest.
 	var fast, slow []string
 	for _, p := range pool {
-		if taken[p] {
+		if taken[p] || exitBurned(p, model) {
 			continue
 		}
 		if proxyLatency(p) <= proxyLatency(pool[q-1]) {
@@ -437,9 +481,10 @@ func sampleFrom(ss []string, n int) []string {
 }
 
 // laneReproxy swaps a dead exit for a fresh verified one that no other lane
-// holds, keeping the lane session pinned (affinity survives proxy churn).
-func laneReproxy(l *zenLane) string {
-	p := pickLaneProxy()
+// holds and that is not burned for model, keeping the lane session pinned
+// (affinity survives proxy churn).
+func laneReproxy(l *zenLane, model string) string {
+	p := pickLaneProxyFor(model)
 	lanesMu.Lock()
 	defer lanesMu.Unlock()
 	l.proxy = p
@@ -466,8 +511,8 @@ func laneDropProxy(proxyURL string) {
 // free-tier-blocked going direct. without it every lane shares one burned
 // home ip and failover is a no-op: the retry loop re-sends direct and gets
 // the same 403. after escalation laneProxyFor returns this exit.
-func laneEscalate(l *zenLane) string {
-	p := pickLaneProxy()
+func laneEscalate(l *zenLane, model string) string {
+	p := pickLaneProxyFor(model)
 	if p == "" {
 		return ""
 	}
@@ -559,13 +604,11 @@ func redactProxyUserinfo(p string) string {
 		return p
 	}
 	rest := p[i+3:]
+	slash := strings.Index(rest, "/")
 	at := strings.Index(rest, "@")
-	if at < 0 {
-		return p
-	}
-	// only strip when the part before @ is userinfo, not a host with a port
-	head := rest[:at]
-	if !strings.Contains(head, ":") && !strings.Contains(head, "/") {
+	// an @ before the first slash means the authority carries credentials
+	// (user or user:pass) — redact the whole userinfo segment.
+	if at < 0 || (slash >= 0 && slash < at) {
 		return p
 	}
 	return p[:i+3] + "***@" + rest[at+1:]
@@ -629,21 +672,30 @@ func laneFailover(l *zenLane) *zenLane {
 // laneProxyFor returns the lane's pinned proxy, verifying and (re)picking
 // when empty or dead. "" means direct, which is correct on a cold lane when
 // always_proxy is off; once a lane has been escalated (direct got limited)
-// the pinned exit is returned regardless of that setting.
-func laneProxyFor(l *zenLane) string {
+// the pinned exit is returned regardless of that setting. repicks skip
+// exits burned for model.
+func laneProxyFor(l *zenLane, model string) string {
 	lanesMu.Lock()
 	p := l.proxy
 	escalated := l.escalated
 	lanesMu.Unlock()
 	if p != "" {
-		if probeProxyFull(p, time.Second) {
+		if !exitBurned(p, model) && probeProxyFull(p, time.Second) {
 			return p
 		}
-		dropProxy(p)
-		laneDropProxy(p)
+		if exitBurned(p, model) {
+			lanesMu.Lock()
+			if l.proxy == p {
+				l.proxy = ""
+			}
+			lanesMu.Unlock()
+		} else {
+			dropProxy(p)
+			laneDropProxy(p)
+		}
 	}
 	if !cfg().Zen.AlwaysProxy && !escalated {
 		return ""
 	}
-	return laneReproxy(l)
+	return laneReproxy(l, model)
 }

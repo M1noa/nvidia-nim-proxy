@@ -211,7 +211,7 @@ func TestPickAvoidsPenalized(t *testing.T) {
 
 	counts := map[string]int{}
 	for i := 0; i < 30000; i++ {
-		k := p.Pick(nil, "m")
+		k := p.PickSticky(nil, "m", "")
 		counts[k.Name]++
 	}
 	// once LastUsed self-resets in the tight loop, clean and hot both sit at the
@@ -1773,6 +1773,56 @@ func resetLanes() {
 	lanes = map[string]*zenLane{}
 }
 
+func resetBurns() {
+	burnMu.Lock()
+	defer burnMu.Unlock()
+	burned = map[string]time.Time{}
+}
+
+// a burned exit is skipped for that model but still serves others.
+func TestBurnExitPerModel(t *testing.T) {
+	resetLanes()
+	defer resetLanes()
+	resetBurns()
+	defer resetBurns()
+	zenProxiesMu.Lock()
+	zenProxies = []string{"http://10.0.0.1:1", "http://10.0.0.2:2"}
+	zenProxiesMu.Unlock()
+	defer func() {
+		zenProxiesMu.Lock()
+		zenProxies = nil
+		zenProxiesMu.Unlock()
+	}()
+	c := testConfig()
+	c.Zen.AlwaysProxy = true
+	c.Zen.ExitBurnMinutes = 30
+	applyConfig(c)
+	defer applyConfig(testConfig())
+
+	burnExit("http://10.0.0.1:1", "big-pickle")
+	if !exitBurned("http://10.0.0.1:1", "big-pickle") {
+		t.Fatal("burned exit should report burned")
+	}
+	if exitBurned("http://10.0.0.1:1", "space-bunny-free") {
+		t.Fatal("burn must not leak to other models")
+	}
+	if exitBurned("http://10.0.0.2:2", "big-pickle") {
+		t.Fatal("burn must not leak to other exits")
+	}
+	// burned exit never picked for its model; other model may still get it.
+	for i := 0; i < 10; i++ {
+		if p := pickLaneProxyFor("big-pickle"); p == "http://10.0.0.1:1" {
+			t.Fatalf("burned exit picked for burned model: %s", p)
+		}
+	}
+	// empty proxy/model never burns.
+	burnExit("", "big-pickle")
+	burnExit("http://10.0.0.1:1", "")
+	if exitBurned("", "big-pickle") || len(burned) != 1 {
+		t.Fatalf("empty proxy/model must not burn: %v", burned)
+	}
+}
+
 func TestLaneHeaderPinning(t *testing.T) {
 	resetLanes()
 	defer resetLanes()
@@ -1791,6 +1841,7 @@ func TestLaneHeaderPinning(t *testing.T) {
 func TestRedactProxyUserinfo(t *testing.T) {
 	cases := map[string]string{
 		"http://user:pass@host:8080": "http://***@host:8080",
+		"http://user@host:8080":      "http://***@host:8080", // no password, still creds
 		"http://host:8080":           "http://host:8080",
 		"socks5://u:p@1.2.3.4:1080":  "socks5://***@1.2.3.4:1080",
 		"":                           "",
@@ -1930,7 +1981,7 @@ func TestPickLaneProxyDistinct(t *testing.T) {
 		lanesMu.Lock()
 		lanes["t:"+l.session] = l
 		lanesMu.Unlock()
-		p := laneReproxy(l) // pins the pick on the lane
+		p := laneReproxy(l, "") // pins the pick on the lane
 		if p == "" {
 			t.Fatalf("lane %d got no proxy while pool had untaken exits", i)
 		}
@@ -1978,15 +2029,15 @@ func TestLaneEscalateFromDirect(t *testing.T) {
 	applyConfig(c)
 	defer applyConfig(testConfig())
 	l := laneFor("esc-1", []byte(`{"messages":[{"role":"user","content":"esc"}]}`))
-	if p := laneProxyFor(l); p != "" {
+	if p := laneProxyFor(l, ""); p != "" {
 		t.Fatalf("cold lane must be direct with always_proxy off, got %q", p)
 	}
 	// escalation pins a distinct exit, and it is honored afterward.
-	got := laneEscalate(l)
+	got := laneEscalate(l, "")
 	if got == "" {
 		t.Skip("no verified pool available to escalate onto")
 	}
-	if p := laneProxyFor(l); p == "" {
+	if p := laneProxyFor(l, ""); p == "" {
 		t.Fatal("escalated lane must keep its pinned proxy")
 	}
 }

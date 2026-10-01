@@ -1280,7 +1280,7 @@ func handleClassifier(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-func (p *Pool) handleAnthropic(w http.ResponseWriter, r *http.Request, start time.Time) {
+func (p *Pool) handleAnthropic(w http.ResponseWriter, r *http.Request, start time.Time, reqID string) {
 	w.Header().Set("Access-Control-Allow-Origin", "*")
 	w.Header().Set("Access-Control-Allow-Headers", "*")
 	w.Header().Set("Access-Control-Allow-Methods", "*")
@@ -1319,6 +1319,9 @@ func (p *Pool) handleAnthropic(w http.ResponseWriter, r *http.Request, start tim
 		return
 	}
 
+	if p.sem != nil && len(p.sem) == cap(p.sem) {
+		acclog.Printf("%s ... all %d slots busy, queueing", reqID, cap(p.sem))
+	}
 	p.sem <- struct{}{}
 	p.concurrent.Add(1)
 	defer func() {
@@ -1332,7 +1335,7 @@ func (p *Pool) handleAnthropic(w http.ResponseWriter, r *http.Request, start tim
 		return
 	}
 
-	acclog.Printf("-> POST /v1/messages model=%s upstream=%s stream=%v bytes=%d", clientModel, upstreamModel, isStream, len(oaiBody))
+	acclog.Printf("%s -> POST /v1/messages model=%s upstream=%s stream=%v bytes=%d", reqID, clientModel, upstreamModel, isStream, len(oaiBody))
 
 	// Route opencode/* models to zen endpoint
 	if strings.HasPrefix(upstreamModel, "opencode/") {
@@ -1341,7 +1344,10 @@ func (p *Pool) handleAnthropic(w http.ResponseWriter, r *http.Request, start tim
 			writeAnthropicError(w, http.StatusServiceUnavailable, "api_error", "opencode zen is disabled; set zen.enabled: true in config.yml")
 			return
 		}
-		p.handleOpenCodeAnthropic(w, r, body, oaiBody, clientModel, upstreamModel, tnames, isStream, start)
+		p.concurrentZen.Add(1)
+		defer p.concurrentZen.Add(-1)
+		acclog.Printf("%s routed to opencode model=%s", reqID, upstreamModel)
+		p.handleOpenCodeAnthropic(w, r, body, oaiBody, clientModel, upstreamModel, tnames, isStream, start, reqID)
 		return
 	}
 
@@ -1366,6 +1372,9 @@ func (p *Pool) handleAnthropic(w http.ResponseWriter, r *http.Request, start tim
 	}
 
 	target := nvidiaBase + "/chat/completions"
+	acclog.Printf("%s routed to nvidia target=%s model=%s", reqID, target, upstreamModel)
+	p.concurrentNV.Add(1)
+	defer p.concurrentNV.Add(-1)
 	fwd := http.Header{
 		"Content-Type": {"application/json"},
 		"Accept":       {"application/json"},
@@ -1532,6 +1541,9 @@ func extractErrMessage(body string) string {
 		return errStr.Error
 	}
 	msg := strings.TrimSpace(body)
+	if msg == "" {
+		msg = "upstream error with empty body"
+	}
 	if len(msg) > 200 {
 		msg = msg[:200]
 	}
@@ -1560,10 +1572,10 @@ func randBase62(n int) string {
 // per-ms counter, 6 bytes big-endian hex (complemented when descending),
 // plus 14 base62 random chars from crypto bytes % 62.
 var (
-	zenIDMu        sync.Mutex
-	zenIDLastTs    int64
-	zenIDCounter   int64
-	zenIDMask      int64 = 0xFFFFFFFFFFFF
+	zenIDMu      sync.Mutex
+	zenIDLastTs  int64
+	zenIDCounter int64
+	zenIDMask    int64 = 0xFFFFFFFFFFFF
 )
 
 func zenID(descending bool) string {
@@ -1614,7 +1626,7 @@ func setZenHeaders(req *http.Request, sessionID string) {
 	req.Header.Set("x-opencode-session", sessionID)
 	req.Header.Set("x-opencode-request", zenMsgID())
 	req.Header.Set("x-opencode-project", "global")
-	req.Header.Set("User-Agent", "opencode/"+zenVersion)
+	req.Header.Set("User-Agent", "opencode/"+zenVersionStr())
 	req.Header.Set("Accept", "*/*")
 	// opencode's @ai-sdk/anthropic client sends this on every zen request.
 	// the anonymous free tier fingerprints it, so omitting it can surface as
@@ -1647,10 +1659,11 @@ func estimateTokens(body []byte) int {
 }
 
 // handleOpenCodeAnthropic routes opencode/* models through the zen endpoint.
-func (p *Pool) handleOpenCodeAnthropic(w http.ResponseWriter, r *http.Request, origBody, oaiBody []byte, clientModel, upstreamModel string, tnames toolNames, isStream bool, start time.Time) {
+func (p *Pool) handleOpenCodeAnthropic(w http.ResponseWriter, r *http.Request, origBody, oaiBody []byte, clientModel, upstreamModel string, tnames toolNames, isStream bool, start time.Time, reqID string) {
 	zenModel := strings.TrimPrefix(upstreamModel, "opencode/")
 	endpoint := endpointForModel(zenModel)
 	isResponses := endpoint == "/responses"
+	acclog.Printf("%s routed to opencode model=%s endpoint=%s", reqID, zenModel, endpoint)
 
 	var m map[string]any
 	if json.Unmarshal(oaiBody, &m) == nil {
@@ -1708,16 +1721,26 @@ func (p *Pool) handleOpenCodeAnthropic(w http.ResponseWriter, r *http.Request, o
 			}
 			proxy := ""
 			if zenRetries == 0 {
-				proxy = laneProxyFor(lane)
-				cl = zenClient(proxy)
-				lastProxy = proxy
-			} else if rotating {
-				proxy = laneProxyFor(lane)
+				proxy = laneProxyFor(lane, zenModel)
 				if proxy == "" && cfg().Zen.AlwaysProxy {
 					if nl := laneFailover(lane); nl != nil {
 						lane = nl
 						sessionID = laneSession(lane)
-						proxy = laneProxyFor(lane)
+						proxy = laneProxyFor(lane, zenModel)
+					}
+					if proxy == "" {
+						return nil
+					}
+				}
+				cl = zenClient(proxy)
+				lastProxy = proxy
+			} else if rotating {
+				proxy = laneProxyFor(lane, zenModel)
+				if proxy == "" && cfg().Zen.AlwaysProxy {
+					if nl := laneFailover(lane); nl != nil {
+						lane = nl
+						sessionID = laneSession(lane)
+						proxy = laneProxyFor(lane, zenModel)
 					}
 				}
 				if proxy == "" && cfg().Zen.AlwaysProxy {
@@ -1761,7 +1784,7 @@ func (p *Pool) handleOpenCodeAnthropic(w http.ResponseWriter, r *http.Request, o
 				acclog.Printf("  opencode rate-limited %d (retry %d/4) model=%s country=%s proxy=%s %s lane=%s, cooling lane",
 					up.StatusCode, zenRetries, clientModel, proxyCountry(proxy), proxy, tag, lane.id)
 				if proxy == "" {
-					laneEscalate(lane) // direct got limited: give the lane an exit
+					laneEscalate(lane, zenModel) // direct got limited: give the lane an exit
 				}
 				laneCool(lane)
 				if nl := laneFailover(lane); nl != nil {
@@ -1827,8 +1850,9 @@ func (p *Pool) handleOpenCodeAnthropic(w http.ResponseWriter, r *http.Request, o
 					acclog.Printf("  opencode free-tier-blocked %d (retry %d/4) model=%s country=%s proxy=%s %s lane=%s, switching lane",
 						up.StatusCode, zenRetries, clientModel, proxyCountry(proxy), proxy, tag, lane.id)
 					dropProxy(proxy)
+					burnExit(proxy, zenModel)
 					if proxy == "" {
-						laneEscalate(lane) // direct is flagged: give the lane an exit
+						laneEscalate(lane, zenModel) // direct is flagged: give the lane an exit
 					}
 					laneBlock(lane)
 					if nl := laneFailover(lane); nl != nil {
@@ -1930,7 +1954,7 @@ func (p *Pool) handleOpenCodeAnthropic(w http.ResponseWriter, r *http.Request, o
 			Stream:           true,
 			ContentBytes:     int64(len(origBody)),
 		})
-		acclog.Printf("<- 200 POST /v1/messages %v %d bytes [opencode]", elapsed.Round(time.Millisecond), written)
+		acclog.Printf("<- 200 POST /v1/messages %v %d bytes [opencode] model=%s %s", elapsed.Round(time.Millisecond), written, clientModel, reqID)
 	} else {
 		rb, _ := io.ReadAll(resp.Body)
 		if os.Getenv("ZEN_DUMP") != "" {
@@ -1993,6 +2017,6 @@ func (p *Pool) handleOpenCodeAnthropic(w http.ResponseWriter, r *http.Request, o
 			Stream:           false,
 			ContentBytes:     int64(len(origBody)),
 		})
-		acclog.Printf("<- 200 POST /v1/messages %v %d bytes [opencode]", elapsed.Round(time.Millisecond), len(out))
+		acclog.Printf("<- 200 POST /v1/messages %v %d bytes [opencode] model=%s %s", elapsed.Round(time.Millisecond), len(out), clientModel, reqID)
 	}
 }

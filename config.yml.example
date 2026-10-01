@@ -175,6 +175,10 @@ zen:
   # refresh the whole pool once this many lanes hit 429 since the last
   # refresh (distinct exits all limited = stale pool). 0 disables.
   pool_refresh_429s: 2
+  # an exit that 403s FreeTierError for a model is skipped for that model
+  # for this long (minutes). per (exit, model): the exit can still serve
+  # other models. 0 disables (never burn, old behavior).
+  exit_burn_minutes: 30
 
 # --- freebuff (planned, disabled. see FREEBUFF-PLAN.md) ---
 # privacy: every proxied prompt leaves this machine. short version, full
@@ -218,6 +222,17 @@ status:
   show_opencode_models: true  # free model list (just ids, always safe)
   show_zen: true              # last session (partial) + proxy + ago
   show_locks: true            # per-key model lockouts
+  show_usage: true            # request + token totals from usage tracking
+
+# --- usage: per-request token tracker ---
+# every model request appends one json line (model, tokens, latency,
+# status) and bumps in-memory totals shown in /status under "usage".
+# query the file with duckdb, no driver needed:
+#   select model, count(*), sum(total_tokens)
+#   from read_json('nim-usage.jsonl') group by 1;
+usage:
+  enabled: true             # false = no file, no counters, zero overhead
+  path: "nim-usage.jsonl"   # relative to the working dir
 
 # --- models ---
 models:

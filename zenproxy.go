@@ -61,7 +61,18 @@ var (
 
 // zenVersion is the opencode release tag reported in the User-Agent. Defaults
 // to 1.18.31 and is refreshed from GitHub on startup and every 6h after.
-var zenVersion = "1.18.31"
+// guarded by a mutex: the refresher goroutine writes it while request
+// goroutines read it for every zen request.
+var (
+	zenVersionMu sync.RWMutex
+	zenVersion   = "1.18.31"
+)
+
+func zenVersionStr() string {
+	zenVersionMu.RLock()
+	defer zenVersionMu.RUnlock()
+	return zenVersion
+}
 
 // fetchOpenCodeVersion pulls the latest opencode release tag from the GitHub
 // API, falling back to the default on any error.
@@ -79,9 +90,14 @@ func fetchOpenCodeVersion() {
 		return
 	}
 	v := strings.TrimPrefix(strings.TrimSpace(r.TagName), "v")
-	if v != "" && v != zenVersion {
+	if v != "" {
+		zenVersionMu.Lock()
+		changed := v != zenVersion
 		zenVersion = v
-		log.Printf("  opencode version: %s", v)
+		zenVersionMu.Unlock()
+		if changed {
+			log.Printf("  opencode version: %s", v)
+		}
 	}
 }
 
@@ -374,14 +390,19 @@ func dropProxy(proxyURL string) {
 		return
 	}
 	zenProxiesMu.Lock()
-	defer zenProxiesMu.Unlock()
+	found := false
 	for i, p := range zenProxies {
 		if p == proxyURL {
 			zenProxies = append(zenProxies[:i], zenProxies[i+1:]...)
+			found = true
 			log.Printf("  zen proxies: dropped %s (left %d)", proxyURL, len(zenProxies))
-			laneDropProxy(proxyURL)
-			return
+			break
 		}
+	}
+	zenProxiesMu.Unlock()
+	if found {
+		laneDropProxy(proxyURL)
+		closeZenTransport(proxyURL)
 	}
 }
 
@@ -568,19 +589,27 @@ func watchZenProxies() {
 	}
 }
 
-// zenClient builds a client routing via proxyURL, or direct if ""/bad.
-func zenClient(proxyURL string) *http.Client {
-	if proxyURL == "" {
-		return &http.Client{Timeout: 300 * time.Second}
-	}
-	pu, err := url.Parse(proxyURL)
-	if err != nil {
-		return &http.Client{Timeout: 300 * time.Second}
+// zenTransports caches one transport per proxy. building a fresh transport
+// per client leaked its idle connections (and fds) until gc on every request;
+// transports are safe for concurrent use, so sharing per-proxy is correct.
+var (
+	zenTransportMu sync.Mutex
+	zenTransports  = map[string]*http.Transport{}
+)
+
+// zenTransport returns the cached transport for proxyURL, building it on
+// first use. pu must be a valid parse of proxyURL.
+func zenTransport(proxyURL string, pu *url.URL) *http.Transport {
+	zenTransportMu.Lock()
+	defer zenTransportMu.Unlock()
+	if tr, ok := zenTransports[proxyURL]; ok {
+		return tr
 	}
 	tr := http.DefaultTransport.(*http.Transport).Clone()
 	tr.TLSHandshakeTimeout = 10 * time.Second
 	tr.ResponseHeaderTimeout = 30 * time.Second
 	tr.ExpectContinueTimeout = 1 * time.Second
+	tr.MaxIdleConnsPerHost = 4
 	dialer := &net.Dialer{Timeout: 10 * time.Second, KeepAlive: 30 * time.Second}
 	switch pu.Scheme {
 	case "socks4":
@@ -601,7 +630,30 @@ func zenClient(proxyURL string) *http.Client {
 		tr.Proxy = http.ProxyURL(pu)
 		tr.DialContext = dialer.DialContext
 	}
-	return &http.Client{Timeout: 120 * time.Second, Transport: tr}
+	zenTransports[proxyURL] = tr
+	return tr
+}
+
+// closeZenTransport drops a proxy's cached transport and its idle conns.
+func closeZenTransport(proxyURL string) {
+	zenTransportMu.Lock()
+	if tr, ok := zenTransports[proxyURL]; ok {
+		delete(zenTransports, proxyURL)
+		tr.CloseIdleConnections()
+	}
+	zenTransportMu.Unlock()
+}
+
+// zenClient builds a client routing via proxyURL, or direct if ""/bad.
+func zenClient(proxyURL string) *http.Client {
+	if proxyURL == "" {
+		return &http.Client{Timeout: 300 * time.Second}
+	}
+	pu, err := url.Parse(proxyURL)
+	if err != nil {
+		return &http.Client{Timeout: 300 * time.Second}
+	}
+	return &http.Client{Timeout: 120 * time.Second, Transport: zenTransport(proxyURL, pu)}
 }
 
 // socks4Dial connects to proxyAddr and requests a SOCKS4/SOCKS4a CONNECT to addr.
