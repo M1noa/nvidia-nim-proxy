@@ -1003,6 +1003,49 @@ func TestConvertUserMessageCarriesImage(t *testing.T) {
 	}
 }
 
+// an image-only tool_result has no text part to flatten. falling back to the
+// raw json pastes a base64 data url into the role:"tool" content, which zen's
+// /chat/completions models reject with a bare [invalid_request_error]. the
+// image must survive as a trailing multimodal user message instead.
+func TestToolResultImageOnlyBecomesUserImage(t *testing.T) {
+	raw := json.RawMessage(`[{"type":"tool_result","tool_use_id":"toolu_01","content":[
+		{"type":"image","source":{"type":"base64","media_type":"image/png","data":"aGVsbG8="}}]}]`)
+	msgs := convertUserMessage(raw)
+	if len(msgs) != 2 {
+		t.Fatalf("want tool msg + user image msg, got %d: %v", len(msgs), msgs)
+	}
+	if msgs[0]["role"] != "tool" {
+		t.Fatalf("first msg should be the tool result: %v", msgs[0])
+	}
+	if c, _ := msgs[0]["content"].(string); c != "" {
+		t.Fatalf("raw image json leaked into tool content: %q", c)
+	}
+	if msgs[1]["role"] != "user" {
+		t.Fatalf("second msg should be user: %v", msgs[1])
+	}
+	arr, ok := msgs[1]["content"].([]any)
+	if !ok {
+		t.Fatalf("user msg should carry image parts, got %T", msgs[1]["content"])
+	}
+	pm, _ := arr[0].(map[string]any)
+	iu, _ := pm["image_url"].(map[string]any)
+	if pm["type"] != "image_url" || iu["url"] != "data:image/png;base64,aGVsbG8=" {
+		t.Fatalf("image not carried: %v", arr)
+	}
+
+	// a text part alongside the image stays on the tool message.
+	raw = json.RawMessage(`[{"type":"tool_result","tool_use_id":"toolu_01","content":[
+		{"type":"text","text":"shot saved"},
+		{"type":"image","source":{"type":"base64","media_type":"image/png","data":"aGVsbG8="}}]}]`)
+	msgs = convertUserMessage(raw)
+	if c, _ := msgs[0]["content"].(string); c != "shot saved" {
+		t.Fatalf("text part lost: %q", c)
+	}
+	if b, _ := json.Marshal(msgs); !strings.Contains(string(b), "aGVsbG8=") {
+		t.Fatalf("image dropped alongside text: %s", b)
+	}
+}
+
 func TestKeylessServesOpencodeOnly(t *testing.T) {
 	p := newPool(map[string]string{})
 
@@ -1119,6 +1162,63 @@ func TestConvertToResponsesCarriesImage(t *testing.T) {
 	}
 	if !found {
 		t.Fatalf("input_image lost: %v", arr)
+	}
+}
+
+// anySlice widens a typed message slice for the generic convertToResponses.
+func anySlice(msgs []map[string]any) []any {
+	out := make([]any, len(msgs))
+	for i, m := range msgs {
+		out[i] = m
+	}
+	return out
+}
+
+// a screenshot arriving as a tool_result must survive on both zen paths:
+// image_url on /chat/completions, input_image on /responses, and never as raw
+// json inside the tool message's text channel.
+func TestToolResultImageSurvivesBothZenPaths(t *testing.T) {
+	const b64 = "aGVsbG8="
+	raw := json.RawMessage(`[{"type":"text","text":"take a screenshot"},
+		{"type":"tool_use","id":"toolu_01","name":"shot","input":{}},
+		{"type":"tool_result","tool_use_id":"toolu_01","content":[
+			{"type":"image","source":{"type":"base64","media_type":"image/png","data":"` + b64 + `"}}]}]`)
+	msgs := convertUserMessage(raw)
+
+	var chatHasImage bool
+	for _, m := range msgs {
+		if m["role"] == "tool" {
+			if c, _ := m["content"].(string); strings.Contains(c, b64) {
+				t.Fatalf("base64 leaked into tool content: %q", c)
+			}
+		}
+		if arr, ok := m["content"].([]any); ok {
+			for _, p := range arr {
+				pm, _ := p.(map[string]any)
+				iu, _ := pm["image_url"].(map[string]any)
+				if u, _ := iu["url"].(string); u == "data:image/png;base64,"+b64 {
+					chatHasImage = true
+				}
+			}
+		}
+	}
+	if !chatHasImage {
+		t.Fatalf("chat path lost the image: %v", msgs)
+	}
+
+	oai := map[string]any{"messages": anySlice(msgs)}
+	convertToResponses(oai)
+	b, _ := json.Marshal(oai["input"])
+	if !strings.Contains(string(b), "input_image") || !strings.Contains(string(b), b64) {
+		t.Fatalf("responses path lost the image: %s", b)
+	}
+	for _, it := range oai["input"].([]any) {
+		m, _ := it.(map[string]any)
+		if m["type"] == "function_call_output" {
+			if out, _ := m["output"].(string); strings.Contains(out, b64) {
+				t.Fatalf("base64 leaked into function_call_output: %q", out)
+			}
+		}
 	}
 }
 

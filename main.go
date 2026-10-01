@@ -511,6 +511,7 @@ func (p *Pool) noteZenSuccess(session, proxy string) {
 	p.lastZenProxy = proxy
 	p.lastZenAt = time.Now()
 	p.mu.Unlock()
+	noteZenSuccessAt()
 }
 
 var (
@@ -2550,7 +2551,12 @@ func (p *Pool) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	fwd := http.Header{}
 	for k, v := range r.Header {
 		lk := strings.ToLower(k)
-		if lk == "authorization" || lk == "host" || lk == "origin" || lk == "cookie" {
+		// auth + internal headers never reach nim: x-api-key is the
+		// proxy credential (audit: leaked to upstream pre-fix),
+		// x-session-id selects pii/lane state and would link the
+		// client across requests for the upstream.
+		if lk == "authorization" || lk == "host" || lk == "origin" || lk == "cookie" ||
+			lk == "x-api-key" || lk == "x-session-id" {
 			continue
 		}
 		fwd[k] = v
@@ -2868,7 +2874,9 @@ func (p *Pool) handleOpenCode(w http.ResponseWriter, r *http.Request, body []byt
 				lane = nl
 				sessionID = laneSession(lane)
 			} else if zenRetries > 0 {
-				if wait := laneWait(); wait > 0 {
+				if maybeRefreshStalePool() {
+					sessionID = laneSession(lane)
+				} else if wait := laneWait(); wait > 0 {
 					acclog.Printf("  opencode all lanes cooling, waiting %v (retry %d/4)", wait, zenRetries)
 					time.Sleep(wait)
 				}

@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"strings"
 	"sync"
+	"time"
 )
 
 // scanner: paragraph-chunked detection with an lru span cache, scope-limited
@@ -17,6 +18,9 @@ type cacheEntry struct {
 	key   string
 	spans []Span
 	elem  *list.Element
+	// lastAccess stamps the last hit/put, so the sweep can evict
+	// entries idle past the scan-cache ttl (vault entries live longer).
+	lastAccess time.Time
 }
 
 type ScanCache struct {
@@ -48,6 +52,7 @@ func (c *ScanCache) get(key string) ([]Span, bool) {
 	defer c.mu.Unlock()
 	if e, ok := c.items[key]; ok {
 		c.lru.MoveToFront(e.elem)
+		e.lastAccess = time.Now()
 		c.Hits++
 		return e.spans, true
 	}
@@ -60,10 +65,11 @@ func (c *ScanCache) put(key string, spans []Span) {
 	defer c.mu.Unlock()
 	if e, ok := c.items[key]; ok {
 		e.spans = spans
+		e.lastAccess = time.Now()
 		c.lru.MoveToFront(e.elem)
 		return
 	}
-	e := &cacheEntry{key: key, spans: spans}
+	e := &cacheEntry{key: key, spans: spans, lastAccess: time.Now()}
 	e.elem = c.lru.PushFront(key)
 	c.items[key] = e
 	for c.lru.Len() > c.max {
@@ -76,6 +82,26 @@ func (c *ScanCache) put(key string, spans []Span) {
 	}
 }
 
+// sweepIdle evicts entries untouched for longer than ttl. the vault keeps
+// its own (longer) ttl: evicting a scan entry never evicts vault entries.
+func (c *ScanCache) sweepIdle(ttl time.Duration) int {
+	if ttl <= 0 {
+		return 0
+	}
+	cutoff := time.Now().Add(-ttl)
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	n := 0
+	for k, e := range c.items {
+		if e.lastAccess.Before(cutoff) {
+			delete(c.items, k)
+			c.lru.Remove(e.elem)
+			n++
+		}
+	}
+	return n
+}
+
 type Detector func(text string) []Span
 
 type Scanner struct {
@@ -84,6 +110,17 @@ type Scanner struct {
 	Keep      map[Label]bool
 	Ver       string
 	Timeout   int // reserved for ner timeout ms
+	// Replacements maps lowercased entity spellings to a fixed
+	// surrogate, bypassing the vault when set.
+	Replacements map[string]string
+}
+
+// surrogateFor returns a fixed replacement for entity spellings, else "".
+func (s *Scanner) surrogateFor(orig string) string {
+	if len(s.Replacements) == 0 {
+		return ""
+	}
+	return s.Replacements[strings.ToLower(strings.TrimSpace(orig))]
 }
 
 func splitParagraphs(s string) []string {
@@ -122,7 +159,10 @@ func (s *Scanner) detect(text string) []Span {
 func (s *Scanner) maskText(text string, v *Vault) string {
 	spans := applyPolicy(s.detect(text), s.Keep)
 	for _, sp := range spans {
-		surr := v.For(sp.Label, text[sp.Start:sp.End])
+		surr := s.surrogateFor(text[sp.Start:sp.End])
+		if surr == "" {
+			surr = v.For(sp.Label, text[sp.Start:sp.End])
+		}
 		text = text[:sp.Start] + surr + text[sp.End:]
 	}
 	return text
@@ -175,7 +215,10 @@ func (s *Scanner) maskBody(body []byte, v *Vault, includeSystem bool) []byte {
 	model, _ := topModel(text)
 	for _, sp := range spans {
 		orig := text[sp.Start:sp.End]
-		surr := v.For(sp.Label, orig)
+		surr := s.surrogateFor(orig)
+		if surr == "" {
+			surr = v.For(sp.Label, orig)
+		}
 		text = text[:sp.Start] + surr + text[sp.End:]
 		// shift later zones/spans: recompute by re-walking is costly;
 		// spans are right-to-left so earlier offsets stay valid.

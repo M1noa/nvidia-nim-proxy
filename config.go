@@ -117,6 +117,10 @@ type zenConfig struct {
 	Lanes            int      `yaml:"lanes"`
 	LaneTTLMinutes   int      `yaml:"lane_ttl_minutes"`
 	LaneCooldownSecs int      `yaml:"lane_cooldown_secs"`
+	// SessionIdleMinutes drops lanes idle past this (minutes) on the pool
+	// sweep, clearing the session hash/id from cache. lane_ttl_minutes
+	// stays the hard cap. 0 disables (ttl only).
+	SessionIdleMinutes int `yaml:"session_idle_minutes"`
 	// LaneMinGapMs paces a lane: a request waits until this long since the
 	// lane's previous send. 0 disables pacing (reactive cooldown only).
 	LaneMinGapMs int `yaml:"lane_min_gap_ms"`
@@ -237,9 +241,10 @@ func defaultConfig() appConfig {
 			BlockedCountries: []string{"PK", "RU", "VE", "HK", "BY", "TJ", "IQ", "MM"},
 			MaxResponseMs:    400,
 			PoolSize:         400,
-			Lanes:            5,
+			Lanes:            8,
 			LaneTTLMinutes:   30,
 			LaneCooldownSecs: 60,
+			SessionIdleMinutes: 6,
 			LaneMinGapMs:     1500,
 			LaneReleaseSecs:  90,
 			PoolRefresh429s:  2,

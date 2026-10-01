@@ -3,6 +3,7 @@ package pii
 import (
 	"strings"
 	"testing"
+	"time"
 )
 
 func testGuard() *Guard {
@@ -111,5 +112,87 @@ func BenchmarkDetect(b *testing.B) {
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
 		detectHeuristics(text)
+	}
+}
+
+func TestScanSweepIdle(t *testing.T) {
+	g := testGuard()
+	g.scanner.maskText("history line with minoa here", g.vault)
+	if len(g.scanner.Cache.items) == 0 {
+		t.Fatal("want cached entries after scan")
+	}
+	// fresh entries survive a long ttl.
+	if n := g.scanner.Cache.sweepIdle(time.Hour); n != 0 {
+		t.Fatalf("fresh entries swept: %d", n)
+	}
+	// backdate access, then sweep evicts.
+	for _, e := range g.scanner.Cache.items {
+		e.lastAccess = time.Now().Add(-time.Hour)
+	}
+	if n := g.scanner.Cache.sweepIdle(time.Minute); n == 0 {
+		t.Fatal("stale entries must be swept")
+	}
+	if len(g.scanner.Cache.items) != 0 {
+		t.Fatalf("want empty cache, got %d", len(g.scanner.Cache.items))
+	}
+	// vault entries survive the scan sweep (different ttls).
+	if len(g.vault.Surrogates()) == 0 {
+		t.Fatal("vault must keep surrogates after scan sweep")
+	}
+}
+
+func TestEntityReplacement(t *testing.T) {
+	g := build(Config{
+		Enabled: true, DetectPII: true,
+		Entities: []CustomTerm{{Name: "minoa", Type: "name", Replacement: "REDACTED_X"}},
+	}, "test-repl")
+	masked := string(g.MaskBody([]byte(`{"model":"x","messages":[{"role":"user","content":"hi minoa"}]}`)))
+	if strings.Contains(masked, "minoa") {
+		t.Fatalf("entity leaked: %s", masked)
+	}
+	if !strings.Contains(masked, "REDACTED_X") {
+		t.Fatalf("replacement not used: %s", masked)
+	}
+	back := string(g.RestoreBody([]byte(masked)))
+	if !strings.Contains(back, "minoa") {
+		t.Fatalf("replacement not restored: %s", back)
+	}
+}
+
+func TestModeRoundTrips(t *testing.T) {
+	body := `{"model":"x","messages":[{"role":"user","content":"hi minoa, ssn 472-81-0094"}]}`
+	for _, mode := range []string{"realistic", "variable", "label"} {
+		g := build(Config{
+			Enabled: true, Mode: mode, DetectPII: true,
+			Entities: []CustomTerm{{Name: "minoa"}},
+		}, "test-mode-"+mode)
+		masked := string(g.MaskBody([]byte(body)))
+		if strings.Contains(masked, "minoa") || strings.Contains(masked, "472-81-0094") {
+			t.Fatalf("mode %s leaked: %s", mode, masked)
+		}
+		if mode == "variable" && !strings.Contains(masked, "{") {
+			t.Fatalf("mode %s: want {TYPE_N} placeholder, got %s", mode, masked)
+		}
+		if mode == "label" && !strings.Contains(masked, "[") {
+			t.Fatalf("mode %s: want [LABEL_N] placeholder, got %s", mode, masked)
+		}
+		if back := string(g.RestoreBody([]byte(masked))); back != body {
+			t.Fatalf("mode %s round trip mismatch:\n got %s\nwant %s", mode, back, body)
+		}
+	}
+}
+
+func TestEntitiesWinOverTerms(t *testing.T) {
+	d := NewCustomDetector(
+		[]string{"york"}, // flat term, substring of the entity name
+		[]CustomTerm{{Name: "new york", Type: "city"}},
+		0.95,
+	)
+	spans := applyPolicy(d("visit new york soon"), nil)
+	if len(spans) != 1 {
+		t.Fatalf("want 1 merged span, got %v", spans)
+	}
+	if spans[0].Source != "custom-entity" {
+		t.Fatalf("entity must win overlap, got %+v", spans[0])
 	}
 }

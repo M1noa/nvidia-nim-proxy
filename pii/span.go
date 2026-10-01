@@ -96,6 +96,11 @@ func prefer(a, b Span) bool {
 	if a.Score != b.Score {
 		return a.Score > b.Score
 	}
+	// entities win over flat terms on overlap (documented precedence).
+	ae, be := a.Source == "custom-entity", b.Source == "custom-entity"
+	if ae != be {
+		return ae
+	}
 	la, lb := a.End-a.Start, b.End-b.Start
 	if la != lb {
 		return la > lb

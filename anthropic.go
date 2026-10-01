@@ -304,67 +304,34 @@ func convertUserMessage(raw json.RawMessage) []map[string]any {
 		case "text":
 			textParts = append(textParts, b.Text)
 		case "tool_result":
-			content := toolResultText(b.Content)
+			text, imgs := toolResultParts(b.Content)
 			if b.IsError {
-				content = "Error: " + content
+				text = "Error: " + text
 			}
 			result = append(result, map[string]any{
 				"role":         "tool",
 				"tool_call_id": b.ToolUseID,
-				"content":      content,
+				"content":      text,
 			})
+			// a tool_result can carry images (screenshot tools). role:"tool"
+			// is text-only upstream, so the images become a trailing
+			// multimodal user message instead of being pasted into the tool
+			// content as raw json, which zen /chat/completions 400s on.
+			if len(imgs) > 0 {
+				result = append(result, map[string]any{
+					"role":    "user",
+					"content": contentOf(nil, imgs),
+				})
+			}
 		case "image":
-			if b.Source == nil {
-				continue
-			}
-			var url string
-			switch b.Source.Type {
-			case "base64":
-				if b.Source.Data == "" {
-					continue
-				}
-				mt := b.Source.MediaType
-				if mt == "" {
-					mt = "image/jpeg"
-				}
-				url = "data:" + mt + ";base64," + b.Source.Data
-			case "url":
-				if b.Source.URL == "" {
-					continue
-				}
-				url = b.Source.URL
-			default:
-				// claude code sends base64 without explicit type sometimes
-				if b.Source.Data != "" {
-					mt := b.Source.MediaType
-					if mt == "" {
-						mt = "image/jpeg"
-					}
-					url = "data:" + mt + ";base64," + b.Source.Data
-				} else if b.Source.URL != "" {
-					url = b.Source.URL
-				}
-			}
-			if url != "" {
-				imgParts = append(imgParts, map[string]any{"type": "image_url", "image_url": map[string]any{"url": url}})
+			if u := imageURL(b.Source); u != "" {
+				imgParts = append(imgParts, map[string]any{"type": "image_url", "image_url": map[string]any{"url": u}})
 			}
 		}
 	}
 
 	if len(textParts) > 0 || len(imgParts) > 0 {
-		var content any = strings.Join(textParts, "\n")
-		if len(imgParts) > 0 {
-			arr := make([]any, 0, len(textParts)+len(imgParts))
-			for _, t := range textParts {
-				arr = append(arr, map[string]any{"type": "text", "text": t})
-			}
-			for _, im := range imgParts {
-				arr = append(arr, im)
-			}
-			content = arr
-		}
-		userMsg := map[string]any{"role": "user", "content": content}
-		result = append([]map[string]any{userMsg}, result...)
+		result = append([]map[string]any{{"role": "user", "content": contentOf(textParts, imgParts)}}, result...)
 	}
 
 	if len(result) == 0 {
@@ -430,28 +397,82 @@ func convertAssistantMessage(raw json.RawMessage) []map[string]any {
 	return []map[string]any{msg}
 }
 
-func toolResultText(raw json.RawMessage) string {
-	if len(raw) == 0 {
+// imageURL converts an anthropic image source block to a url usable as an
+// openai image_url part. returns "" when the source carries no usable data.
+func imageURL(src *struct {
+	Type      string `json:"type"`
+	MediaType string `json:"media_type"`
+	Data      string `json:"data"`
+	URL       string `json:"url"`
+}) string {
+	if src == nil {
 		return ""
+	}
+	mt := src.MediaType
+	if mt == "" {
+		mt = "image/jpeg"
+	}
+	// claude code sends base64 without an explicit type sometimes, so prefer
+	// whichever field is populated rather than trusting src.Type.
+	if src.Data != "" {
+		return "data:" + mt + ";base64," + src.Data
+	}
+	return src.URL
+}
+
+// contentOf builds a user message body: a plain string when there are no
+// images, a parts array once there are.
+func contentOf(text []string, imgs []map[string]any) any {
+	if len(imgs) == 0 {
+		return strings.Join(text, "\n")
+	}
+	arr := make([]any, 0, len(text)+len(imgs))
+	for _, t := range text {
+		arr = append(arr, map[string]any{"type": "text", "text": t})
+	}
+	for _, im := range imgs {
+		arr = append(arr, im)
+	}
+	return arr
+}
+
+// toolResultText flattens a tool_result body to the string a role:"tool"
+// message can carry.
+func toolResultText(raw json.RawMessage) string {
+	text, _ := toolResultParts(raw)
+	return text
+}
+
+// toolResultParts splits a tool_result body into its text and its images.
+// text-only callers use toolResultText; images need a separate multimodal
+// user message because role:"tool" cannot carry them.
+func toolResultParts(raw json.RawMessage) (string, []map[string]any) {
+	if len(raw) == 0 {
+		return "", nil
 	}
 	var s string
 	if json.Unmarshal(raw, &s) == nil {
-		return s
+		return s, nil
 	}
 	var blocks []anthropicBlock
 	if json.Unmarshal(raw, &blocks) != nil {
-		return string(raw)
+		// not a known shape: pass it through as text, never as a half-parsed
+		// structure. upstream sees a plain string either way.
+		return string(raw), nil
 	}
 	var parts []string
+	var imgs []map[string]any
 	for _, b := range blocks {
-		if b.Type == "text" {
+		switch b.Type {
+		case "text":
 			parts = append(parts, b.Text)
+		case "image":
+			if u := imageURL(b.Source); u != "" {
+				imgs = append(imgs, map[string]any{"type": "image_url", "image_url": map[string]any{"url": u}})
+			}
 		}
 	}
-	if len(parts) > 0 {
-		return strings.Join(parts, "\n")
-	}
-	return string(raw)
+	return strings.Join(parts, "\n"), imgs
 }
 
 func convertToolChoice(tc any) any {
@@ -1711,7 +1732,9 @@ func (p *Pool) handleOpenCodeAnthropic(w http.ResponseWriter, r *http.Request, o
 					lane = nl
 					sessionID = laneSession(lane)
 				} else if zenRetries > 0 {
-					if wait := laneWait(); wait > 0 {
+					if maybeRefreshStalePool() {
+						sessionID = laneSession(lane)
+					} else if wait := laneWait(); wait > 0 {
 						acclog.Printf("  opencode all lanes cooling, waiting %v (retry %d/4)", wait, zenRetries)
 						time.Sleep(wait)
 					}

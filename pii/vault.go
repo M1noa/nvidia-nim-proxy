@@ -124,6 +124,23 @@ func (v *Vault) For(label Label, original string) string {
 	return surr
 }
 
+// SeedFixed registers a fixed surrogate -> original pair (entity
+// `replacement:` values). fixed pairs never expire with the vault ttl
+// and are returned by Lookup/Surrogates like derived ones.
+func (v *Vault) SeedFixed(surrogate, original string, label Label) {
+	if surrogate == "" || original == "" {
+		return
+	}
+	v.mu.Lock()
+	defer v.mu.Unlock()
+	if _, taken := v.bySurr[surrogate]; taken {
+		return
+	}
+	e := &vaultEntry{original: original, surrogate: surrogate, label: label, expires: time.Now().Add(100 * 365 * 24 * time.Hour)}
+	v.byOrig[normOrig(label, original)] = e
+	v.bySurr[surrogate] = e
+}
+
 // maxSurrogateSalts caps the hmac salt-retry loop in Vault.For.
 const maxSurrogateSalts = 64
 

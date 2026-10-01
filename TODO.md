@@ -47,7 +47,7 @@ only `enabled/file/extra` are configurable.
 done: `guardrailThreshold()`/`guardrailWeights()` read config with same
 defaults. test `TestGuardrailThresholdKnob`.
 
-## 4. required zen params on every request shape [medium]
+## 4. required zen params on every request shape [medium] SUPERSEDED
 
 title-gen/summary calls 403 (`FreeTierError`) because they skip what
 agentic calls carry: the four gate tools (`ensureZenTools` only fills
@@ -63,7 +63,15 @@ agentic calls carry: the four gate tools (`ensureZenTools` only fills
   `x-opencode-*` header set. add a `assertZenBody` test helper.
 - `nudge_no_tools`/cache keys must keep being stripped (`stripCacheFields`).
 
-## 5. zen lanes: 6m session-idle eviction + scan-cache TTL [medium]
+superseded 2026-10-01: the no-tools skip in `ensureZenTools` is
+deliberate — giving the summarizer callable stubs makes it emit tool
+calls that zen rejects with "tool call not allowed while generating
+summary" (main.go comment). live 403s are per-exit free-tier blocks,
+survived by rotation (exit burns), not a request-shape gap: every
+outbound path already carries model, stream, stream_options, and
+`x-opencode-*` headers. do NOT inject stubs into tool-less bodies.
+
+## 5. zen lanes: 6m session-idle eviction + scan-cache TTL [medium] DONE
 
 lanes expire by `lane_ttl_minutes` (default 30m) swept on the pool tick;
 the ask is 6m of no activity clears the session hash/id from cache.
@@ -76,7 +84,13 @@ the ask is 6m of no activity clears the session hash/id from cache.
 - per-session surrogate maps already live in the vault; evicting the lane
   must not evict vault entries (different TTLs).
 
-## 6. anonymize config wiring pass [medium]
+done: `session_idle_minutes` (default 6, 0 disables) evicts idle lanes
+in `sweepLanes`; scan cache has `lastAccess` + `sweepIdle`, called from
+the same sweep via `pii.SweepScanIdle` (vault untouched). tests
+`TestLaneSessionIdleEviction`, `TestLaneSessionIdleDisabled`,
+`TestScanSweepIdle`.
+
+## 6. anonymize config wiring pass [medium] DONE
 
 most knobs exist (`mode`, `fuzzy_threshold`, `detect_secrets`,
 `detect_pii`, `keep_labels`, `include_system`, `on_timeout`,
@@ -91,6 +105,12 @@ most knobs exist (`mode`, `fuzzy_threshold`, `detect_secrets`,
   default, not silent (silent = `disclose: false`).
 - confirm `include_system: true` also covers the injected helpful line,
   not just client system prompts.
+
+done: `replacement` wired (fixed surrogate, seeded into vault for
+restore); entity spans tagged `custom-entity`, win overlaps via
+`prefer()`; round-trip tests per mode; `include_system` covers the
+helpful line (injected before masking), test
+`TestIncludeSystemCoversHelpfulLine`. docs in config.yml.example.
 
 ## 7. rampart NER: wire the existing build, verify cache [large]
 
@@ -136,3 +156,24 @@ gets no params. zen 400/403s when required fields are missing.
   matches at least one params glob.
 - keep `inject.params: false` as the escape hatch; document `_nim: true`
   per-request opt-out (already in example).
+
+## 10. pool tuning: calm the refresh storms [medium]
+
+symptoms (2026-10-01 log): `pool_refresh_429s: 2` fires a full pool
+refresh on 2 rate-limited lanes, and several 429s cluster within seconds
+of each other, so one burst triggers 2-3 refreshes back to back. each
+refresh re-probes up to `pool_size` candidates (40-way parallel verify)
+and revalidates every lane exit. requests still succeed via rotation,
+but the churn is wasteful.
+
+- raise `pool_refresh_429s` default 2 -> 4: a single conversation
+  bursting one exit should not refresh the whole pool; 4 distinct
+  limited lanes means the pool really is stale.
+- add `pool_refresh_cooldown_secs` (default 120): skip refresh when the
+  last one finished less than this ago, even if the 429 count trips.
+  log the skip at debug so tuning is visible.
+- consider `lane_min_gap_ms` 1500 -> 2000 if single-lane bursts keep
+  429ing the same exit (check: repeated 429s on one lane with distinct
+  proxies = gap too tight; 429s across many lanes = pool stale).
+- verify: unit test for cooldown skip + counter reset; live check that
+  refreshes drop to ~1 per burst in the log.

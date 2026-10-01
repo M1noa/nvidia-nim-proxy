@@ -112,9 +112,25 @@ func build(cfg Config, sessionID string) *Guard {
 		ttl = 24 * time.Hour
 	}
 	v := SessionVaultMode(sessionID, vaultKey(), ttl, cfg.VaultMaxSize, cfg.Mode)
+	// entity replacements: fixed surrogate per spelling, seeded into the
+	// vault so restore maps them back. entities win over flat terms on
+	// overlap (span.go prefer).
+	repl := map[string]string{}
+	for _, e := range cfg.Entities {
+		if e.Replacement == "" {
+			continue
+		}
+		for _, s := range append([]string{e.Name}, e.Variations...) {
+			if s == "" {
+				continue
+			}
+			repl[strings.ToLower(strings.TrimSpace(s))] = e.Replacement
+			v.SeedFixed(e.Replacement, s, customLabel(e))
+		}
+	}
 	return &Guard{
 		cfg:     cfg,
-		scanner: &Scanner{Detectors: dets, Cache: NewScanCache(2048), Keep: keep, Ver: "v1"},
+		scanner: &Scanner{Detectors: dets, Cache: NewScanCache(2048), Keep: keep, Ver: "v1", Replacements: repl},
 		vault:   v,
 	}
 }
@@ -160,6 +176,24 @@ func (g *Guard) VaultLookup(s string) (string, bool) {
 		return "", false
 	}
 	return g.vault.Lookup(s)
+}
+
+// SweepScanIdle evicts scan-cache entries idle past ttl across all session
+// guards. vault entries keep their own ttl and are untouched.
+func SweepScanIdle(ttl time.Duration) int {
+	guardMu.Lock()
+	caches := make([]*ScanCache, 0, len(guards))
+	for _, g := range guards {
+		if g != nil && g.scanner != nil && g.scanner.Cache != nil {
+			caches = append(caches, g.scanner.Cache)
+		}
+	}
+	guardMu.Unlock()
+	n := 0
+	for _, c := range caches {
+		n += c.sweepIdle(ttl)
+	}
+	return n
 }
 
 // Similarity and FuzzFind re-exported for tests and callers.

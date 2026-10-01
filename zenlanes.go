@@ -9,6 +9,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"nvidia-nim-proxy/pii"
 )
 
 // zen lanes: pinned proxy+session pairs so concurrent conversations spread
@@ -100,7 +102,7 @@ func laneCap() int {
 	if n := cfg().Zen.Lanes; n > 0 {
 		return n
 	}
-	return 5
+	return 8
 }
 
 func laneTTL() time.Duration {
@@ -115,6 +117,15 @@ func laneCooldownBase() time.Duration {
 		return time.Duration(s) * time.Second
 	}
 	return time.Minute
+}
+
+// sessionIdleTTL is the idle time after which a lane's session hash/id is
+// evicted on the sweep. lane_ttl_minutes stays the hard cap.
+func sessionIdleTTL() time.Duration {
+	if m := cfg().Zen.SessionIdleMinutes; m > 0 {
+		return time.Duration(m) * time.Minute
+	}
+	return 0
 }
 
 func laneMinGap() time.Duration {
@@ -437,47 +448,24 @@ func pickLaneProxyFor(model string) string {
 	if len(pool) == 0 {
 		return ""
 	}
-	sort.Slice(pool, func(i, j int) bool { return proxyLatency(pool[i]) < proxyLatency(pool[j]) })
-	q := len(pool) / 4
-	if q < 1 {
-		q = 1
-	}
-	// prefer untaken, unburned exits from the fastest quartile, then rest.
-	var fast, slow []string
+	// untaken, unburned exits, fastest+most-reliable first. weighting
+	// (not strict quartiles) keeps the whole pool in play while fast
+	// exits win most draws.
+	var cands []string
 	for _, p := range pool {
 		if taken[p] || exitBurned(p, model) {
 			continue
 		}
-		if proxyLatency(p) <= proxyLatency(pool[q-1]) {
-			fast = append(fast, p)
-		} else {
-			slow = append(slow, p)
-		}
+		cands = append(cands, p)
 	}
-	cands := append(fast, slow...)
 	if len(cands) == 0 {
 		return ""
 	}
-	if w := raceProbe(sampleFrom(cands, 3), 3*time.Second); w != "" {
+	sort.Slice(cands, func(i, j int) bool { return proxyWeight(cands[i]) > proxyWeight(cands[j]) })
+	if w := raceProbe(sampleWeighted(cands, 3), 3*time.Second); w != "" {
 		return w
 	}
-	return cands[rand.Intn(len(cands))]
-}
-
-func sampleFrom(ss []string, n int) []string {
-	if len(ss) <= n {
-		return ss
-	}
-	out := make([]string, 0, n)
-	seen := map[string]bool{}
-	for len(out) < n {
-		p := ss[rand.Intn(len(ss))]
-		if !seen[p] {
-			seen[p] = true
-			out = append(out, p)
-		}
-	}
-	return out
+	return sampleWeighted(cands, 1)[0]
 }
 
 // laneReproxy swaps a dead exit for a fresh verified one that no other lane
@@ -547,15 +535,92 @@ func laneWait() time.Duration {
 	return d
 }
 
+// lastZenSuccess tracks the last working zen response, so the retry loops
+// can tell "all exits limited for a while" (stale pool/sessions) from a
+// momentary burst.
+var (
+	zenSuccessMu sync.Mutex
+	zenSuccessAt time.Time
+)
+
+func noteZenSuccessAt() {
+	zenSuccessMu.Lock()
+	zenSuccessAt = time.Now()
+	zenSuccessMu.Unlock()
+}
+
+func zenStaleSince() time.Duration {
+	zenSuccessMu.Lock()
+	defer zenSuccessMu.Unlock()
+	if zenSuccessAt.IsZero() {
+		return 0
+	}
+	return time.Since(zenSuccessAt)
+}
+
+// maybeRefreshStalePool fires a pool refresh + session rotation when every
+// lane has been cooling with no success for 15s: the pool/sessions are
+// stale, not just busy. returns true when it fired.
+func maybeRefreshStalePool() bool {
+	if zenStaleSince() < 15*time.Second {
+		return false
+	}
+	lanesMu.Lock()
+	now := time.Now()
+	allCooling := len(lanes) > 0
+	for _, l := range lanes {
+		if now.After(l.cooldown) {
+			allCooling = false
+			break
+		}
+	}
+	lanesMu.Unlock()
+	if !allCooling {
+		return false
+	}
+	acclog.Printf("  zen: all lanes limited 15s+ with no success, refreshing pool + sessions")
+	refreshZenProxiesAsync()
+	resetStaleLanes()
+	return true
+}
+
+// resetStaleLanes clears cooldowns and mints fresh sessions after a stale
+// refresh, so retry loops re-enter on new sessions instead of waiting out
+// dead backoffs.
+func resetStaleLanes() {
+	lanesMu.Lock()
+	defer lanesMu.Unlock()
+	for _, l := range lanes {
+		l.cooldown = time.Time{}
+		l.fails = 0
+		l.proxy = ""
+		l.session = zenSession()
+	}
+	zenSuccessMu.Lock()
+	zenSuccessAt = time.Now()
+	zenSuccessMu.Unlock()
+}
+
 // sweepLanes runs on the pool refresh tick: drops lanes idle past ttl and
 // releases exits idle past lane_release_secs, so a lane that has been cold
-// resumes on a fresh proxy instead of a stale one.
+// resumes on a fresh proxy instead of a stale one. lanes idle past
+// session_idle_minutes are evicted too, clearing the session hash/id from
+// cache while lane_ttl_minutes stays the hard cap.
 func sweepLanes() {
 	cutoff := time.Now().Add(-laneTTL())
 	rel := laneRelease()
+	idle := sessionIdleTTL()
+	var idleCutoff time.Time
+	if idle > 0 {
+		idleCutoff = time.Now().Add(-idle)
+	}
 	lanesMu.Lock()
 	for k, l := range lanes {
 		if l.lastUsed.Before(cutoff) {
+			delete(lanes, k)
+			continue
+		}
+		if !idleCutoff.IsZero() && l.lastUsed.Before(idleCutoff) {
 			delete(lanes, k)
 			continue
 		}
@@ -565,6 +630,13 @@ func sweepLanes() {
 	}
 	lanesMu.Unlock()
 	resetPoolRefresh429s()
+	// scan-cache entries idle past the same ttl go too; vault entries
+	// keep their own (longer) ttl and are untouched.
+	if idle > 0 {
+		if n := pii.SweepScanIdle(idle); n > 0 {
+			acclog.Printf("  pii scan cache: %d idle entr(ies) evicted", n)
+		}
+	}
 }
 
 // lanesRevalidate clears lane exits that are no longer in the freshly

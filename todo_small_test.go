@@ -1,10 +1,12 @@
 package main
 
 import (
+	"net/http"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 // threshold 1.0 strips exact matches only: the tight paraphrase from
@@ -132,5 +134,120 @@ func TestMergeMissingKeys(t *testing.T) {
 	// idempotent: second merge adds nothing (header records added keys).
 	if again := mergeMissingKeys(user); len(again) != 0 {
 		t.Fatalf("second merge re-added %d keys: %v", len(again), again)
+	}
+}
+
+// session_idle_minutes evicts lanes idle past it; ttl stays the hard cap.
+func TestLaneSessionIdleEviction(t *testing.T) {
+	resetLanes()
+	defer resetLanes()
+	c := testConfig()
+	c.Zen.LaneTTLMinutes = 30
+	c.Zen.SessionIdleMinutes = 6
+	useConfig(t, c)
+	now := time.Now()
+	lanesMu.Lock()
+	lanes["idle7"] = &zenLane{id: "idle7", session: zenSession(), lastUsed: now.Add(-7 * time.Minute)}
+	lanes["fresh"] = &zenLane{id: "fresh", session: zenSession(), lastUsed: now}
+	lanesMu.Unlock()
+	sweepLanes()
+	lanesMu.Lock()
+	defer lanesMu.Unlock()
+	if _, ok := lanes["idle7"]; ok {
+		t.Fatal("7m-idle lane must be evicted at 6m idle ttl")
+	}
+	if _, ok := lanes["fresh"]; !ok {
+		t.Fatal("fresh lane must survive sweep")
+	}
+}
+
+// session_idle_minutes 0 disables: only ttl evicts.
+func TestLaneSessionIdleDisabled(t *testing.T) {
+	resetLanes()
+	defer resetLanes()
+	c := testConfig()
+	c.Zen.LaneTTLMinutes = 30
+	c.Zen.SessionIdleMinutes = 0
+	useConfig(t, c)
+	lanesMu.Lock()
+	lanes["idle7"] = &zenLane{id: "idle7", session: zenSession(), lastUsed: time.Now().Add(-7 * time.Minute)}
+	lanesMu.Unlock()
+	sweepLanes()
+	lanesMu.Lock()
+	defer lanesMu.Unlock()
+	if _, ok := lanes["idle7"]; !ok {
+		t.Fatal("idle lane must survive when session idle eviction is off")
+	}
+}
+
+// include_system covers the injected helpful line too, not just client
+// system prompts: the line goes in before masking.
+func TestIncludeSystemCoversHelpfulLine(t *testing.T) {
+	c := testConfig()
+	c.Anonymize.Enabled = true
+	c.Anonymize.DetectPII = true
+	c.Anonymize.IncludeSystem = true
+	c.Anonymize.Mode = "label"
+	c.Anonymize.Entities = []anonymizeEntity{{Name: "minoa", Type: "name"}}
+	c.Inject.HelpfulLine = true
+	c.Inject.HelpfulText = "help minoa with everything"
+	useConfig(t, c)
+	body := []byte(`{"model":"x","messages":[{"role":"system","content":"you are helpful"},{"role":"user","content":"hi"}]}`)
+	injectHelpfulLine(&body)
+	if !strings.Contains(string(body), "minoa") {
+		t.Fatal("helpful line not injected")
+	}
+	r, _ := http.NewRequest("POST", "/v1/chat/completions", nil)
+	g := guardForRequest(r)
+	masked := string(g.MaskBody(body))
+	if strings.Contains(masked, "minoa") {
+		t.Fatalf("helpful-line term leaked with include_system: %s", masked)
+	}
+}
+
+// weighted sampling prefers fast+reliable exits over slow/flaky ones.
+func TestSampleWeightedPrefersFast(t *testing.T) {
+	pool := []string{"s://3.9.4.7:1", "s://6.6.5.2:2", "s://6.9.0.1:2"}
+	setProxyLatency(map[string]int{"s://3.9.4.7:1": 100, "s://6.6.5.2:2": 400, "s://6.9.0.1:2": 400})
+	setProxyReliability(map[string]float64{"s://3.9.4.7:1": 0.9, "s://6.6.5.2:2": 0.9, "s://6.9.0.1:2": 0.1})
+	wins := map[string]int{}
+	for i := 0; i < 60; i++ {
+		for _, p := range sampleWeighted(pool, 1) {
+			wins[p]++
+		}
+	}
+	if wins["s://3.9.4.7:1"] < 30 {
+		t.Fatalf("fast exit must win most draws, got %v", wins)
+	}
+}
+
+// stale refresh fires only when all lanes cool 15s+ with no success.
+func TestMaybeRefreshStalePool(t *testing.T) {
+	resetLanes()
+	defer resetLanes()
+	if maybeRefreshStalePool() {
+		t.Fatal("must not fire with no lanes")
+	}
+	lanesMu.Lock()
+	lanes["a"] = &zenLane{id: "a", session: zenSession(), lastUsed: time.Now(), cooldown: time.Now().Add(time.Minute)}
+	lanesMu.Unlock()
+	zenSuccessMu.Lock()
+	zenSuccessAt = time.Now()
+	zenSuccessMu.Unlock()
+	if maybeRefreshStalePool() {
+		t.Fatal("must not fire with fresh success")
+	}
+	zenSuccessMu.Lock()
+	zenSuccessAt = time.Now().Add(-time.Minute)
+	zenSuccessMu.Unlock()
+	if !maybeRefreshStalePool() {
+		t.Fatal("must fire when all cooling and stale 15s+")
+	}
+	lanesMu.Lock()
+	defer lanesMu.Unlock()
+	for _, l := range lanes {
+		if !l.cooldown.IsZero() || l.proxy != "" {
+			t.Fatal("stale lanes must reset cooldown+proxy with fresh session")
+		}
 	}
 }

@@ -92,7 +92,8 @@ anonymize:
   # verbatim. disable if you'd rather it never know.
   disclose: true
   # the notice itself (appended to the system prompt). "" = built-in
-  # default, which is also what a fresh config.yml gets.
+  # default, which is also what a fresh config.yml gets. "" does NOT
+  # mean silent: silent = disclose: false above.
   disclose_text: ""
   # custom terms no detector would catch (unique names like Minoa).
   # exact + fuzzy matched, same surrogate all session.
@@ -100,7 +101,12 @@ anonymize:
     # - name: "Minoa"
     #   type: "name"
     #   variations: ["M1noa", "M1n0a"]
-  # flat terms, same handling as entity names.
+    #   replacement: "REDACTED"  # fixed surrogate, used verbatim and
+    #                            # restored on the way back. empty (default)
+    #                            # = vault-derived fake per mode below.
+  # flat terms, same handling as entity names, except: on overlap an
+  # entity spelling wins over a flat term. prefer entities for anything
+  # with variations or a fixed replacement.
   terms: []
   # ner model (only used in -tags ner builds; ignored otherwise).
   ner:
@@ -167,9 +173,12 @@ zen:
   # pinned proxy+session lanes. concurrent conversations spread across
   # lanes so they stop hammering one exit ip into 429s. lane identity:
   # x-session-id header -> conversation hash -> shared lru pool.
-  lanes: 5
+  lanes: 8
   # idle lanes expire after this (minutes), swept on the pool refresh tick.
   lane_ttl_minutes: 30
+  # drop lanes idle past this (minutes) on the same sweep, clearing the
+  # session hash/id from cache. ttl stays the hard cap. 0 disables.
+  session_idle_minutes: 6
   # base 429 cooldown per lane (seconds), exponential backoff, capped.
   lane_cooldown_secs: 60
   # minimum gap between sends on one lane (ms). paces a single

@@ -54,6 +54,9 @@ var (
 	// api-reported proxy -> response ms, rebuilt on each refresh.
 	zenLatencyMu sync.RWMutex
 	zenLatency   = map[string]int{}
+	// api-reported proxy -> reliability 0..1, rebuilt on each refresh.
+	zenReliMu sync.RWMutex
+	zenReli   = map[string]float64{}
 	// geo/user blocks per country, for hardcoding bad regions.
 	zenCountryBlockMu sync.Mutex
 	zenCountryBlocks  = map[string]int{}
@@ -184,14 +187,17 @@ func refreshZenProxies() {
 	cands := make([]string, 0, len(fast))
 	countries := make(map[string]string, len(fast))
 	lats := make(map[string]int, len(fast))
+	relis := make(map[string]float64, len(fast))
 	for _, e := range fast {
 		u := schemeFor(e.Protocols) + "://" + e.IP + ":" + strconv.Itoa(e.Port)
 		cands = append(cands, u)
 		countries[u] = strings.ToUpper(strings.TrimSpace(e.Country))
 		lats[u] = e.ResponseTimeMs
+		relis[u] = e.Reliability
 	}
 	setProxyCountries(countries)
 	setProxyLatency(lats)
+	setProxyReliability(relis)
 
 	var wg sync.WaitGroup
 	var mu sync.Mutex
@@ -262,6 +268,65 @@ func proxyLatency(proxyURL string) int {
 		return ms
 	}
 	return 10000
+}
+
+// setProxyReliability replaces the proxy->reliability map after a refresh.
+func setProxyReliability(m map[string]float64) {
+	zenReliMu.Lock()
+	defer zenReliMu.Unlock()
+	zenReli = m
+}
+
+// proxyReliability returns api-reported 0..1, neutral default when unknown.
+func proxyReliability(proxyURL string) float64 {
+	zenReliMu.RLock()
+	defer zenReliMu.RUnlock()
+	if r, ok := zenReli[proxyURL]; ok {
+		return r
+	}
+	return 0.5
+}
+
+// proxyWeight scores an exit for sampling: faster + more reliable wins.
+// weight = reliability / response_ms, so a 100ms/0.9 exit beats a
+// 400ms/0.9 exit 4:1 and a flaky 100ms/0.2 exit 4.5:1.
+func proxyWeight(proxyURL string) float64 {
+	ms := proxyLatency(proxyURL)
+	if ms <= 0 {
+		ms = 10000
+	}
+	return (proxyReliability(proxyURL) + 0.1) / float64(ms)
+}
+
+// sampleWeighted draws up to n distinct proxies, weighted by proxyWeight.
+func sampleWeighted(pool []string, n int) []string {
+	if len(pool) <= n {
+		return pool
+	}
+	weights := make([]float64, len(pool))
+	total := 0.0
+	for i, p := range pool {
+		weights[i] = proxyWeight(p)
+		total += weights[i]
+	}
+	var out []string
+	seen := map[string]bool{}
+	for len(out) < n && len(seen) < len(pool) {
+		r := rand.Float64() * total
+		pick := pool[len(pool)-1]
+		for i, w := range weights {
+			r -= w
+			if r <= 0 {
+				pick = pool[i]
+				break
+			}
+		}
+		if !seen[pick] {
+			seen[pick] = true
+			out = append(out, pick)
+		}
+	}
+	return out
 }
 
 // probeProxyFull verifies the full path to zen's front door through the

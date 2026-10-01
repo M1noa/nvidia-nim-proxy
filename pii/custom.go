@@ -42,6 +42,23 @@ func fuzzyEligible(typ, s string) bool {
 type customDetector struct {
 	spellings []string
 	threshold float64
+	// source tags entity spans apart from term spans so entity
+	// matches win overlaps (config documents entities win).
+	source string
+}
+
+func spellList(strs []string) []string {
+	seen := map[string]bool{}
+	var out []string
+	for _, t := range strs {
+		if t == "" || seen[t] {
+			continue
+		}
+		seen[t] = true
+		out = append(out, t)
+	}
+	sort.Slice(out, func(i, j int) bool { return len(out[i]) > len(out[j]) })
+	return out
 }
 
 func NewCustomDetector(terms []string, entities []CustomTerm, threshold float64) Detector {
@@ -49,26 +66,15 @@ func NewCustomDetector(terms []string, entities []CustomTerm, threshold float64)
 		threshold = 0.95
 	}
 	var spells []string
-	seen := map[string]bool{}
-	for _, t := range terms {
-		if t == "" || seen[t] {
-			continue
-		}
-		seen[t] = true
-		spells = append(spells, t)
-	}
 	for _, e := range entities {
-		for _, s := range append([]string{e.Name}, e.Variations...) {
-			if s == "" || seen[s] {
-				continue
-			}
-			seen[s] = true
-			spells = append(spells, s)
-		}
+		spells = append(spells, e.Name)
+		spells = append(spells, e.Variations...)
 	}
-	sort.Slice(spells, func(i, j int) bool { return len(spells[i]) > len(spells[j]) })
-	d := &customDetector{spells, threshold}
-	return d.detect
+	ent := &customDetector{spellList(spells), threshold, "custom-entity"}
+	trm := &customDetector{spellList(terms), threshold, "custom-term"}
+	return func(text string) []Span {
+		return append(ent.detect(text), trm.detect(text)...)
+	}
 }
 
 func (d *customDetector) detect(text string) []Span {
@@ -81,7 +87,7 @@ func (d *customDetector) detect(text string) []Span {
 				break
 			}
 			st := start + i
-			out = append(out, Span{st, st + len(sp), LCustom, 1, "custom", sp})
+			out = append(out, Span{st, st + len(sp), LCustom, 1, d.source, sp})
 			start = st + len(sp)
 		}
 	}
@@ -104,7 +110,7 @@ func (d *customDetector) detect(text string) []Span {
 			if base < 0 {
 				continue
 			}
-			out = append(out, Span{base + i, base + i + len(hit), LCustom, 0.9, "custom", hit})
+			out = append(out, Span{base + i, base + i + len(hit), LCustom, 0.9, d.source, hit})
 		}
 	}
 	return out
