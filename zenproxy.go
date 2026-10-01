@@ -57,6 +57,11 @@ var (
 	// geo/user blocks per country, for hardcoding bad regions.
 	zenCountryBlockMu sync.Mutex
 	zenCountryBlocks  = map[string]int{}
+	// pool stats for /status: last refresh time, candidates seen,
+	// total dropped exits. guarded by zenProxiesMu.
+	zenPoolRefreshed time.Time
+	zenPoolCands     int
+	zenPoolDropped   int
 )
 
 // zenVersion is the opencode release tag reported in the User-Agent. Defaults
@@ -209,6 +214,8 @@ func refreshZenProxies() {
 
 	zenProxiesMu.Lock()
 	zenProxies = verified
+	zenPoolRefreshed = time.Now()
+	zenPoolCands = len(cands)
 	zenProxiesMu.Unlock()
 	// a fresh pool means every lane's pinned exit is suspect: revalidate
 	// against the new verified set so lanes stop burning stale exits.
@@ -395,6 +402,7 @@ func dropProxy(proxyURL string) {
 		if p == proxyURL {
 			zenProxies = append(zenProxies[:i], zenProxies[i+1:]...)
 			found = true
+			zenPoolDropped++
 			log.Printf("  zen proxies: dropped %s (left %d)", proxyURL, len(zenProxies))
 			break
 		}
@@ -550,6 +558,54 @@ func noteZenCountryBlock(country string) int {
 	defer zenCountryBlockMu.Unlock()
 	zenCountryBlocks[country]++
 	return zenCountryBlocks[country]
+}
+
+// poolExit is one verified exit for /status.
+type poolExit struct {
+	Proxy   string `json:"proxy"`
+	Country string `json:"country"`
+	Latency int    `json:"latency_ms"`
+	Pinned  bool   `json:"pinned"`
+}
+
+// poolSummary is the /status view of the proxy pool.
+type poolSummary struct {
+	Verified int        `json:"verified"`
+	Cands    int        `json:"candidates"`
+	Dropped  int        `json:"dropped_total"`
+	Refresh  string     `json:"last_refresh_ago"`
+	Exits    []poolExit `json:"exits,omitempty"`
+}
+
+// poolSnapshot builds the pool section: counts, refresh age, per-exit
+// rows with pinned-lane marking. credentials stay redacted like lanes.
+func poolSnapshot() poolSummary {
+	zenProxiesMu.RLock()
+	pool := append([]string(nil), zenProxies...)
+	refreshed := zenPoolRefreshed
+	cands := zenPoolCands
+	dropped := zenPoolDropped
+	zenProxiesMu.RUnlock()
+	pinned := map[string]bool{}
+	lanesMu.Lock()
+	for _, l := range lanes {
+		if l.proxy != "" {
+			pinned[l.proxy] = true
+		}
+	}
+	lanesMu.Unlock()
+	out := poolSummary{Dropped: dropped, Cands: cands}
+	out.Verified = len(pool)
+	if !refreshed.IsZero() {
+		out.Refresh = time.Since(refreshed).Round(time.Second).String()
+	}
+	for _, p := range pool {
+		out.Exits = append(out.Exits, poolExit{
+			Proxy: redactProxyUserinfo(p), Country: proxyCountry(p),
+			Latency: proxyLatency(p), Pinned: pinned[p],
+		})
+	}
+	return out
 }
 
 // logZenNetErr logs a transport-level zen failure with model and country.

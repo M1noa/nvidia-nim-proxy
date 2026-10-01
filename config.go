@@ -29,9 +29,14 @@ type authConfig struct {
 }
 
 type guardrailsConfig struct {
-	Enabled bool     `yaml:"enabled"`
-	File    string   `yaml:"file"`
-	Extra   []string `yaml:"extra"`
+	Enabled  bool     `yaml:"enabled"`
+	File     string   `yaml:"file"`
+	Extra    []string `yaml:"extra"`
+	// fuzzy-match tuning: score >= threshold strips. score is
+	// coverage*(window_weight+density_weight*density). defaults 0.6/0.7/0.3.
+	Threshold    float64 `yaml:"threshold"`
+	WindowWeight float64 `yaml:"window_weight"`
+	DensityWeight float64 `yaml:"density_weight"`
 }
 
 type injectConfig struct {
@@ -137,6 +142,7 @@ type statusConfig struct {
 	ShowZen            bool `yaml:"show_zen"`
 	ShowLocks          bool `yaml:"show_locks"`
 	ShowUsage          bool `yaml:"show_usage"`
+	ShowPool           bool `yaml:"show_pool"`
 }
 
 // usageConfig gates the per-request tracker. off = no file, no counters.
@@ -192,8 +198,11 @@ func defaultConfig() appConfig {
 	return appConfig{
 		Server: serverConfig{Port: 5419},
 		Guardrails: guardrailsConfig{
-			Enabled: true,
-			File:    "guardrails.json",
+			Enabled:      true,
+			File:         "guardrails.json",
+			Threshold:    0.6,
+			WindowWeight: 0.7,
+			DensityWeight: 0.3,
 		},
 		Inject: injectConfig{
 			Params:      true,
@@ -242,6 +251,7 @@ func defaultConfig() appConfig {
 			ShowZen:            true,
 			ShowLocks:          true,
 			ShowUsage:          true,
+			ShowPool:           true,
 		},
 		Usage: usageConfig{
 			Enabled: true,
@@ -297,12 +307,31 @@ func loadConfigFile(path string) (*appConfig, error) {
 				if _, has := s["show_usage"]; !has {
 					c.Status.ShowUsage = true
 				}
+				if _, has := s["show_pool"]; !has {
+					c.Status.ShowPool = true
+				}
 			}
 		} else {
 			c.Status.ShowUsage = true
+			c.Status.ShowPool = true
 		}
 		if c.Usage.Path == "" {
 			c.Usage.Path = "nim-usage.jsonl"
+		}
+		if g, ok := doc["guardrails"].(map[string]any); ok {
+			if _, has := g["threshold"]; !has {
+				c.Guardrails.Threshold = 0.6
+			}
+			if _, has := g["window_weight"]; !has {
+				c.Guardrails.WindowWeight = 0.7
+			}
+			if _, has := g["density_weight"]; !has {
+				c.Guardrails.DensityWeight = 0.3
+			}
+		} else {
+			c.Guardrails.Threshold = 0.6
+			c.Guardrails.WindowWeight = 0.7
+			c.Guardrails.DensityWeight = 0.3
 		}
 	}
 	if c.NvidiaKeys == nil {
@@ -323,8 +352,12 @@ func zenEnabled() bool {
 
 // loadOrCreateConfig reads config.yml, creating it from the shipped example
 // on first run. old jsonc files are not read; config.yml is the only source.
+// on every load, keys present in the example but missing from the user file
+// are appended as commented defaults, so new features arrive without wiping
+// user values. malformed user yaml keeps the old running config (caller).
 func loadOrCreateConfig(path string) *appConfig {
 	if c, err := loadConfigFile(path); err == nil {
+		mergeMissingKeys(path)
 		return c
 	}
 	// first run: seed from example so fresh users get commented defaults.
@@ -342,6 +375,191 @@ func loadOrCreateConfig(path string) *appConfig {
 		return &d
 	}
 	return c
+}
+
+// exampleKeys flattens a yaml doc into dotted key paths (sections + leaves).
+func exampleKeys(node *yaml.Node, prefix string, out map[string]bool) {
+	if node == nil {
+		return
+	}
+	if node.Kind == yaml.DocumentNode && len(node.Content) > 0 {
+		exampleKeys(node.Content[0], "", out)
+		return
+	}
+	if node.Kind != yaml.MappingNode {
+		return
+	}
+	for i := 0; i+1 < len(node.Content); i += 2 {
+		k := node.Content[i].Value
+		path := k
+		if prefix != "" {
+			path = prefix + "." + k
+		}
+		out[path] = true
+		if node.Content[i+1].Kind == yaml.MappingNode {
+			exampleKeys(node.Content[i+1], path, out)
+		}
+	}
+}
+
+// missingLeafKeys returns example leaf paths absent from the user doc.
+// a missing section is reported once (as the section), not per leaf.
+func missingLeafKeys(userDoc, seedDoc *yaml.Node) []string {
+	have := map[string]bool{}
+	exampleKeys(userDoc, "", have)
+	want := map[string]bool{}
+	exampleKeys(seedDoc, "", want)
+	var missing []string
+	for k := range want {
+		if have[k] {
+			continue
+		}
+		// skip leaves under a missing section: the section stub covers them.
+		skip := false
+		for p := k; ; {
+			i := strings.LastIndex(p, ".")
+			if i < 0 {
+				break
+			}
+			p = p[:i]
+			if want[p] && !have[p] {
+				skip = true
+				break
+			}
+		}
+		if !skip {
+			missing = append(missing, k)
+		}
+	}
+	sortStrings(missing)
+	return missing
+}
+
+// seedValue renders the example's value for a dotted path, commented.
+// "usage.path" -> "# usage.path: \"nim-usage.jsonl\"". "" when absent.
+func seedValue(seedDoc *yaml.Node, path string) string {
+	node := seedDoc
+	if node.Kind == yaml.DocumentNode && len(node.Content) > 0 {
+		node = node.Content[0]
+	}
+	parts := strings.Split(path, ".")
+	for _, part := range parts {
+		if node.Kind != yaml.MappingNode {
+			return ""
+		}
+		found := false
+		for i := 0; i+1 < len(node.Content); i += 2 {
+			if node.Content[i].Value == part {
+				node = node.Content[i+1]
+				found = true
+				break
+			}
+		}
+		if !found {
+			return ""
+		}
+	}
+	raw, err := yaml.Marshal(node)
+	if err != nil {
+		return ""
+	}
+	// indent under a "# path:" header; the example's own comment lines
+	// stay single-# (no double-prefix noise), value lines get commented.
+	indent := func(l string) string {
+		if strings.HasPrefix(strings.TrimSpace(l), "#") || strings.TrimSpace(l) == "" {
+			return "  " + l + "\n"
+		}
+		return "  # " + l + "\n"
+	}
+	lines := strings.Split(strings.TrimSuffix(string(raw), "\n"), "\n")
+	var b strings.Builder
+	last := parts[len(parts)-1]
+	if node.Kind == yaml.MappingNode {
+		b.WriteString("# " + path + ":\n")
+		for _, l := range lines {
+			b.WriteString(indent(l))
+		}
+		return b.String()
+	}
+	if len(lines) == 1 {
+		return "# " + strings.Join(parts[:len(parts)-1], ".") + "." + last + ": " + lines[0] + "\n"
+	}
+	b.WriteString("# " + path + ":\n")
+	for _, l := range lines {
+		b.WriteString(indent(l))
+	}
+	return b.String()
+}
+
+// mergeMissingKeys appends example keys absent from the user file as
+// commented defaults. append-only: user content is never touched.
+// returns the added key paths.
+func mergeMissingKeys(path string) []string {
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		return nil
+	}
+	seed, err := os.ReadFile("config.yml.example")
+	if err != nil {
+		return nil
+	}
+	var userDoc, seedDoc yaml.Node
+	if yaml.Unmarshal(raw, &userDoc) != nil || yaml.Unmarshal(seed, &seedDoc) != nil {
+		return nil
+	}
+	missing := missingLeafKeys(&userDoc, &seedDoc)
+	if len(missing) == 0 {
+		return nil
+	}
+	// commented stubs are invisible to yaml, so without dedup every restart
+	// would re-append the same block. the header records added keys; only
+	// keys not already recorded are appended.
+	recorded := map[string]bool{}
+	for _, line := range strings.Split(string(raw), "\n") {
+		if strings.HasPrefix(line, "# added: ") {
+			for _, k := range strings.Split(strings.TrimPrefix(line, "# added: "), ",") {
+				if k = strings.TrimSpace(k); k != "" {
+					recorded[k] = true
+				}
+			}
+		}
+	}
+	var fresh []string
+	for _, k := range missing {
+		if !recorded[k] {
+			fresh = append(fresh, k)
+		}
+	}
+	if len(fresh) == 0 {
+		return nil
+	}
+	var b strings.Builder
+	b.WriteString("\n# --- auto-added: keys from config.yml.example missing here ---\n")
+	b.WriteString("# uncomment, move under the right section, edit to use.\n")
+	b.WriteString("# added: " + strings.Join(fresh, ", ") + "\n")
+	for _, k := range fresh {
+		b.WriteString(seedValue(&seedDoc, k))
+	}
+	f, err := os.OpenFile(path, os.O_APPEND|os.O_WRONLY, 0600)
+	if err != nil {
+		log.Printf("WARN: cannot merge keys into %s: %v", path, err)
+		return nil
+	}
+	defer f.Close()
+	if _, err := f.WriteString(b.String()); err != nil {
+		log.Printf("WARN: cannot merge keys into %s: %v", path, err)
+		return nil
+	}
+	log.Printf("  %s: added %d missing key(s) as commented defaults", path, len(fresh))
+	return fresh
+}
+
+func sortStrings(s []string) {
+	for i := 1; i < len(s); i++ {
+		for j := i; j > 0 && s[j] < s[j-1]; j-- {
+			s[j], s[j-1] = s[j-1], s[j]
+		}
+	}
 }
 
 // applyConfig swaps the snapshot and rebuilds every derived structure.
@@ -530,11 +748,15 @@ func (p *Pool) StatusFor(authed bool) StatusResponse {
 	if !c.Status.ShowUsage {
 		sr.Usage = nil
 	}
+	if !c.Status.ShowPool {
+		sr.Pool = nil
+	}
 	if authRequired() && !authed {
 		sr.Keys, sr.Locks = nil, nil
 		sr.ZenSession, sr.ZenProxy, sr.ZenAgo = "", "", ""
 		sr.ZenLanes = nil
 		sr.Usage = nil
+		sr.Pool = nil
 	}
 	return sr
 }

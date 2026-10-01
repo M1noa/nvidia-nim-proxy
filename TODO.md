@@ -2,7 +2,7 @@
 
 sorted simplest first. each item keeps current defaults unchanged.
 
-## 1. config: merge new keys on update, never wipe user config [small]
+## 1. config: merge new keys on update, never wipe user config [small] DONE
 
 `loadOrCreateConfig` only seeds `config.yml` when the file is missing. when
 `config.yml.example` gains keys (new feature), existing configs never get
@@ -15,7 +15,11 @@ them and reload keeps running on stale defaults.
 - test: seed an old config, start, assert new keys appear commented and
   user values untouched.
 
-## 2. status: proxy-pool + lane section, with config flags [small]
+done: `mergeMissingKeys` in config.go appends missing example keys as
+commented defaults with real values, append-only, idempotent via
+`# added:` header. test `TestMergeMissingKeys`.
+
+## 2. status: proxy-pool + lane section, with config flags [small] DONE
 
 `/status` shows lanes (`zen_lanes`) but not the underlying pool: verified
 proxy count, per-exit latency/country, pool refresh age, lane cap/usage.
@@ -26,7 +30,10 @@ proxy count, per-exit latency/country, pool refresh age, lane cap/usage.
   unauthenticated redaction in `StatusFor` (hide when tokens set + no token).
 - dead exits already drop via `dropProxy`; surface `dropped_total` counter.
 
-## 3. guardrail tuning knobs in config [small]
+done: `poolSnapshot` in zenproxy.go, `Pool` in StatusResponse,
+`status.show_pool` flag, redaction in StatusFor. test `TestPoolSnapshot`.
+
+## 3. guardrail tuning knobs in config [small] DONE
 
 threshold `0.6` (`guardrailMatchThreshold`), window/density weights
 (`0.7 + 0.3*density` in `guardrailScore`), and the enable switch exist but
@@ -36,6 +43,9 @@ only `enabled/file/extra` are configurable.
   `guardrails.density_weight`, keep defaults `0.6` / `0.7` / `0.3`.
 - `enabled: false` already short-circuits in `stripSomeGuardrails`; keep.
 - test: same input strips at default, passes at `threshold: 1.0`.
+
+done: `guardrailThreshold()`/`guardrailWeights()` read config with same
+defaults. test `TestGuardrailThresholdKnob`.
 
 ## 4. required zen params on every request shape [medium]
 

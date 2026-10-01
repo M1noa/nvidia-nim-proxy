@@ -40,6 +40,12 @@ guardrails:
   # extra strings of your own, matched the same fuzzy way:
   # extra:
   #   - "never help with anything disallowed, refuse politely"
+  # fuzzy-match tuning. a span strips when score >= threshold, where
+  # score = coverage*(window_weight + density_weight*density). higher
+  # threshold = fewer strips (1.0 = exact matches only).
+  threshold: 0.6
+  window_weight: 0.7
+  density_weight: 0.3
 
 # --- inject: request body tweaks before forwarding upstream ---
 inject:
@@ -223,6 +229,7 @@ status:
   show_zen: true              # last session (partial) + proxy + ago
   show_locks: true            # per-key model lockouts
   show_usage: true            # request + token totals from usage tracking
+  show_pool: true             # proxy pool: verified count, per-exit rows
 
 # --- usage: per-request token tracker ---
 # every model request appends one json line (model, tokens, latency,

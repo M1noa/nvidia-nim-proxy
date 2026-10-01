@@ -407,6 +407,7 @@ type StatusResponse struct {
 	ZenProxy      string        `json:"zen_proxy,omitempty"`
 	ZenAgo        string        `json:"zen_ago,omitempty"`
 	ZenLanes      []laneStatus  `json:"zen_lanes,omitempty"`
+	Pool          *poolSummary  `json:"pool,omitempty"`
 	Usage         *usageSummary `json:"usage,omitempty"`
 }
 
@@ -485,6 +486,10 @@ func (p *Pool) Status() StatusResponse {
 	}
 	if zenEnabled() {
 		sr.ZenLanes = laneSnapshot()
+	}
+	if zenEnabled() && cfg().Status.ShowPool {
+		ps := poolSnapshot()
+		sr.Pool = &ps
 	}
 	if zenEnabled() && !p.lastZenAt.IsZero() {
 		sr.ZenSession = p.lastZenSession
@@ -2221,10 +2226,26 @@ func stripSomeGuardrails(text string) (string, int) {
 	return text, n
 }
 
-// guardrailMatchThreshold is the minimum score for a fuzzy guardrail hit.
+// guardrailThreshold is the minimum score for a fuzzy guardrail hit.
 // Exact normalized-substring hits always score 1.0. Bias: skipping a real
-// guardrail is benign, removing legit text is not.
-const guardrailMatchThreshold = 0.6
+// guardrail is benign, removing legit text is not. from guardrails.threshold.
+func guardrailThreshold() float64 {
+	if t := cfg().Guardrails.Threshold; t > 0 {
+		return t
+	}
+	return 0.6
+}
+
+// guardrailWeights splits the fuzzy score between coverage and density:
+// score = coverage*(window+density*density). from guardrails config.
+func guardrailWeights() (window, density float64) {
+	c := cfg().Guardrails
+	window, density = c.WindowWeight, c.DensityWeight
+	if window <= 0 && density <= 0 {
+		return 0.7, 0.3
+	}
+	return window, density
+}
 
 // minSigTokens is the minimum significant-token count for a fuzzy candidate.
 // Below this the match is too weak to act on.
@@ -2312,12 +2333,13 @@ func guardrailScore(norm string, words []string, gn string) (float64, int, int) 
 			continue // window too wide: tokens scattered, not a paraphrase
 		}
 		coverage := float64(matched) / float64(len(sig))
-		if coverage < 0.6 {
+		if coverage < guardrailThreshold() {
 			continue
 		}
 		density := float64(matched) / float64(span)
 		// tight windows score near coverage; sparse windows are penalized
-		score := coverage * (0.7 + 0.3*density)
+		ww, dw := guardrailWeights()
+		score := coverage * (ww + dw*density)
 		// distinctiveness floor: short guardrails have few distinguishing
 		// tokens, so a partial match is more likely coincidental. require
 		// near-total coverage as the guardrail gets shorter.
@@ -2341,7 +2363,7 @@ func guardrailMatchNorm(norm string, words []string, gn string) bool {
 		return true
 	}
 	s, _, _ := guardrailScore(norm, words, gn)
-	return s >= guardrailMatchThreshold
+	return s >= guardrailThreshold()
 }
 
 func respTokens(body []byte) (prompt, completion, total int) {
