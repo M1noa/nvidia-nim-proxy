@@ -1165,6 +1165,50 @@ func TestConvertToResponsesCarriesImage(t *testing.T) {
 	}
 }
 
+// document blocks used to vanish silently: the switch had no case for them,
+// so the model answered with no idea a pdf had been attached. text documents
+// inline as text, binaries ride as a file part.
+func TestDocumentBlocksSurvive(t *testing.T) {
+	raw := json.RawMessage(`[{"type":"text","text":"read these"},
+		{"type":"document","source":{"type":"base64","media_type":"application/pdf","data":"JVBERi0="}},
+		{"type":"document","source":{"type":"text","media_type":"text/plain","data":"cm9tYW5fdGVzdAo="}}]`)
+	msgs := convertUserMessage(raw)
+	b, _ := json.Marshal(msgs)
+
+	if !strings.Contains(string(b), "file_data") || !strings.Contains(string(b), "JVBERi0=") {
+		t.Fatalf("pdf not carried: %s", b)
+	}
+	// base64 "roman_test\n" decodes to readable text, which is what a model can
+	// actually use; the pdf stays opaque.
+	if !strings.Contains(string(b), "roman_test") {
+		t.Fatalf("text document not inlined: %s", b)
+	}
+
+	// the responses path must translate file -> input_file.
+	oai := map[string]any{"messages": anySlice(msgs)}
+	convertToResponses(oai)
+	rb, _ := json.Marshal(oai["input"])
+	if !strings.Contains(string(rb), "input_file") {
+		t.Fatalf("responses path lost the document: %s", rb)
+	}
+}
+
+// claude code omits source.type on some image blocks; the populated field must
+// win over the missing type.
+func TestImageSourceVariantsSurvive(t *testing.T) {
+	for _, tc := range []struct{ name, block, want string }{
+		{"url source", `{"type":"image","source":{"type":"url","url":"https://x.test/a.png"}}`, "https://x.test/a.png"},
+		{"typeless base64", `{"type":"image","source":{"media_type":"image/png","data":"aGk="}}`, "data:image/png;base64,aGk="},
+	} {
+		raw := json.RawMessage("[" + tc.block + `,{"type":"text","text":"describe"}]`)
+		msgs := convertUserMessage(raw)
+		b, _ := json.Marshal(msgs)
+		if !strings.Contains(string(b), tc.want) {
+			t.Errorf("%s dropped: %s", tc.name, b)
+		}
+	}
+}
+
 // anySlice widens a typed message slice for the generic convertToResponses.
 func anySlice(msgs []map[string]any) []any {
 	out := make([]any, len(msgs))

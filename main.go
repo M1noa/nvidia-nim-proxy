@@ -705,6 +705,23 @@ func normalizeResponsesContent(role string, content any) any {
 				out = append(out, map[string]any{"type": textType, "text": txt})
 			case "input_text", "output_text", "input_image", "input_file", "refusal":
 				out = append(out, pm)
+			case "file":
+				// chat/completions file part -> responses input_file. both
+				// spellings exist upstream: a plain url string, or
+				// {filename, file_data}.
+				f, _ := pm["file"].(map[string]any)
+				if f == nil {
+					continue
+				}
+				if u, _ := f["file_url"].(string); u != "" {
+					out = append(out, map[string]any{"type": "input_file", "file_url": u})
+					continue
+				}
+				if d, _ := f["file_data"].(string); d != "" {
+					name, _ := f["filename"].(string)
+					out = append(out, map[string]any{
+						"type": "input_file", "filename": name, "file_data": d})
+				}
 			case "image_url":
 				switch iu := pm["image_url"].(type) {
 				case string:

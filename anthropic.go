@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"crypto/rand"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -298,6 +299,7 @@ func convertUserMessage(raw json.RawMessage) []map[string]any {
 	var result []map[string]any
 	var textParts []string
 	var imgParts []map[string]any
+	var docParts []map[string]any
 
 	for _, b := range blocks {
 		switch b.Type {
@@ -327,8 +329,17 @@ func convertUserMessage(raw json.RawMessage) []map[string]any {
 			if u := imageURL(b.Source); u != "" {
 				imgParts = append(imgParts, map[string]any{"type": "image_url", "image_url": map[string]any{"url": u}})
 			}
+		case "document":
+			// text/plain documents are just text: inline them. every other
+			// document type (pdf, docx...) has no openai chat/completions
+			// equivalent, so it rides as a file part and falls back to a
+			// data url, which is what multimodal providers accept.
+			if p := documentPart(b); p != nil {
+				docParts = append(docParts, p)
+			}
 		}
 	}
+	imgParts = append(imgParts, docParts...)
 
 	if len(textParts) > 0 || len(imgParts) > 0 {
 		result = append([]map[string]any{{"role": "user", "content": contentOf(textParts, imgParts)}}, result...)
@@ -420,8 +431,57 @@ func imageURL(src *struct {
 	return src.URL
 }
 
+// documentPart converts an anthropic document block into an openai content
+// part. text-ish documents are inlined as text (universally understood);
+// binary ones become a file part carrying a data url, and a bare url source
+// stays a plain url. returns nil when there is nothing usable.
+func documentPart(b anthropicBlock) map[string]any {
+	// anthropic ships some documents as {"type":"text","data":"..."} with no
+	// source, and some as source.type=="text".
+	if b.Source == nil {
+		if b.Type == "text" && b.Text != "" {
+			return map[string]any{"type": "text", "text": b.Text}
+		}
+		return nil
+	}
+	s := b.Source
+	mt := s.MediaType
+	if mt == "" {
+		mt = "application/octet-stream"
+	}
+	if s.Type == "text" || strings.HasPrefix(mt, "text/") {
+		if s.Data == "" {
+			return nil
+		}
+		if dec, err := base64.StdEncoding.DecodeString(s.Data); err == nil {
+			return map[string]any{"type": "text", "text": string(dec)}
+		}
+		// already plain text, not base64
+		return map[string]any{"type": "text", "text": s.Data}
+	}
+	if s.Data != "" {
+		return map[string]any{
+			"type": "file",
+			"file": map[string]any{"filename": docName(mt), "file_data": "data:" + mt + ";base64," + s.Data},
+		}
+	}
+	if s.URL != "" {
+		return map[string]any{"type": "file", "file": map[string]any{"filename": docName(mt), "file_url": s.URL}}
+	}
+	return nil
+}
+
+// docName is a filename hint from a media type; zen ignores it but some
+// providers reject a file part without one.
+func docName(mt string) string {
+	if i := strings.IndexByte(mt, '/'); i > 0 {
+		return "attachment" + mt[i:]
+	}
+	return "attachment"
+}
+
 // contentOf builds a user message body: a plain string when there are no
-// images, a parts array once there are.
+// parts, a parts array once there are.
 func contentOf(text []string, imgs []map[string]any) any {
 	if len(imgs) == 0 {
 		return strings.Join(text, "\n")
@@ -469,6 +529,10 @@ func toolResultParts(raw json.RawMessage) (string, []map[string]any) {
 		case "image":
 			if u := imageURL(b.Source); u != "" {
 				imgs = append(imgs, map[string]any{"type": "image_url", "image_url": map[string]any{"url": u}})
+			}
+		case "document":
+			if p := documentPart(b); p != nil {
+				imgs = append(imgs, p)
 			}
 		}
 	}
