@@ -154,6 +154,9 @@ type zenConfig struct {
 	// with every lane cooling and no success. 0 = 15.
 	StalePoolSecs int `yaml:"stale_pool_secs"`
 	// ZenTimeoutSecs caps a proxied upstream request. 0 = 120.
+	// HedgeAfterMs fires a second request on another exit when no first
+	// byte arrives within this long. first response wins. -1 disables.
+	HedgeAfterMs int `yaml:"hedge_after_ms"`
 	ZenTimeoutSecs int `yaml:"zen_timeout_secs"`
 	// ZenDirectTimeoutSecs caps a direct upstream request. 0 = 300.
 	ZenDirectTimeoutSecs int `yaml:"zen_direct_timeout_secs"`
@@ -190,6 +193,9 @@ type freepiConfig struct {
 	ClientVersion string          `yaml:"client_version"`
 	// AdInlineEvery posts inline turns every Nth assistant turn. 0 = 5.
 	AdInlineEvery int `yaml:"ad_inline_every"`
+	// QueueWaitSecs is how long a request waits for a busy account to free
+	// up (one live stream per jwt). 0 = 60.
+	QueueWaitSecs int `yaml:"queue_wait_secs"`
 }
 
 type statusConfig struct {

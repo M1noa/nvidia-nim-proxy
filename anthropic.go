@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/http/httptrace"
 	"os"
 	"strings"
 	"sync"
@@ -1436,6 +1437,18 @@ func (p *Pool) handleAnthropic(w http.ResponseWriter, r *http.Request, start tim
 		return
 	}
 
+	// Route freeepi/* models to api.freepi.ai
+	if strings.HasPrefix(upstreamModel, "freeepi/") {
+		if !freepiEnabled() {
+			acclog.Printf("<- 503 POST /v1/messages model=%s (freepi disabled)", clientModel)
+			writeAnthropicError(w, http.StatusServiceUnavailable, "api_error", "freepi is disabled; set freepi.enabled: true with accounts in config.yml")
+			return
+		}
+		acclog.Printf("%s routed to freepi model=%s", reqID, upstreamModel)
+		p.handleFreepiAnthropic(w, r, oaiBody, clientModel, upstreamModel, tnames, isStream, start, reqID)
+		return
+	}
+
 	// nvidia/ prefix is the listed form; bare ids stay nvidia for compat.
 	if strings.HasPrefix(upstreamModel, "nvidia/") {
 		upstreamModel = strings.TrimPrefix(upstreamModel, "nvidia/")
@@ -1849,7 +1862,47 @@ func (p *Pool) handleOpenCodeAnthropic(w http.ResponseWriter, r *http.Request, o
 				acclog.Printf("  opencode retry %d/%d session=%s proxy=%s lane=%s", zenRetries, zenRetryLabel(), sessionID, redactProxyUserinfo(proxy), lane.id)
 			}
 
-			up, err := cl.Do(req)
+			hedgeAfter := 2 * time.Second
+			if ms := cfg().Zen.HedgeAfterMs; ms != 0 {
+				if ms < 0 {
+					hedgeAfter = 0
+				} else {
+					hedgeAfter = time.Duration(ms) * time.Millisecond
+				}
+			}
+			var firstByteAt time.Time
+			traced := req.WithContext(httptrace.WithClientTrace(req.Context(), &httptrace.ClientTrace{
+				GotFirstResponseByte: func() { firstByteAt = time.Now() },
+			}))
+			sendStart := time.Now()
+			up, err, _ := hedgedDo(
+				func() (*http.Response, error) { return cl.Do(traced) },
+				func() (*http.Response, error) {
+					hl := lane
+					if nl := laneFailover(lane); nl != nil {
+						hl = nl
+					}
+					hp := laneProxyFor(hl, zenModel)
+					if hp == "" || hp == proxy {
+						select {}
+					}
+					hcl := zenClient(hp)
+					hreq, herr := http.NewRequest(r.Method, target, bytes.NewReader(body))
+					if herr != nil {
+						return nil, herr
+					}
+					setZenHeaders(hreq, laneSession(hl))
+					hup, huerr := hcl.Do(hreq)
+					if huerr == nil {
+						noteExitOK(hp)
+					}
+					return hup, huerr
+				}, hedgeAfter)
+			if err == nil && !firstByteAt.IsZero() {
+				if fb := firstByteAt.Sub(sendStart); fb > 6*time.Second {
+					noteExitSlow(proxy)
+				}
+			}
 			if err != nil {
 				dropProxy(proxy)
 				rotating = true
@@ -1873,7 +1926,8 @@ func (p *Pool) handleOpenCodeAnthropic(w http.ResponseWriter, r *http.Request, o
 				if proxy == "" {
 					laneEscalate(lane, zenModel) // direct got limited: give the lane an exit
 				}
-				laneCool(lane)
+				noteExit429(proxy)
+			laneCool(lane)
 				if nl := laneFailover(lane); nl != nil {
 					lane = nl
 					sessionID = laneSession(lane)
@@ -1964,7 +2018,8 @@ func (p *Pool) handleOpenCodeAnthropic(w http.ResponseWriter, r *http.Request, o
 			resetZenNetworkErrors()
 			if up.StatusCode == http.StatusOK {
 				p.noteZenSuccess(sessionID, proxy)
-				laneTouch(lane, proxy)
+				noteExitOK(proxy)
+			laneTouch(lane, proxy)
 			}
 			return up
 		}

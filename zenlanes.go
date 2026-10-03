@@ -5,6 +5,8 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"math/rand"
+	"net/http"
+	"net/http/httptrace"
 	"sort"
 	"strings"
 	"sync"
@@ -94,6 +96,114 @@ var (
 	burned = map[string]time.Time{}
 )
 
+// long burns: an exit that keeps 429ing (twice, 20s+ since its last
+// success) is out for every model for 12h. per-exit, not per-model:
+// a saturated exit is saturated for everything.
+var (
+	longBurnMu sync.Mutex
+	longBurned = map[string]time.Time{}
+	// exitTrack holds per-exit health: last success, 429 streak, slow strikes.
+	exitTrackMu sync.Mutex
+	exitTrack   = map[string]*exitHealth{}
+)
+
+type exitHealth struct {
+	lastOK   time.Time
+	streak   int // consecutive 429s
+	strikes  []time.Time
+	slowWins int
+}
+
+func exitHealthFor(proxy string) *exitHealth {
+	exitTrackMu.Lock()
+	defer exitTrackMu.Unlock()
+	h, ok := exitTrack[proxy]
+	if !ok {
+		h = &exitHealth{}
+		exitTrack[proxy] = h
+	}
+	return h
+}
+
+// noteExit429 records a 429 on an exit. twice in a row with 20s+ since the
+// last success means long-term saturation: 12h ban for every model.
+func noteExit429(proxy string) bool {
+	if proxy == "" {
+		return false
+	}
+	h := exitHealthFor(proxy)
+	exitTrackMu.Lock()
+	h.streak++
+	streak, lastOK := h.streak, h.lastOK
+	exitTrackMu.Unlock()
+	if streak >= 2 && time.Since(lastOK) > 20*time.Second {
+		longBurnMu.Lock()
+		longBurned[proxy] = time.Now().Add(12 * time.Hour)
+		longBurnMu.Unlock()
+		acclog.Printf("  zen exit %s long-burned 12h (429 streak, no success 20s+)", redactProxyUserinfo(proxy))
+		return true
+	}
+	return false
+}
+
+// noteExitOK clears an exit's 429 streak on any success.
+func noteExitOK(proxy string) {
+	if proxy == "" {
+		return
+	}
+	h := exitHealthFor(proxy)
+	exitTrackMu.Lock()
+	h.streak = 0
+	h.lastOK = time.Now()
+	exitTrackMu.Unlock()
+}
+
+// exitLongBurned reports whether an exit is under a 12h saturation ban.
+func exitLongBurned(proxy string) bool {
+	if proxy == "" {
+		return false
+	}
+	longBurnMu.Lock()
+	defer longBurnMu.Unlock()
+	until, ok := longBurned[proxy]
+	if !ok {
+		return false
+	}
+	if time.Now().After(until) {
+		delete(longBurned, proxy)
+		return false
+	}
+	return true
+}
+
+// noteExitSlow records a >6s first-byte stall on an exit. two strikes
+// within an hour drops the exit from the pool: consistently slow exits
+// waste every request they touch.
+func noteExitSlow(proxy string) {
+	if proxy == "" {
+		return
+	}
+	h := exitHealthFor(proxy)
+	exitTrackMu.Lock()
+	now := time.Now()
+	h.strikes = append(h.strikes, now)
+	// keep only the last hour
+	var kept []time.Time
+	for _, t := range h.strikes {
+		if now.Sub(t) < time.Hour {
+			kept = append(kept, t)
+		}
+	}
+	h.strikes = kept
+	n := len(kept)
+	exitTrackMu.Unlock()
+	if n >= 2 {
+		acclog.Printf("  zen exit %s dropped: 2 slow strikes in 1h", redactProxyUserinfo(proxy))
+		dropProxy(proxy)
+		laneDropProxy(proxy)
+	}
+}
+
 func burnTTL() time.Duration {
 	if m := cfg().Zen.ExitBurnMinutes; m > 0 {
 		return time.Duration(m) * time.Minute
@@ -143,6 +253,77 @@ func sweepBurns() {
 		if now.After(until) {
 			delete(burned, k)
 		}
+	}
+	longBurnMu.Lock()
+	defer longBurnMu.Unlock()
+	for k, until := range longBurned {
+		if now.After(until) {
+			delete(longBurned, k)
+		}
+	}
+}
+
+// firstByteDo runs do() with a trace recording when the first response
+// byte arrives. returns the response plus first-byte latency (0 on error
+// before headers). callers use it for slow-strike accounting.
+func firstByteDo(do func(*httptrace.ClientTrace) (*http.Response, error)) (*http.Response, error, time.Duration) {
+	var firstByte time.Time
+	start := time.Now()
+	trace := &httptrace.ClientTrace{
+		GotFirstResponseByte: func() { firstByte = time.Now() },
+	}
+	resp, err := do(trace)
+	if err != nil || firstByte.IsZero() {
+		return resp, err, 0
+	}
+	return resp, err, firstByte.Sub(start)
+}
+// fires hedge concurrently: first completed response wins, the loser is
+// cancelled (body closed). chat completions are read-only from our side,
+// so double-send is safe. returns which side won (true = hedge).
+func hedgedDo(primary, hedge func() (*http.Response, error), hedgeAfter time.Duration) (*http.Response, error, bool) {
+	if hedgeAfter <= 0 || hedge == nil {
+		resp, err := primary()
+		return resp, err, false
+	}
+	type result struct {
+		resp *http.Response
+		err  error
+		hed  bool
+	}
+	primaryCh := make(chan result, 1)
+	go func() {
+		resp, err := primary()
+		primaryCh <- result{resp, err, false}
+	}()
+	timer := time.NewTimer(hedgeAfter)
+	defer timer.Stop()
+	select {
+	case r := <-primaryCh:
+		return r.resp, r.err, false
+	case <-timer.C:
+	}
+	hedgeCh := make(chan result, 1)
+	go func() {
+		resp, err := hedge()
+		hedgeCh <- result{resp, err, true}
+	}()
+	select {
+	case r := <-primaryCh:
+		// loser still running: close its body when it lands to free the conn.
+		go func() {
+			if hr := <-hedgeCh; hr.resp != nil && hr.resp.Body != nil {
+				hr.resp.Body.Close()
+			}
+		}()
+		return r.resp, r.err, false
+	case r := <-hedgeCh:
+		go func() {
+			if pr := <-primaryCh; pr.resp != nil && pr.resp.Body != nil {
+				pr.resp.Body.Close()
+			}
+		}()
+		return r.resp, r.err, true
 	}
 }
 
@@ -528,7 +709,7 @@ func pickLaneProxyFor(model string) string {
 	if cps := getCustomProxies(); len(cps) > 0 {
 		var free []string
 		for _, c := range cps {
-			if !taken[c] && !exitBurned(c, model) {
+			if !taken[c] && !exitBurned(c, model) && !exitLongBurned(c) {
 				free = append(free, c)
 			}
 		}
@@ -552,7 +733,7 @@ func pickLaneProxyFor(model string) string {
 	// exits win most draws.
 	var cands []string
 	for _, p := range pool {
-		if taken[p] || exitBurned(p, model) {
+		if taken[p] || exitBurned(p, model) || exitLongBurned(p) {
 			continue
 		}
 		cands = append(cands, p)
@@ -872,10 +1053,10 @@ func laneProxyFor(l *zenLane, model string) string {
 	escalated := l.escalated
 	lanesMu.Unlock()
 	if p != "" {
-		if !exitBurned(p, model) && probeProxyFull(p, probeTimeout()) {
+		if !exitBurned(p, model) && !exitLongBurned(p) && probeProxyFull(p, probeTimeout()) {
 			return p
 		}
-		if exitBurned(p, model) {
+		if exitBurned(p, model) || exitLongBurned(p) {
 			lanesMu.Lock()
 			if l.proxy == p {
 				l.proxy = ""

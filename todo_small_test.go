@@ -385,3 +385,101 @@ func TestFreepiSnapshotNoLeak(t *testing.T) {
 		t.Fatal("no accounts must disable")
 	}
 }
+
+// long burns ban saturated exits for every model.
+func TestLongBurn(t *testing.T) {
+	resetLanes()
+	defer resetLanes()
+	burnMu.Lock()
+	burned = map[string]time.Time{}
+	burnMu.Unlock()
+	longBurnMu.Lock()
+	longBurned = map[string]time.Time{}
+	longBurnMu.Unlock()
+	exitTrackMu.Lock()
+	delete(exitTrack, "http://9.9.9.9:1")
+	exitTrackMu.Unlock()
+	// first 429: no ban. second 429 with stale success: 12h ban.
+	noteExit429("http://9.9.9.9:1")
+	if exitLongBurned("http://9.9.9.9:1") {
+		t.Fatal("single 429 must not long-burn")
+	}
+	exitTrackMu.Lock()
+	exitTrack["http://9.9.9.9:1"].lastOK = time.Now().Add(-time.Minute)
+	exitTrackMu.Unlock()
+	noteExit429("http://9.9.9.9:1")
+	if !exitLongBurned("http://9.9.9.9:1") {
+		t.Fatal("repeat 429 with stale success must long-burn")
+	}
+	noteExitOK("http://9.9.9.9:1")
+	// success clears streak but not an active ban (ban is time-based).
+	longBurnMu.Lock()
+	delete(longBurned, "http://9.9.9.9:1")
+	longBurnMu.Unlock()
+	if exitLongBurned("http://9.9.9.9:1") {
+		t.Fatal("cleared ban must lapse")
+	}
+}
+
+// slow strikes: 2 in an hour drops the exit.
+func TestSlowStrikes(t *testing.T) {
+	exitTrackMu.Lock()
+	delete(exitTrack, "http://8.8.8.8:1")
+	exitTrackMu.Unlock()
+	zenProxiesMu.Lock()
+	zenProxies = append(zenProxies, "http://8.8.8.8:1")
+	defer func() {
+		zenProxiesMu.Lock()
+		for i, p := range zenProxies {
+			if p == "http://8.8.8.8:1" {
+				zenProxies = append(zenProxies[:i], zenProxies[i+1:]...)
+				break
+			}
+		}
+		zenProxiesMu.Unlock()
+	}()
+	zenProxiesMu.Unlock()
+	noteExitSlow("http://8.8.8.8:1")
+	zenProxiesMu.RLock()
+	found := false
+	for _, p := range zenProxies {
+		if p == "http://8.8.8.8:1" {
+			found = true
+		}
+	}
+	zenProxiesMu.RUnlock()
+	if !found {
+		t.Fatal("single strike must not drop")
+	}
+	noteExitSlow("http://8.8.8.8:1")
+	zenProxiesMu.RLock()
+	for _, p := range zenProxies {
+		if p == "http://8.8.8.8:1" {
+			zenProxiesMu.RUnlock()
+			t.Fatal("two strikes in 1h must drop the exit")
+		}
+	}
+	zenProxiesMu.RUnlock()
+}
+
+// hedgedDo: first response wins, slow side loses.
+func TestHedgedDo(t *testing.T) {
+	fast := func() (*http.Response, error) {
+		return &http.Response{StatusCode: 200}, nil
+	}
+	slow := func() (*http.Response, error) {
+		time.Sleep(5 * time.Second)
+		return &http.Response{StatusCode: 200}, nil
+	}
+	resp, err, hedged := hedgedDo(fast, slow, 50*time.Millisecond)
+	if err != nil || resp.StatusCode != 200 || hedged {
+		t.Fatalf("fast primary must win: %v %v hedged=%v", resp, err, hedged)
+	}
+	resp, err, hedged = hedgedDo(slow, fast, 50*time.Millisecond)
+	if err != nil || resp.StatusCode != 200 || !hedged {
+		t.Fatalf("hedge must win stalled primary: %v %v hedged=%v", resp, err, hedged)
+	}
+	resp, err, _ = hedgedDo(slow, slow, 0)
+	_ = resp
+	_ = err
+}

@@ -8,6 +8,7 @@ import (
 	"log"
 	"math/rand"
 	"net/http"
+	"net/http/httptrace"
 	"os"
 	"os/signal"
 	"sort"
@@ -452,25 +453,25 @@ type KeyStatus struct {
 }
 
 type StatusResponse struct {
-	OK            bool          `json:"ok"`
-	Version       string        `json:"version"`
-	Uptime        string        `json:"uptime"`
-	Total         int           `json:"total"`
-	Available     int           `json:"available"`
-	Concurrent    int           `json:"concurrent"`
-	ConcurrentNV  int           `json:"concurrent_nvidia"`
-	ConcurrentZen int           `json:"concurrent_opencode"`
-	SemLimit      int           `json:"sem_limit"`
-	Keys          []KeyStatus   `json:"keys,omitempty"`
-	Locks         interface{}   `json:"model_locks,omitempty"`
-	Opencode      *OpencodeInfo `json:"opencode,omitempty"`
-	ZenSession    string        `json:"zen_session,omitempty"`
-	ZenProxy      string        `json:"zen_proxy,omitempty"`
-	ZenAgo        string        `json:"zen_ago,omitempty"`
-	ZenLanes      []laneStatus  `json:"zen_lanes,omitempty"`
-	LaneCap       int           `json:"lane_cap,omitempty"`
-	Pool          *poolSummary  `json:"pool,omitempty"`
-	Usage         *usageSummary `json:"usage,omitempty"`
+	OK            bool           `json:"ok"`
+	Version       string         `json:"version"`
+	Uptime        string         `json:"uptime"`
+	Total         int            `json:"total"`
+	Available     int            `json:"available"`
+	Concurrent    int            `json:"concurrent"`
+	ConcurrentNV  int            `json:"concurrent_nvidia"`
+	ConcurrentZen int            `json:"concurrent_opencode"`
+	SemLimit      int            `json:"sem_limit"`
+	Keys          []KeyStatus    `json:"keys,omitempty"`
+	Locks         interface{}    `json:"model_locks,omitempty"`
+	Opencode      *OpencodeInfo  `json:"opencode,omitempty"`
+	ZenSession    string         `json:"zen_session,omitempty"`
+	ZenProxy      string         `json:"zen_proxy,omitempty"`
+	ZenAgo        string         `json:"zen_ago,omitempty"`
+	ZenLanes      []laneStatus   `json:"zen_lanes,omitempty"`
+	LaneCap       int            `json:"lane_cap,omitempty"`
+	Pool          *poolSummary   `json:"pool,omitempty"`
+	Usage         *usageSummary  `json:"usage,omitempty"`
 	Freepi        *freepiSummary `json:"freepi,omitempty"`
 }
 
@@ -3096,7 +3097,60 @@ func (p *Pool) handleOpenCode(w http.ResponseWriter, r *http.Request, body []byt
 			}
 		}
 
-		resp, err = cl.Do(req)
+		// hedged send: if no first byte in ~2s, fire the same body on a
+		// second exit; first response wins, loser is closed. first-byte
+		// latency over 6s earns the exit a slow strike (2 in 1h drops it).
+		hedgeAfter := 2 * time.Second
+		if ms := cfg().Zen.HedgeAfterMs; ms != 0 {
+			if ms < 0 {
+				hedgeAfter = 0 // -1 disables hedging
+			} else {
+				hedgeAfter = time.Duration(ms) * time.Millisecond
+			}
+		}
+		hedgeFn := func() (*http.Response, error) {
+			hl := lane
+			if nl := laneFailover(lane); nl != nil {
+				hl = nl
+			}
+			hp := laneProxyFor(hl, realModel)
+			if hp == "" || hp == proxy {
+				select {} // no distinct exit: hang so primary wins
+			}
+			hcl := zenClient(hp)
+			hreq, herr := http.NewRequest(r.Method, target, bytes.NewReader(body))
+			if herr != nil {
+				return nil, herr
+			}
+			setZenHeaders(hreq, laneSession(hl))
+			for k, v := range r.Header {
+				if zenHeaderForwarded(k) {
+					hreq.Header[k] = v
+				}
+			}
+			up, uerr := hcl.Do(hreq)
+			if uerr == nil {
+				acclog.Printf("  opencode hedge won on %s lane=%s", redactProxyUserinfo(hp), hl.id)
+				noteExitOK(hp)
+			}
+			return up, uerr
+		}
+		var firstByteAt time.Time
+		traced := req.WithContext(httptrace.WithClientTrace(req.Context(), &httptrace.ClientTrace{
+			GotFirstResponseByte: func() { firstByteAt = time.Now() },
+		}))
+		sendStart := time.Now()
+		primaryFn := func() (*http.Response, error) {
+			return cl.Do(traced)
+		}
+		var hedged bool
+		resp, err, hedged = hedgedDo(primaryFn, hedgeFn, hedgeAfter)
+		_ = hedged
+		if err == nil && !firstByteAt.IsZero() {
+			if fb := firstByteAt.Sub(sendStart); fb > 6*time.Second {
+				noteExitSlow(proxy)
+			}
+		}
 		if err != nil {
 			dropProxy(proxy)
 			rotating = true
@@ -3124,6 +3178,7 @@ func (p *Pool) handleOpenCode(w http.ResponseWriter, r *http.Request, body []byt
 			if proxy == "" {
 				laneEscalate(lane, realModel) // direct got limited: give the lane an exit
 			}
+			noteExit429(proxy)
 			laneCool(lane)
 			if nl := laneFailover(lane); nl != nil {
 				lane = nl
@@ -3224,7 +3279,8 @@ func (p *Pool) handleOpenCode(w http.ResponseWriter, r *http.Request, body []byt
 		resetZenNetworkErrors()
 		if resp.StatusCode == http.StatusOK {
 			p.noteZenSuccess(sessionID, usedProxy)
-			laneTouch(lane, usedProxy)
+			noteExitOK(usedProxy)
+		laneTouch(lane, usedProxy)
 		}
 		break
 	}
