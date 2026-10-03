@@ -1,6 +1,7 @@
 package main
 
 import (
+	"encoding/json"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -341,5 +342,46 @@ func TestSweepBurns(t *testing.T) {
 	}
 	if _, ok := burned["y\x00m"]; !ok {
 		t.Fatal("live burn must survive")
+	}
+}
+
+// freepi error envelope classification.
+func TestParseFreepiErr(t *testing.T) {
+	fe := parseFreepiErr(429, []byte(`{"code":"daily_cap","message":"spent"}`), http.Header{"Retry-After": {"30"}})
+	if fe.Code != "daily_cap" || fe.Retry != "30" {
+		t.Fatalf("bad parse: %+v", fe)
+	}
+	fe = parseFreepiErr(409, []byte(`{"code":"concurrent_session"}`), http.Header{})
+	if fe.Code != "concurrent_session" {
+		t.Fatalf("bad parse: %+v", fe)
+	}
+	fe = parseFreepiErr(502, []byte(`bad gateway`), http.Header{})
+	if fe.Msg != "bad gateway" {
+		t.Fatalf("plain body must survive: %+v", fe)
+	}
+}
+
+// freepi disabled without accounts; jwt never in status.
+func TestFreepiSnapshotNoLeak(t *testing.T) {
+	c := testConfig()
+	c.Freepi.Enabled = true
+	c.Freepi.Accounts = []freepiAccount{{Name: "a", JWT: "secret-jwt"}}
+	useConfig(t, c)
+	sum := freepiSnapshot()
+	if sum == nil || len(sum.Accounts) != 1 {
+		t.Fatalf("want 1 account: %+v", sum)
+	}
+	b, _ := json.Marshal(sum)
+	if strings.Contains(string(b), "secret-jwt") {
+		t.Fatalf("jwt leaked in status: %s", b)
+	}
+	if !freepiEnabled() {
+		t.Fatal("enabled with accounts")
+	}
+	c2 := testConfig()
+	c2.Freepi.Enabled = true
+	useConfig(t, c2)
+	if freepiEnabled() {
+		t.Fatal("no accounts must disable")
 	}
 }

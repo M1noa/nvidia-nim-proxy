@@ -1,6 +1,6 @@
 #!/bin/sh
 # nim: run nim-proxy in foreground, as a service, or show status.
-# usage: nim [run|start|stop|restart|status [tail]|status-tail|logs|log [N|tail]|tail|install|uninstall]
+# usage: nim [run|start|stop|restart|status [tail]|status-tail|logs|log [N|tail]|tail|install|uninstall|freepi auth]
 PROXY_DIR="$(cd "$(dirname "$0")" && pwd)"
 LOGFILE="$PROXY_DIR/nim-proxy.log"
 BINARY="$PROXY_DIR/nim-proxy"
@@ -109,6 +109,11 @@ case "${1:-status}" in
       *) echo "Usage: nim log [N|tail]"; exit 1 ;;
     esac ;;
   tail)    tail -f "$LOGFILE" ;;
+  freepi)
+    case "$2" in
+      auth) PY="$(find_py)" || { echo "no python3"; exit 1; }; exec "$PY" "$PROXY_DIR/scripts/freepi_login.py" --into-config "$PROXY_DIR/config.yml" ;;
+      *) echo "Usage: nim freepi auth"; exit 1 ;;
+    esac ;;
   install)
     port_alive && { pretty_status; exit 0; }
     svc_start; sleep 2; pretty_status

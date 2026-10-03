@@ -471,6 +471,23 @@ type StatusResponse struct {
 	LaneCap       int           `json:"lane_cap,omitempty"`
 	Pool          *poolSummary  `json:"pool,omitempty"`
 	Usage         *usageSummary `json:"usage,omitempty"`
+	Freepi        *freepiSummary `json:"freepi,omitempty"`
+}
+
+// freepiAcctStatus is one account's /status row. jwt never leaves config.
+type freepiAcctStatus struct {
+	Name       string   `json:"name"`
+	Models     []string `json:"models,omitempty"`
+	Requests   int      `json:"requests"`
+	Prompt     int      `json:"prompt_tokens"`
+	Completion int      `json:"completion_tokens"`
+	Inflight   bool     `json:"inflight"`
+}
+
+// freepiSummary groups per-account freepi state, separate from zen.
+type freepiSummary struct {
+	Enabled  bool               `json:"enabled"`
+	Accounts []freepiAcctStatus `json:"accounts,omitempty"`
 }
 
 // usageSummary is the /status view of the in-memory counters.
@@ -562,6 +579,9 @@ func (p *Pool) Status() StatusResponse {
 	if cfg().Usage.Enabled && cfg().Status.ShowUsage {
 		reqs, prompt, comp, byModel := usageSnapshot()
 		sr.Usage = &usageSummary{Requests: reqs, Prompt: prompt, Completion: comp, ByModel: byModel}
+	}
+	if freepiEnabled() {
+		sr.Freepi = freepiSnapshot()
 	}
 	return sr
 }
@@ -1865,9 +1885,42 @@ func (p *Pool) handleModels(w http.ResponseWriter, r *http.Request) {
 			TopProvider:   map[string]any{"context_length": cl, "max_completion_tokens": nil, "is_moderated": false},
 		})
 	}
+	appendFreepiModels(&out, seenIDs)
 
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(out)
+}
+
+// appendFreepiModels lists freeepi/<id> for every catalog model across
+// accounts. dedupes by id; per-account availability is a status concern.
+func appendFreepiModels(out *struct {
+	Data []openRouterModel `json:"data"`
+}, seenIDs map[string]bool) {
+	if !freepiEnabled() {
+		return
+	}
+	seen := map[string]bool{}
+	for _, fa := range freepiAccounts() {
+		for _, m := range freepiModels(fa) {
+			if seen[m] {
+				continue
+			}
+			seen[m] = true
+			id := "freeepi/" + m
+			if seenIDs[id] {
+				continue
+			}
+			seenIDs[id] = true
+			out.Data = append(out.Data, openRouterModel{
+				ID:            id,
+				Name:          modelDisplayName(id),
+				ContextLength: 1048576,
+				Pricing:       map[string]string{"prompt": "0", "completion": "0", "request": "0"},
+				Architecture:  map[string]any{"modality": "text->text", "tokenizer": "Other", "instruct_type": nil},
+				TopProvider:   map[string]any{"context_length": 1048576, "max_completion_tokens": nil, "is_moderated": false},
+			})
+		}
+	}
 }
 
 func modelDisplayName(id string) string {
@@ -2603,6 +2656,17 @@ func (p *Pool) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		defer p.concurrentZen.Add(-1)
 		acclog.Printf("%s routed to opencode model=%s", reqID, model)
 		p.handleOpenCode(w, r, body, model, isStream, start, reqID)
+		return
+	}
+
+	if strings.HasPrefix(model, "freeepi/") {
+		if !freepiEnabled() {
+			acclog.Printf("<- 503 %s %s model=%s (freepi disabled)", r.Method, r.URL.Path, model)
+			http.Error(w, `{"error":"freepi is disabled; set freepi.enabled: true with accounts in config.yml"}`, http.StatusServiceUnavailable)
+			return
+		}
+		acclog.Printf("%s routed to freepi model=%s", reqID, model)
+		p.handleFreepi(w, r, body, model, isStream, start, reqID)
 		return
 	}
 

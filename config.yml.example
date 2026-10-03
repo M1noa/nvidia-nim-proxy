@@ -257,6 +257,20 @@ zen:
 #   model_refresh_sec: 300
 #   timeout_ms: 20000
 
+# --- freepi: ad-supported free models (https://api.freepi.ai) ---
+# models are `freeepi/<id>` (catalog from GET /client-version).
+# login: ./nim freepi auth (github device flow, appends jwt below).
+# one live stream per account (server 409s a second); add more accounts
+# to run concurrent. ads run silently per account (banner + inline
+# impressions); nothing is displayed. jwt never leaves this file.
+freepi:
+  enabled: false
+  client_version: "0.2.19"  # below server min = 426 on completions
+  ad_inline_every: 5        # inline impression every Nth turn
+  accounts:
+    # - name: "main"
+    #   jwt: "<jwt from ./nim freepi auth>"
+
 # --- status: what /status shows ---
 # when auth.tokens is set AND the /status request has no valid token,
 # keys, locks, zen session and proxy are hidden no matter what these say.

@@ -175,6 +175,23 @@ type nvidiaConfig struct {
 	Enabled bool `yaml:"enabled"`
 }
 
+// freepiAccount is one ad-supported account: jwt from github device flow
+// (`./nim freepi auth`), stable x-session-id minted once (server 409s a
+// second concurrent stream on the same jwt).
+type freepiAccount struct {
+	Name string `yaml:"name"`
+	JWT  string `yaml:"jwt"`
+}
+
+// freepiConfig gates the freepi backend (https://api.freepi.ai).
+type freepiConfig struct {
+	Enabled       bool            `yaml:"enabled"`
+	Accounts      []freepiAccount `yaml:"accounts"`
+	ClientVersion string          `yaml:"client_version"`
+	// AdInlineEvery posts inline turns every Nth assistant turn. 0 = 5.
+	AdInlineEvery int `yaml:"ad_inline_every"`
+}
+
 type statusConfig struct {
 	ShowKeys           bool `yaml:"show_keys"`
 	ShowOpencodeModels bool `yaml:"show_opencode_models"`
@@ -217,6 +234,7 @@ type appConfig struct {
 	Rtk        rtkConfig         `yaml:"rtk"`
 	Translate  translateConfig   `yaml:"translate"`
 	Zen        zenConfig         `yaml:"zen"`
+	Freepi     freepiConfig      `yaml:"freepi"`
 	Status     statusConfig      `yaml:"status"`
 	Usage      usageConfig       `yaml:"usage"`
 	Models     modelsConfig      `yaml:"models"`
@@ -270,6 +288,10 @@ func defaultConfig() appConfig {
 		},
 		Nvidia: nvidiaConfig{
 			Enabled: true,
+		},
+		Freepi: freepiConfig{
+			ClientVersion: "0.2.19",
+			AdInlineEvery: 5,
 		},
 		Zen: zenConfig{
 			Enabled:                true,
@@ -813,6 +835,7 @@ func (p *Pool) StatusFor(authed bool) StatusResponse {
 		sr.Keys, sr.Locks = nil, nil
 		sr.ZenSession, sr.ZenProxy, sr.ZenAgo = "", "", ""
 		sr.ZenLanes = nil
+		sr.Freepi = nil
 		sr.LaneCap = 0
 		sr.Usage = nil
 		sr.Pool = nil

@@ -46,6 +46,9 @@ type usageTotals struct {
 var (
 	totalsMu sync.Mutex
 	totals   = map[string]*usageTotals{}
+	// totalsByKey mirrors totals keyed by record KeyName (e.g.
+	// "freepi:<account>). only populated when KeyName is set.
+	totalsByKey = map[string]*usageTotals{}
 )
 
 func logUsage(r UsageRecord) {
@@ -69,7 +72,30 @@ func logUsage(r UsageRecord) {
 	if r.StatusCode >= 400 {
 		t.Errors++
 	}
+	if r.KeyName != "" {
+		kt := totalsByKey[r.KeyName]
+		if kt == nil {
+			kt = &usageTotals{}
+			totalsByKey[r.KeyName] = kt
+		}
+		kt.Requests++
+		kt.Prompt += r.PromptTokens
+		kt.Completion += r.CompletionTokens
+		if r.StatusCode >= 400 {
+			kt.Errors++
+		}
+	}
 	totalsMu.Unlock()
+}
+
+// keyUsage returns totals for one KeyName ("" when none).
+func keyUsage(key string) usageTotals {
+	totalsMu.Lock()
+	defer totalsMu.Unlock()
+	if t := totalsByKey[key]; t != nil {
+		return *t
+	}
+	return usageTotals{}
 }
 
 func usageSnapshot() (reqs, prompt, comp int, byModel map[string]usageTotals) {
