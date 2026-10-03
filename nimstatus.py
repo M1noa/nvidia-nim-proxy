@@ -91,6 +91,12 @@ def plain_status(d):
     c.append("today %s req, %s tok · all-time %s req, %s tok%s" % (
         fmt_int(st["today"]["req"]), fmt_tok(st["today"]["tok"]),
         fmt_int(st["all"]["req"]), fmt_tok(st["all"]["tok"]), since))
+    fp = d.get("freepi") or {}
+    for acct in fp.get("accounts") or []:
+        tok = acct.get("prompt_tokens", 0) + acct.get("completion_tokens", 0)
+        c.append("freepi:%s %d req, %s tok%s" % (
+            acct.get("name", "?"), acct.get("requests", 0), fmt_tok(tok),
+            " INFLIGHT" if acct.get("inflight") else ""))
     return "\n".join(c)
 
 
@@ -142,10 +148,41 @@ def build_renderable(d, stats):
     parts.append(Text("convo = sticky conversation · shared = overflow pool · hdr = pinned header",
                        style="dim"))
     oc = d.get("opencode") or {}
-    models = oc.get("models") or []
-    if models:
-        short = [m.split("/", 1)[-1] for m in models]
-        parts.append(Text("models  " + " · ".join(short), style="dim"))
+    oc_models = [m.split("/", 1)[-1] for m in (oc.get("models") or [])]
+    fp = d.get("freepi") or {}
+    fp_models, fp_rows = [], []
+    for acct in fp.get("accounts") or []:
+        ms = acct.get("models") or []
+        fp_models.extend(ms)
+        req = acct.get("requests", 0)
+        tok = acct.get("prompt_tokens", 0) + acct.get("completion_tokens", 0)
+        mark = "◆" if acct.get("inflight") else "◇"
+        fp_rows.append((mark, acct.get("name", "?"), req, tok, ms))
+    nv_keys = [k.get("name", "?") for k in (d.get("keys") or [])]
+    cols = []
+    if oc_models:
+        cols.append(("opencode", oc_models))
+    if fp_models or fp_rows:
+        seen, uniq = set(), []
+        for m in fp_models:
+            if m not in seen:
+                seen.add(m)
+                uniq.append(m)
+        cols.append(("freepi", uniq))
+    if nv_keys:
+        cols.append(("nvidia", ["keys: " + ", ".join(nv_keys)]))
+    if cols:
+        t = Table(show_header=True, header_style="bold", box=None,
+                  pad_edge=False)
+        for name, _ in cols:
+            t.add_column(name, style="dim")
+        for row in zip(*[ms + [""] * (max(len(ms) for _, ms in cols) - len(ms))
+                         for _, ms in cols]):
+            t.add_row(*row)
+        parts.append(t)
+    for mark, name, req, tok, ms in fp_rows:
+        line = "%s freepi:%s  %d req · %s tok" % (mark, name, req, fmt_tok(tok))
+        parts.append(Text(line, style="yellow" if mark == "◆" else "dim"))
     p = d.get("pool") or {}
     parts.append(Text("pool  %d verified · %d dropped · refresh %s ago" % (
         p.get("verified", 0), p.get("dropped_total", 0),
