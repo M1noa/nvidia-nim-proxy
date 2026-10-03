@@ -121,6 +121,10 @@ type zenConfig struct {
 	// sweep, clearing the session hash/id from cache. lane_ttl_minutes
 	// stays the hard cap. 0 disables (ttl only).
 	SessionIdleMinutes int `yaml:"session_idle_minutes"`
+	// ConvoIdleMinutes drops convo-hash lanes idle past this (minutes).
+	// one-shot requests (title-gen) never pin a lane past this. hdr: and
+	// busy shared lanes keep the TTLs above. 0 disables.
+	ConvoIdleMinutes int `yaml:"convo_idle_minutes"`
 	// LaneMinGapMs paces a lane: a request waits until this long since the
 	// lane's previous send. 0 disables pacing (reactive cooldown only).
 	LaneMinGapMs int `yaml:"lane_min_gap_ms"`
@@ -270,12 +274,13 @@ func defaultConfig() appConfig {
 		Zen: zenConfig{
 			Enabled:                true,
 			BlockedCountries:       []string{"PK", "RU", "VE", "HK", "BY", "TJ", "IQ", "MM"},
-			MaxResponseMs:          400,
+			MaxResponseMs:          250,
 			PoolSize:               400,
 			Lanes:                  25,
 			LaneTTLMinutes:         30,
 			LaneCooldownSecs:       60,
 			SessionIdleMinutes:     6,
+			ConvoIdleMinutes:       1,
 			LaneMinGapMs:           1500,
 			LaneReleaseSecs:        90,
 			PoolRefresh429s:        2,

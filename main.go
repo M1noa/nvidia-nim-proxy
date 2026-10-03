@@ -641,6 +641,14 @@ func refreshOpencodeModels() {
 
 func initLogging() {
 	acclog = log.New(os.Stdout, "", log.LstdFlags)
+	// fresh log per boot: stdout is redirected to nim-proxy.log by the
+	// service scripts, so truncate it here instead of appending forever.
+	// stat first: never create it in a foreign cwd, only reset our own.
+	if _, err := os.Stat("nim-proxy.log"); err == nil {
+		if f, err := os.OpenFile("nim-proxy.log", os.O_WRONLY|os.O_TRUNC, 0644); err == nil {
+			f.Close()
+		}
+	}
 	df := "nim-proxy-debug.log"
 	if e := os.Getenv("DEBUG_FILE"); e != "" {
 		df = e
@@ -2487,7 +2495,11 @@ func (p *Pool) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 
 	reqID := fmt.Sprintf("req-%d", reqSeq.Add(1))
-	acclog.Printf("%s --> %s %s from %s (%d bytes)", reqID, r.Method, r.URL.Path, r.RemoteAddr, r.ContentLength)
+	// /status + /health poll every second from status tail: logging them
+	// buries real traffic. errors on those paths still log below.
+	if r.URL.Path != "/status" && r.URL.Path != "/health" {
+		acclog.Printf("%s --> %s %s from %s (%d bytes)", reqID, r.Method, r.URL.Path, r.RemoteAddr, r.ContentLength)
+	}
 
 	switch r.URL.Path {
 	case "/status", "/health":

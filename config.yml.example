@@ -167,7 +167,7 @@ zen:
   blocked_countries: ["PK", "RU", "VE", "HK", "BY", "TJ", "IQ", "MM"]
   # drop auto-pool candidates slower than this (ms). higher = more proxies,
   # slower failover. 0 = no limit.
-  max_response_ms: 400
+  max_response_ms: 250
   # cap on auto-pool size after sorting by speed. 0 = no cap.
   pool_size: 400
   # pinned proxy+session lanes. concurrent conversations spread across

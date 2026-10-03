@@ -49,7 +49,41 @@ type laneStatus struct {
 var (
 	lanesMu sync.Mutex
 	lanes   = map[string]*zenLane{}
+	// convoSeen counts convo-hash sightings so lanes pin only from the
+	// second request. tiny: hashes evicted on the sweep with the lanes.
+	convoSeenMu sync.Mutex
+	convoSeen   = map[string]int{}
 )
+
+// seenConvoLocked reports whether a convo hash was seen before.
+// caller holds lanesMu (same critical section as lane assignment).
+func seenConvoLocked(h string) bool {
+	convoSeenMu.Lock()
+	defer convoSeenMu.Unlock()
+	return convoSeen[h] > 0
+}
+
+// noteConvoLocked records a first sighting. caller holds lanesMu.
+func noteConvoLocked(h string) {
+	convoSeenMu.Lock()
+	defer convoSeenMu.Unlock()
+	convoSeen[h]++
+	if len(convoSeen) > 4*laneCap()+64 {
+		for k := range convoSeen {
+			delete(convoSeen, k)
+			break
+		}
+	}
+}
+
+// dropConvoSeen forgets a sighting when its lane is swept. caller holds
+// lanesMu; takes convoSeenMu (leaf lock, no inversion: convoSeenMu never
+// acquires lanesMu).
+func dropConvoSeen(k string) {
+	convoSeenMu.Lock()
+	defer convoSeenMu.Unlock()
+	delete(convoSeen, k)
+}
 
 // exit burns: an exit that 403s FreeTierError for a model is skipped for
 // that model until the burn lapses. per (exit, model), not per exit: a
@@ -98,6 +132,20 @@ func exitBurned(proxy, model string) bool {
 	return true
 }
 
+// sweepBurns drops lapsed burns. exitBurned deletes on read, but entries
+// for dropped exits or renamed models are never read again and would
+// linger: the pool churns hourly, so this runs on the same sweep.
+func sweepBurns() {
+	burnMu.Lock()
+	defer burnMu.Unlock()
+	now := time.Now()
+	for k, until := range burned {
+		if now.After(until) {
+			delete(burned, k)
+		}
+	}
+}
+
 func laneCap() int {
 	if n := cfg().Zen.Lanes; n > 0 {
 		return n
@@ -123,6 +171,16 @@ func laneCooldownBase() time.Duration {
 // evicted on the sweep. lane_ttl_minutes stays the hard cap.
 func sessionIdleTTL() time.Duration {
 	if m := cfg().Zen.SessionIdleMinutes; m > 0 {
+		return time.Duration(m) * time.Minute
+	}
+	return 0
+}
+
+// convoIdleTTL is the shorter idle TTL for convo-hash lanes only: one-shot
+// requests must not pin a lane for minutes. hdr: and shared lanes keep
+// the longer TTLs above.
+func convoIdleTTL() time.Duration {
+	if m := cfg().Zen.ConvoIdleMinutes; m > 0 {
 		return time.Duration(m) * time.Minute
 	}
 	return 0
@@ -277,6 +335,8 @@ func contentText(c any) string {
 
 // laneFor assigns a lane: explicit header wins, then conversation hash,
 // then the least-recently-used healthy lane (shared pool fallback).
+// convo-hash lanes pin only from the second sighting: single-turn
+// one-shots (title-gen) fall to the shared pool and never pin a lane.
 func laneFor(headerSession string, body []byte) *zenLane {
 	lanesMu.Lock()
 	defer lanesMu.Unlock()
@@ -284,7 +344,11 @@ func laneFor(headerSession string, body []byte) *zenLane {
 	if headerSession != "" {
 		key = "hdr:" + headerSession
 	} else if h := convoHash(body); h != "" {
-		key = h
+		if seenConvoLocked(h) {
+			key = h
+		} else {
+			noteConvoLocked(h)
+		}
 	}
 	if key != "" {
 		if l, ok := lanes[key]; ok {
@@ -657,14 +721,26 @@ func sweepLanes() {
 	if idle > 0 {
 		idleCutoff = time.Now().Add(-idle)
 	}
+	convo := convoIdleTTL()
+	var convoCutoff time.Time
+	if convo > 0 {
+		convoCutoff = time.Now().Add(-convo)
+	}
 	lanesMu.Lock()
 	for k, l := range lanes {
 		if l.lastUsed.Before(cutoff) {
 			delete(lanes, k)
+			dropConvoSeen(k)
+			continue
+		}
+		if !convoCutoff.IsZero() && strings.HasPrefix(k, "convo:") && l.lastUsed.Before(convoCutoff) {
+			delete(lanes, k)
+			dropConvoSeen(k)
 			continue
 		}
 		if !idleCutoff.IsZero() && l.lastUsed.Before(idleCutoff) {
 			delete(lanes, k)
+			dropConvoSeen(k)
 			continue
 		}
 		if rel > 0 && l.proxy != "" && time.Since(l.lastUsed) > rel {
@@ -673,6 +749,7 @@ func sweepLanes() {
 	}
 	lanesMu.Unlock()
 	resetPoolRefresh429s()
+	sweepBurns()
 	// scan-cache entries idle past the same ttl go too; vault entries
 	// keep their own (longer) ttl and are untouched.
 	if idle > 0 {

@@ -267,3 +267,79 @@ func TestProxyCredsRedacted(t *testing.T) {
 		}
 	}
 }
+
+// convo lanes pin only from the second sighting; one-shots use shared.
+func laneKeyOf(l *zenLane) string {
+	lanesMu.Lock()
+	defer lanesMu.Unlock()
+	for k, v := range lanes {
+		if v == l {
+			return k
+		}
+	}
+	return ""
+}
+
+func resetConvoSeen() {
+	convoSeenMu.Lock()
+	defer convoSeenMu.Unlock()
+	convoSeen = map[string]int{}
+}
+
+func TestConvoTwoRequestRule(t *testing.T) {
+	resetLanes()
+	resetConvoSeen()
+	defer resetLanes()
+	defer resetConvoSeen()
+	body := []byte(`{"messages":[{"role":"user","content":"title this chat"},{"role":"assistant","content":"done"}]}`)
+	l1 := laneFor("", body)
+	if strings.HasPrefix(laneKeyOf(l1), "convo:") {
+		t.Fatal("first sighting must not pin a convo lane")
+	}
+	l2 := laneFor("", body)
+	if !strings.HasPrefix(laneKeyOf(l2), "convo:") {
+		t.Fatal("second sighting must pin the convo lane")
+	}
+}
+
+// convo lanes idle past convo_idle_minutes are swept; hdr lanes stay.
+func TestConvoIdleExpiry(t *testing.T) {
+	resetLanes()
+	resetConvoSeen()
+	defer resetLanes()
+	defer resetConvoSeen()
+	c := testConfig()
+	c.Zen.ConvoIdleMinutes = 1
+	useConfig(t, c)
+	now := time.Now()
+	lanesMu.Lock()
+	lanes["convo:abc"] = &zenLane{id: "convo", session: zenSession(), lastUsed: now.Add(-2 * time.Minute)}
+	lanes["hdr:keep"] = &zenLane{id: "hdr", session: zenSession(), lastUsed: now.Add(-2 * time.Minute)}
+	lanesMu.Unlock()
+	sweepLanes()
+	lanesMu.Lock()
+	defer lanesMu.Unlock()
+	if _, ok := lanes["convo:abc"]; ok {
+		t.Fatal("idle convo lane must be swept")
+	}
+	if _, ok := lanes["hdr:keep"]; !ok {
+		t.Fatal("hdr lane must survive convo sweep")
+	}
+}
+
+// lapsed burns are swept even when never re-read.
+func TestSweepBurns(t *testing.T) {
+	burnMu.Lock()
+	burned["x\x00m"] = time.Now().Add(-time.Minute)
+	burned["y\x00m"] = time.Now().Add(time.Hour)
+	burnMu.Unlock()
+	sweepBurns()
+	burnMu.Lock()
+	defer burnMu.Unlock()
+	if _, ok := burned["x\x00m"]; ok {
+		t.Fatal("lapsed burn must be swept")
+	}
+	if _, ok := burned["y\x00m"]; !ok {
+		t.Fatal("live burn must survive")
+	}
+}

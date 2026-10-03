@@ -72,6 +72,9 @@ key/proxy/lane rotation to survive per-exit rate limits.
 - usage tracking (`usage.go`): gated on `usage.enabled`, one json line
   per request to `nim-usage.jsonl` plus in-memory totals for `/status`.
   counters only move through `logUsage`; zero overhead when disabled.
+  no local tokenizer exists anywhere: token counts are upstream `usage`
+  verbatim (prompt/completion/total). never add one.
+  `nimstatus.py` reads the jsonl for today/all-time display.
 
 ## 4. /status rules
 

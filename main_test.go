@@ -2022,15 +2022,23 @@ func TestLaneSnapshotRedactsCredentials(t *testing.T) {
 
 func TestLaneConvoHash(t *testing.T) {
 	resetLanes()
+	resetConvoSeen()
 	defer resetLanes()
+	defer resetConvoSeen()
 	b1 := []byte(`{"messages":[{"role":"user","content":"fix the login bug"},{"role":"assistant","content":"sure"}]}`)
 	b2 := []byte(`{"messages":[{"role":"user","content":"fix the login bug"},{"role":"assistant","content":"sure"},{"role":"user","content":"now the logout too"}]}`)
+	// first sighting falls to shared (two-request rule); second pins.
+	laneFor("", b1)
+	pinned := laneFor("", b1)
+	if !strings.HasPrefix(laneKeyOf(pinned), "convo:") {
+		t.Fatal("second sighting must pin a convo lane")
+	}
 	// follow-up user turn keeps first-user + last-assistant -> same lane
-	if laneFor("", b1) != laneFor("", b2) {
+	if laneFor("", b2) != pinned {
 		t.Fatal("same conversation must reuse its lane")
 	}
 	b3 := []byte(`{"messages":[{"role":"user","content":"write a haiku"}]}`)
-	if laneFor("", b3) == laneFor("", b1) {
+	if laneFor("", b3) == pinned {
 		t.Fatal("different conversations must not share a lane")
 	}
 	if convoHash([]byte(`{"model":"x"}`)) != "" {

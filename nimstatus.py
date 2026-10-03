@@ -35,7 +35,8 @@ def today_str():
 
 def jsonl_stats():
     """All-time + today totals from nim-usage.jsonl. Returns dict."""
-    out = {"all": {"req": 0, "tok": 0}, "today": {"req": 0, "tok": 0}}
+    out = {"all": {"req": 0, "tok": 0}, "today": {"req": 0, "tok": 0},
+           "since": ""}
     path = os.path.join(ROOT, "nim-usage.jsonl")
     today = today_str()
     try:
@@ -49,7 +50,10 @@ def jsonl_stats():
                     r.get("prompt_tokens", 0) + r.get("completion_tokens", 0))
                 out["all"]["req"] += 1
                 out["all"]["tok"] += tok
-                if str(r.get("ts", ""))[:10] == today:
+                ts = str(r.get("ts", ""))
+                if not out["since"] and ts:
+                    out["since"] = ts[:10]
+                if ts[:10] == today:
                     out["today"]["req"] += 1
                     out["today"]["tok"] += tok
     except OSError:
@@ -57,7 +61,13 @@ def jsonl_stats():
     return out
 
 
+def fmt_int(n):
+    return "%s" % f"{n:,}"
+
+
 def fmt_tok(n):
+    if n >= 1_000_000_000:
+        return "%.1fB" % (n / 1_000_000_000)
     if n >= 1_000_000:
         return "%.1fM" % (n / 1_000_000)
     if n >= 1_000:
@@ -77,9 +87,10 @@ def plain_status(d):
     c.append("pool %d verified, %d dropped" % (
         p.get("verified", 0), p.get("dropped_total", 0)))
     st = jsonl_stats()
-    c.append("today %d req, %s tok · all-time %d req, %s tok" % (
-        st["today"]["req"], fmt_tok(st["today"]["tok"]),
-        st["all"]["req"], fmt_tok(st["all"]["tok"])))
+    since = " since " + st["since"] if st["since"] else ""
+    c.append("today %s req, %s tok · all-time %s req, %s tok%s" % (
+        fmt_int(st["today"]["req"]), fmt_tok(st["today"]["tok"]),
+        fmt_int(st["all"]["req"]), fmt_tok(st["all"]["tok"]), since))
     return "\n".join(c)
 
 
@@ -128,13 +139,21 @@ def build_renderable(d, stats):
                    style="green" if ok else "red")
     parts.append(hdr)
     parts.append(merged_table(d))
+    parts.append(Text("convo = sticky conversation · shared = overflow pool · hdr = pinned header",
+                       style="dim"))
+    oc = d.get("opencode") or {}
+    models = oc.get("models") or []
+    if models:
+        short = [m.split("/", 1)[-1] for m in models]
+        parts.append(Text("models  " + " · ".join(short), style="dim"))
     p = d.get("pool") or {}
     parts.append(Text("pool  %d verified · %d dropped · refresh %s ago" % (
         p.get("verified", 0), p.get("dropped_total", 0),
         p.get("last_refresh_ago", "?")), style="dim"))
-    parts.append(Text("today %d req · %s tok   │   all-time %d req · %s tok" % (
-        stats["today"]["req"], fmt_tok(stats["today"]["tok"]),
-        stats["all"]["req"], fmt_tok(stats["all"]["tok"])), style="dim"))
+    since = " since " + stats["since"] if stats["since"] else ""
+    parts.append(Text("today %s req · %s tok   │   all-time %s req · %s tok%s" % (
+        fmt_int(stats["today"]["req"]), fmt_tok(stats["today"]["tok"]),
+        fmt_int(stats["all"]["req"]), fmt_tok(stats["all"]["tok"]), since), style="dim"))
     return Group(*parts)
 
 
@@ -171,7 +190,7 @@ def main():
             import time
             try:
                 while True:
-                    time.sleep(2)
+                    time.sleep(1)
                     live.update(render())
             except KeyboardInterrupt:
                 pass
