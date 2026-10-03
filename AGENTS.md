@@ -40,6 +40,13 @@ key/proxy/lane rotation to survive per-exit rate limits.
   (who owns the invariant). reproduce-first for bug fixes.
 - green before commit: `gofmt -l .`, `go vet ./...`, `go test ./...`.
   ner build is separate: `go build -tags ner`.
+- never interrupt the primary instance (:5419 live). test on a separate
+  port with a scratch config until the change is verified end to end:
+  copy `config.yml` to `config.test.yml`, set `server.port` to an unused
+  port (e.g. 5420) and `usage.path` to a scratch file, then
+  `CONFIG_FILE=config.test.yml ./nim-proxy`. only restart the primary
+  (`./nim restart`) when done and confident. delete scratch configs,
+  binaries, and usage files after.
 
 ## 3. config rules
 
