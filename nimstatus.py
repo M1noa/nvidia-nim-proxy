@@ -22,6 +22,7 @@ try:
     from rich.console import Console, Group
     from rich.live import Live
     from rich.table import Table
+    from rich import box
     from rich.text import Text
 
     RICH = True
@@ -105,7 +106,7 @@ def merged_table(d):
     lanes = d.get("zen_lanes") or []
     pool = d.get("pool") or {}
     exits = {e.get("proxy"): e for e in (pool.get("exits") or [])}
-    t = Table(show_header=True, header_style="bold", box=None,
+    t = Table(show_header=True, header_style="bold", box=box.SIMPLE,
               pad_edge=False)
     t.add_column("", width=2)
     t.add_column("lane", style="cyan")
@@ -148,7 +149,7 @@ def build_renderable(d, stats):
     parts.append(Text("convo = sticky conversation · shared = overflow pool · hdr = pinned header",
                        style="dim"))
     oc = d.get("opencode") or {}
-    oc_models = [m.split("/", 1)[-1] for m in (oc.get("models") or [])]
+    oc_models = list(oc.get("models") or [])
     fp = d.get("freepi") or {}
     fp_models, fp_rows = [], []
     for acct in fp.get("accounts") or []:
@@ -165,14 +166,15 @@ def build_renderable(d, stats):
     if fp_models or fp_rows:
         seen, uniq = set(), []
         for m in fp_models:
-            if m not in seen:
-                seen.add(m)
-                uniq.append(m)
+            full = m if "/" in m else "freeepi/" + m
+            if full not in seen:
+                seen.add(full)
+                uniq.append(full)
         cols.append(("freepi", uniq))
     if nv_keys:
         cols.append(("nvidia", ["keys: " + ", ".join(nv_keys)]))
     if cols:
-        t = Table(show_header=True, header_style="bold", box=None,
+        t = Table(show_header=True, header_style="bold", box=box.SIMPLE,
                   pad_edge=False)
         for name, _ in cols:
             t.add_column(name, style="dim")
