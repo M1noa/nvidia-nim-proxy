@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 """nimstatus: rich renderer for ./nim status/log commands. stdlib fallback."""
+import datetime
 import json
 import os
 import sys
@@ -7,6 +8,7 @@ import urllib.request
 
 PORT = os.environ.get("PORT", "5419")
 BASE = "http://localhost:" + PORT
+ROOT = os.path.dirname(os.path.abspath(__file__))
 
 
 def fetch(path):
@@ -17,7 +19,8 @@ def fetch(path):
 
 
 try:
-    from rich.console import Console
+    from rich.console import Console, Group
+    from rich.live import Live
     from rich.table import Table
     from rich.text import Text
 
@@ -26,85 +29,118 @@ except ImportError:
     RICH = False
 
 
+def today_str():
+    return datetime.date.today().isoformat()
+
+
+def jsonl_stats():
+    """All-time + today totals from nim-usage.jsonl. Returns dict."""
+    out = {"all": {"req": 0, "tok": 0}, "today": {"req": 0, "tok": 0}}
+    path = os.path.join(ROOT, "nim-usage.jsonl")
+    today = today_str()
+    try:
+        with open(path) as f:
+            for line in f:
+                try:
+                    r = json.loads(line)
+                except ValueError:
+                    continue
+                tok = r.get("total_tokens") or (
+                    r.get("prompt_tokens", 0) + r.get("completion_tokens", 0))
+                out["all"]["req"] += 1
+                out["all"]["tok"] += tok
+                if str(r.get("ts", ""))[:10] == today:
+                    out["today"]["req"] += 1
+                    out["today"]["tok"] += tok
+    except OSError:
+        pass
+    return out
+
+
+def fmt_tok(n):
+    if n >= 1_000_000:
+        return "%.1fM" % (n / 1_000_000)
+    if n >= 1_000:
+        return "%.1fk" % (n / 1_000)
+    return str(n)
+
+
 def plain_status(d):
     c = []
     c.append("NimRoute %s | up %s | load %d/%d" % (
         d.get("version", "?"), d.get("uptime", "?"),
         d.get("concurrent", 0), d.get("sem_limit", 0)))
-    if "keys" in d:
-        c.append("keys %d/%d avail" % (d.get("available", 0), d.get("total", 0)))
     lanes = d.get("zen_lanes") or []
     live = sum(1 for l in lanes if not l.get("cooldown_remaining"))
     c.append("lanes %d/%d live" % (live, len(lanes)))
     p = d.get("pool") or {}
     c.append("pool %d verified, %d dropped" % (
         p.get("verified", 0), p.get("dropped_total", 0)))
-    u = d.get("usage") or {}
-    c.append("usage %d req, %d tok" % (
-        u.get("requests", 0), u.get("prompt_tokens", 0) + u.get("completion_tokens", 0)))
+    st = jsonl_stats()
+    c.append("today %d req, %s tok · all-time %d req, %s tok" % (
+        st["today"]["req"], fmt_tok(st["today"]["tok"]),
+        st["all"]["req"], fmt_tok(st["all"]["tok"])))
     return "\n".join(c)
+
+
+def merged_table(d):
+    """One table: lane + its exit (host, cc, ms) + req + state."""
+    lanes = d.get("zen_lanes") or []
+    pool = d.get("pool") or {}
+    exits = {e.get("proxy"): e for e in (pool.get("exits") or [])}
+    t = Table(show_header=True, header_style="bold", box=None,
+              pad_edge=False)
+    t.add_column("", width=2)
+    t.add_column("lane", style="cyan")
+    t.add_column("exit")
+    t.add_column("cc")
+    t.add_column("ms", justify="right")
+    t.add_column("req", justify="right")
+    t.add_column("state")
+    for l in lanes:
+        cool = l.get("cooldown_remaining")
+        mark = Text("○", style="red") if cool else Text("●", style="green")
+        state = Text("cool " + cool, style="red") if cool else Text(
+            "live", style="dim")
+        proxy = l.get("proxy") or ""
+        e = exits.get(proxy, {})
+        if proxy:
+            host = proxy.split("://", 1)[-1]
+            exit_t = Text(host)
+        else:
+            exit_t = Text("—", style="dim")
+        t.add_row(mark, (l.get("id") or "?")[:14], exit_t,
+                  str(e.get("country", "·")), str(e.get("latency_ms", "·")),
+                  str(l.get("requests", 0)), state)
+    return t
+
+
+def build_renderable(d, stats):
+    parts = []
+    hdr = Text("NimRoute %s" % d.get("version", "?"), style="bold cyan")
+    hdr.append("  up %s" % d.get("uptime", "?"), style="dim")
+    hdr.append("  load %d/%d" % (d.get("concurrent", 0),
+                                 d.get("sem_limit", 0)))
+    if "keys" in d:
+        ok = bool(d.get("available"))
+        hdr.append("  keys %d/%d" % (d.get("available", 0),
+                                     d.get("total", 0)),
+                   style="green" if ok else "red")
+    parts.append(hdr)
+    parts.append(merged_table(d))
+    p = d.get("pool") or {}
+    parts.append(Text("pool  %d verified · %d dropped · refresh %s ago" % (
+        p.get("verified", 0), p.get("dropped_total", 0),
+        p.get("last_refresh_ago", "?")), style="dim"))
+    parts.append(Text("today %d req · %s tok   │   all-time %d req · %s tok" % (
+        stats["today"]["req"], fmt_tok(stats["today"]["tok"]),
+        stats["all"]["req"], fmt_tok(stats["all"]["tok"])), style="dim"))
+    return Group(*parts)
 
 
 def rich_status(d):
     con = Console()
-    hdr = Text("NimRoute %s" % d.get("version", "?"), style="bold cyan")
-    hdr.append("  up %s" % d.get("uptime", "?"), style="dim")
-    hdr.append("  load %d/%d" % (d.get("concurrent", 0), d.get("sem_limit", 0)))
-    con.print(hdr)
-    if "keys" in d:
-        con.print("keys  %d/%d available" % (d.get("available", 0), d.get("total", 0)),
-                  style="green" if d.get("available") else "red")
-    else:
-        con.print("keys  keyless (opencode/* only)", style="dim")
-    lanes = d.get("zen_lanes") or []
-    if lanes:
-        t = Table(title="lanes %d" % len(lanes), show_header=True,
-                  header_style="bold", box=None, pad_edge=False)
-        t.add_column("", width=2)
-        t.add_column("lane", style="cyan")
-        t.add_column("exit")
-        t.add_column("req", justify="right")
-        t.add_column("state")
-        for l in lanes:
-            cool = l.get("cooldown_remaining")
-            mark = Text("○", style="red") if cool else Text("●", style="green")
-            state = Text("cool " + cool, style="red") if cool else Text(
-                "live", style="dim")
-            proxy = l.get("proxy") or Text("no exit", style="dim")
-            t.add_row(mark, (l.get("id") or "?")[:14], proxy,
-                      str(l.get("requests", 0)), state)
-        con.print(t)
-    p = d.get("pool") or {}
-    if p:
-        con.print("pool  %d verified · %d dropped · refresh %s ago" % (
-            p.get("verified", 0), p.get("dropped_total", 0),
-            p.get("last_refresh_ago", "?")))
-        exits = p.get("exits") or []
-        t = Table(show_header=True, header_style="bold", box=None,
-                  pad_edge=False)
-        t.add_column("", width=2)
-        t.add_column("exit")
-        t.add_column("cc")
-        t.add_column("ms", justify="right")
-        for e in exits[:8]:
-            pin = Text("◆", style="yellow") if e.get("pinned") else Text("·", style="dim")
-            t.add_row(pin, e.get("proxy", "?"), e.get("country", "?"),
-                      str(e.get("latency_ms", "?")))
-        con.print(t)
-        if len(exits) > 8:
-            con.print("      +%d more" % (len(exits) - 8), style="dim")
-    u = d.get("usage") or {}
-    if u:
-        con.print("usage %d req · %d in · %d out" % (
-            u.get("requests", 0), u.get("prompt_tokens", 0),
-            u.get("completion_tokens", 0)), style="dim")
-
-
-def rich_status_renderable(d, con):
-    """Render status into capturable output for Live refresh."""
-    with con.capture() as cap:
-        rich_status(d)
-    return Text(cap.get())
+    con.print(build_renderable(d, jsonl_stats()))
 
 
 def main():
@@ -123,8 +159,6 @@ def main():
         if not RICH:
             print("rich not available, install with: pip install rich")
             return 1
-        from rich.live import Live
-        from rich.console import Console
         con = Console()
 
         def render():
@@ -132,9 +166,8 @@ def main():
                 d = fetch("/status")
             except Exception as e:
                 return Text("(status fetch failed: %s)" % e, style="red")
-            return rich_status_renderable(d, con)
-        with Live(render(), refresh_per_second=0.5, console=con,
-                  screen=False) as live:
+            return build_renderable(d, jsonl_stats())
+        with Live(render(), refresh_per_second=0.5, console=con) as live:
             import time
             try:
                 while True:
@@ -144,8 +177,7 @@ def main():
                 pass
     elif cmd == "logs":
         n = int(sys.argv[2]) if len(sys.argv) > 2 else 10
-        log = os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                           "nim-proxy.log")
+        log = os.path.join(ROOT, "nim-proxy.log")
         try:
             with open(log) as f:
                 lines = f.readlines()[-n:]

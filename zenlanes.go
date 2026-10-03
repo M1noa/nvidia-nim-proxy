@@ -386,7 +386,7 @@ func laneBlock(l *zenLane) {
 	lanesMu.Lock()
 	defer lanesMu.Unlock()
 	l.proxy = ""
-	l.cooldown = time.Now().Add(5 * time.Second)
+	l.cooldown = time.Now().Add(3 * time.Second)
 }
 
 // noteRateLimit counts lanes rate-limited since the last pool refresh and

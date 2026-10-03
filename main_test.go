@@ -2217,8 +2217,8 @@ func TestLaneBlockIsShortAndDropsExit(t *testing.T) {
 	if l.proxy != "" {
 		t.Error("identity block must drop the exit")
 	}
-	if d := time.Until(l.cooldown); d > 6*time.Second {
-		t.Errorf("identity block cooldown %v, want <= ~5s (not a rate limit)", d)
+	if d := time.Until(l.cooldown); d > 4*time.Second {
+		t.Errorf("identity block cooldown %v, want <= ~3s (not a rate limit)", d)
 	}
 }
 
