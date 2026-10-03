@@ -410,12 +410,18 @@ func (s *Scanner) detectZoned(text string, zones [][2]int) []Span {
 }
 
 // restoreBody swaps surrogates back in a complete response body.
+// mirrors MaskBody's guard: a restore that breaks valid json ships the
+// masked body instead of corrupting the client response.
 func restoreBody(body []byte, v *Vault) []byte {
 	if v == nil {
 		return body
 	}
 	s := restoreText(string(body), v)
-	return []byte(s)
+	out := []byte(s)
+	if json.Valid(body) && !json.Valid(out) {
+		return body
+	}
+	return out
 }
 
 // revealer restores placeholders in a byte stream, holding only a suffix

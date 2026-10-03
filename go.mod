@@ -1,4 +1,4 @@
-module nvidia-nim-proxy
+module nimroute
 
 go 1.25
 

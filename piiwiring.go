@@ -3,7 +3,7 @@ package main
 import (
 	"net/http"
 
-	"nvidia-nim-proxy/pii"
+	"nimroute/pii"
 )
 
 // pii wiring: session guard from config + request headers, disclose line,

@@ -1,6 +1,7 @@
 package pii
 
 import (
+	"container/list"
 	"crypto/sha256"
 	"encoding/json"
 	"strings"
@@ -46,9 +47,19 @@ type Guard struct {
 }
 
 var (
-	guardMu sync.Mutex
-	guards  = map[string]*Guard{}
+	guardMu  sync.Mutex
+	guards   = map[string]*guardEntry{}
+	guardLRU = list.New()
 )
+
+// maxGuards caps session guards: X-Session-Id is attacker-controlled,
+// so an unbounded map is a memory-exhaustion vector. LRU eviction.
+const maxGuards = 512
+
+type guardEntry struct {
+	guard *Guard
+	elem  *list.Element
+}
 
 // SessionKey derives a stable vault id from an api key.
 func SessionKey(apiKey string) string {
@@ -75,13 +86,27 @@ func ForRequest(cfg Config, sessionID string) *Guard {
 	if !cfg.Enabled {
 		return nil
 	}
+	if len(sessionID) > 128 {
+		sessionID = sessionID[:128]
+	}
 	guardMu.Lock()
 	defer guardMu.Unlock()
-	if g, ok := guards[sessionID]; ok {
-		return g
+	if e, ok := guards[sessionID]; ok {
+		guardLRU.MoveToFront(e.elem)
+		return e.guard
 	}
 	g := build(cfg, sessionID)
-	guards[sessionID] = g
+	e := &guardEntry{guard: g}
+	e.elem = guardLRU.PushFront(sessionID)
+	guards[sessionID] = e
+	for guardLRU.Len() > maxGuards {
+		back := guardLRU.Back()
+		if back == nil {
+			break
+		}
+		delete(guards, back.Value.(string))
+		guardLRU.Remove(back)
+	}
 	return g
 }
 
@@ -183,9 +208,9 @@ func (g *Guard) VaultLookup(s string) (string, bool) {
 func SweepScanIdle(ttl time.Duration) int {
 	guardMu.Lock()
 	caches := make([]*ScanCache, 0, len(guards))
-	for _, g := range guards {
-		if g != nil && g.scanner != nil && g.scanner.Cache != nil {
-			caches = append(caches, g.scanner.Cache)
+	for _, e := range guards {
+		if e != nil && e.guard != nil && e.guard.scanner != nil && e.guard.scanner.Cache != nil {
+			caches = append(caches, e.guard.scanner.Cache)
 		}
 	}
 	guardMu.Unlock()

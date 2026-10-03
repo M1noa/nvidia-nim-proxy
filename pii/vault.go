@@ -198,21 +198,45 @@ func (v *Vault) MaxSurrogateLen() int {
 
 // global session vault registry: id -> vault. sessions expire with ttl.
 var (
-	vaultsMu sync.Mutex
-	vaults   = map[string]*Vault{}
+	vaultsMu  sync.Mutex
+	vaults    = map[string]*vaultEntry2{}
+	vaultsLRU = list.New()
 )
+
+// maxVaults mirrors maxGuards: the session vault registry is keyed by
+// the same attacker-influenced session id.
+const maxVaults = 512
+
+type vaultEntry2 struct {
+	vault *Vault
+	elem  *list.Element
+}
 
 func SessionVault(id string, key []byte, ttl time.Duration, maxSize int) *Vault {
 	return SessionVaultMode(id, key, ttl, maxSize, "realistic")
 }
 
 func SessionVaultMode(id string, key []byte, ttl time.Duration, maxSize int, mode string) *Vault {
+	if len(id) > 128 {
+		id = id[:128]
+	}
 	vaultsMu.Lock()
 	defer vaultsMu.Unlock()
-	if v, ok := vaults[id]; ok {
-		return v
+	if e, ok := vaults[id]; ok {
+		vaultsLRU.MoveToFront(e.elem)
+		return e.vault
 	}
 	v := NewVaultMode(key, ttl, maxSize, mode)
-	vaults[id] = v
+	e := &vaultEntry2{vault: v}
+	e.elem = vaultsLRU.PushFront(id)
+	vaults[id] = e
+	for vaultsLRU.Len() > maxVaults {
+		back := vaultsLRU.Back()
+		if back == nil {
+			break
+		}
+		delete(vaults, back.Value.(string))
+		vaultsLRU.Remove(back)
+	}
 	return v
 }

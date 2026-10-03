@@ -173,7 +173,9 @@ zen:
   # pinned proxy+session lanes. concurrent conversations spread across
   # lanes so they stop hammering one exit ip into 429s. lane identity:
   # x-session-id header -> conversation hash -> shared lru pool.
-  lanes: 8
+  # match this to concurrent clients + headroom; the keyless concurrency
+  # limit follows it, so both move together.
+  lanes: 25
   # idle lanes expire after this (minutes), swept on the pool refresh tick.
   lane_ttl_minutes: 30
   # drop lanes idle past this (minutes) on the same sweep, clearing the
@@ -194,6 +196,33 @@ zen:
   # for this long (minutes). per (exit, model): the exit can still serve
   # other models. 0 disables (never burn, old behavior).
   exit_burn_minutes: 30
+  # upstream attempts per request (first try + retries). default 4 retries.
+  # 0 = same default, negative = single attempt, no retry.
+  max_retries: 4
+  # verify a lane's pinned exit before reuse (ms). 0 = 1000.
+  probe_timeout_ms: 1000
+  # cap the parallel exit race when picking a proxy (ms). 0 = 3000.
+  race_timeout_ms: 3000
+  # cap pacing+cooldown wait per send (seconds). 0 = 10.
+  lane_gate_max_secs: 10
+  # clamp the all-lanes-cooling wait (seconds). 0 = 3.
+  lane_wait_max_secs: 3
+  # pool refresh + session rotation after this long with every lane
+  # cooling and no success (seconds). 0 = 15.
+  stale_pool_secs: 15
+  # upstream timeouts: proxied vs direct (seconds). 0 = 120/300.
+  zen_timeout_secs: 120
+  zen_direct_timeout_secs: 300
+  # parallel proxy verification fan-out. 0 = 40.
+  verify_concurrency: 40
+  # consecutive net/geo/block/free-tier errors before a pool refresh.
+  # 0 = 3.
+  error_threshold: 3
+  # pool re-verify + lane sweep tick (minutes). 0 = 60.
+  refresh_interval_minutes: 60
+  # linear backoff step between zen retries, capped (ms). 0 = 150/300.
+  retry_backoff_ms: 150
+  retry_backoff_max_ms: 300
 
 # --- freebuff (planned, disabled. see FREEBUFF-PLAN.md) ---
 # privacy: every proxied prompt leaves this machine. short version, full

@@ -14,7 +14,7 @@ import (
 	"testing"
 	"time"
 
-	"nvidia-nim-proxy/pii"
+	"nimroute/pii"
 )
 
 // loadSuiteConfig returns the config the whole suite is written against.

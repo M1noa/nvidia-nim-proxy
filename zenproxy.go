@@ -23,7 +23,7 @@ const proxyListURL = "https://proxies.minoa.cat/list?format=json&sort=response&l
 
 // zenBlockedCountries are api-reported countries whose exits zen geo-blocks
 // for muse-spark (RegionError "not available in your country"). from the
-// probe_zen_proxies.py sweep: PK 4/4 blocked, RU/VE/HK blocked with 0 ok,
+// scripts/probe_zen_proxies.py sweep: PK 4/4 blocked, RU/VE/HK blocked with 0 ok,
 // BY/TJ/IQ/MM blocked with 0 ok.
 var (
 	zenBlockedMu        sync.RWMutex
@@ -202,7 +202,11 @@ func refreshZenProxies() {
 	var wg sync.WaitGroup
 	var mu sync.Mutex
 	verified := make([]string, 0, len(cands))
-	sem := make(chan struct{}, 40)
+	verifyConc := 40
+	if n := c.Zen.VerifyConcurrency; n > 0 {
+		verifyConc = n
+	}
+	sem := make(chan struct{}, verifyConc)
 	for _, u := range cands {
 		wg.Add(1)
 		go func(u string) {
@@ -485,7 +489,7 @@ func noteZenNetworkError() bool {
 	zenNetErrMu.Lock()
 	defer zenNetErrMu.Unlock()
 	zenNetErrs++
-	return zenNetErrs >= 3
+	return zenNetErrs >= zenErrorThreshold()
 }
 
 func resetZenNetworkErrors() {
@@ -494,12 +498,28 @@ func resetZenNetworkErrors() {
 	zenNetErrs = 0
 }
 
-// zenBackoff caps retry sleeps at 300ms: 0, 150ms, 300ms, 300ms.
-// old linear 1-4s sleeps added up to 10s per request on a dead pool.
+// zenErrorThreshold is the consecutive-error count that marks the pool
+// stale. 0/unset = 3.
+func zenErrorThreshold() int {
+	if n := cfg().Zen.ErrorThreshold; n > 0 {
+		return n
+	}
+	return 3
+}
+
+// zenBackoff sleeps step*retry capped at max: defaults 0, 150ms, 300ms.
 func zenBackoff(retry int) {
-	d := time.Duration(retry) * 150 * time.Millisecond
-	if d > 300*time.Millisecond {
-		d = 300 * time.Millisecond
+	step := 150 * time.Millisecond
+	if ms := cfg().Zen.RetryBackoffMs; ms > 0 {
+		step = time.Duration(ms) * time.Millisecond
+	}
+	max := 300 * time.Millisecond
+	if ms := cfg().Zen.RetryBackoffMaxMs; ms > 0 {
+		max = time.Duration(ms) * time.Millisecond
+	}
+	d := time.Duration(retry) * step
+	if d > max {
+		d = max
 	}
 	if d > 0 {
 		time.Sleep(d)
@@ -524,7 +544,7 @@ func noteZenGeoErr() bool {
 	zenGeoMu.Lock()
 	defer zenGeoMu.Unlock()
 	zenGeoErrs++
-	return zenGeoErrs >= 3
+	return zenGeoErrs >= zenErrorThreshold()
 }
 
 func resetZenGeoErrs() {
@@ -545,7 +565,7 @@ func noteZenBlockErr() bool {
 	zenBlockMu.Lock()
 	defer zenBlockMu.Unlock()
 	zenBlockErrs++
-	return zenBlockErrs >= 3
+	return zenBlockErrs >= zenErrorThreshold()
 }
 
 func resetZenBlockErrs() {
@@ -576,7 +596,7 @@ func noteZenFreeTierErr() bool {
 	zenFreeTierMu.Lock()
 	defer zenFreeTierMu.Unlock()
 	zenFreeTierErrs++
-	return zenFreeTierErrs >= 3
+	return zenFreeTierErrs >= zenErrorThreshold()
 }
 
 func resetZenFreeTierErrs() {
@@ -674,17 +694,18 @@ func poolSnapshot() poolSummary {
 }
 
 // logZenNetErr logs a transport-level zen failure with model and country.
+// proxy userinfo is redacted: the access log is world-readable.
 func logZenNetErr(retry int, model, proxy, tag string, err error) {
-	acclog.Printf("!! opencode zen error (retry %d/4) model=%s country=%s proxy=%s %s: %v",
-		retry, model, proxyCountry(proxy), proxy, tag, err)
+	acclog.Printf("!! opencode zen error (retry %d/%d) model=%s country=%s proxy=%s %s: %v",
+		retry, zenRetryLabel(), model, proxyCountry(proxy), redactProxyUserinfo(proxy), tag, err)
 }
 
 // logZenBlocked logs a geo/user block with status, snippet, and the running
-// per-country block count. returns the count.
+// per-country block count. returns the count. proxy redacted like above.
 func logZenBlocked(kind string, retry, status int, model, proxy, tag string, body []byte) int {
 	n := noteZenCountryBlock(proxyCountry(proxy))
-	acclog.Printf("  opencode %s-blocked %d (retry %d/4) model=%s country=%s blocks=%d via proxy=%s %s err=%q",
-		kind, status, retry, model, proxyCountry(proxy), n, proxy, tag, errSnippet(body, 160))
+	acclog.Printf("  opencode %s-blocked %d (retry %d/%d) model=%s country=%s blocks=%d via proxy=%s %s err=%q",
+		kind, status, retry, zenRetryLabel(), model, proxyCountry(proxy), n, redactProxyUserinfo(proxy), tag, errSnippet(body, 160))
 	return n
 }
 
@@ -702,7 +723,11 @@ func watchZenProxies() {
 		refreshZenProxies()
 	}
 	for {
-		time.Sleep(time.Hour)
+		interval := time.Hour
+		if m := cfg().Zen.RefreshIntervalMinutes; m > 0 {
+			interval = time.Duration(m) * time.Minute
+		}
+		time.Sleep(interval)
 		if zenEnabled() {
 			refreshZenProxies()
 		}
@@ -767,14 +792,22 @@ func closeZenTransport(proxyURL string) {
 
 // zenClient builds a client routing via proxyURL, or direct if ""/bad.
 func zenClient(proxyURL string) *http.Client {
+	direct := 300 * time.Second
+	if s := cfg().Zen.ZenDirectTimeoutSecs; s > 0 {
+		direct = time.Duration(s) * time.Second
+	}
 	if proxyURL == "" {
-		return &http.Client{Timeout: 300 * time.Second}
+		return &http.Client{Timeout: direct}
 	}
 	pu, err := url.Parse(proxyURL)
 	if err != nil {
-		return &http.Client{Timeout: 300 * time.Second}
+		return &http.Client{Timeout: direct}
 	}
-	return &http.Client{Timeout: 120 * time.Second, Transport: zenTransport(proxyURL, pu)}
+	proxied := 120 * time.Second
+	if s := cfg().Zen.ZenTimeoutSecs; s > 0 {
+		proxied = time.Duration(s) * time.Second
+	}
+	return &http.Client{Timeout: proxied, Transport: zenTransport(proxyURL, pu)}
 }
 
 // socks4Dial connects to proxyAddr and requests a SOCKS4/SOCKS4a CONNECT to addr.

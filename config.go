@@ -29,13 +29,13 @@ type authConfig struct {
 }
 
 type guardrailsConfig struct {
-	Enabled  bool     `yaml:"enabled"`
-	File     string   `yaml:"file"`
-	Extra    []string `yaml:"extra"`
+	Enabled bool     `yaml:"enabled"`
+	File    string   `yaml:"file"`
+	Extra   []string `yaml:"extra"`
 	// fuzzy-match tuning: score >= threshold strips. score is
 	// coverage*(window_weight+density_weight*density). defaults 0.6/0.7/0.3.
-	Threshold    float64 `yaml:"threshold"`
-	WindowWeight float64 `yaml:"window_weight"`
+	Threshold     float64 `yaml:"threshold"`
+	WindowWeight  float64 `yaml:"window_weight"`
 	DensityWeight float64 `yaml:"density_weight"`
 }
 
@@ -134,6 +134,37 @@ type zenConfig struct {
 	// out of that model's rotation. per (exit, model): the exit can still
 	// serve other models. 0 disables (never burn).
 	ExitBurnMinutes int `yaml:"exit_burn_minutes"`
+	// MaxRetries caps zen upstream attempts per request (first try +
+	// retries). 0 = single attempt, no retry.
+	MaxRetries int `yaml:"max_retries"`
+	// ProbeTimeoutMs verifies a lane's pinned exit before reuse. 0 = 1000.
+	ProbeTimeoutMs int `yaml:"probe_timeout_ms"`
+	// RaceTimeoutMs caps the parallel exit race when picking a proxy.
+	// 0 = 3000.
+	RaceTimeoutMs int `yaml:"race_timeout_ms"`
+	// LaneGateMaxSecs caps pacing+cooldown wait per send. 0 = 10.
+	LaneGateMaxSecs int `yaml:"lane_gate_max_secs"`
+	// LaneWaitMaxSecs clamps the all-lanes-cooling wait. 0 = 3.
+	LaneWaitMaxSecs int `yaml:"lane_wait_max_secs"`
+	// StalePoolSecs fires pool refresh + session rotation after this long
+	// with every lane cooling and no success. 0 = 15.
+	StalePoolSecs int `yaml:"stale_pool_secs"`
+	// ZenTimeoutSecs caps a proxied upstream request. 0 = 120.
+	ZenTimeoutSecs int `yaml:"zen_timeout_secs"`
+	// ZenDirectTimeoutSecs caps a direct upstream request. 0 = 300.
+	ZenDirectTimeoutSecs int `yaml:"zen_direct_timeout_secs"`
+	// VerifyConcurrency caps parallel proxy verification. 0 = 40.
+	VerifyConcurrency int `yaml:"verify_concurrency"`
+	// ErrorThreshold counts consecutive net/geo/block/free-tier errors
+	// before a pool refresh. 0 = 3.
+	ErrorThreshold int `yaml:"error_threshold"`
+	// RefreshIntervalMinutes re-verifies the pool on this tick; the lane
+	// sweep runs on the same tick. 0 = 60.
+	RefreshIntervalMinutes int `yaml:"refresh_interval_minutes"`
+	// RetryBackoffMs is the linear backoff step between zen retries,
+	// capped at retry_backoff_max_ms. 0 = 150/300.
+	RetryBackoffMs    int `yaml:"retry_backoff_ms"`
+	RetryBackoffMaxMs int `yaml:"retry_backoff_max_ms"`
 }
 
 type nvidiaConfig struct {
@@ -202,10 +233,10 @@ func defaultConfig() appConfig {
 	return appConfig{
 		Server: serverConfig{Port: 5419},
 		Guardrails: guardrailsConfig{
-			Enabled:      true,
-			File:         "guardrails.json",
-			Threshold:    0.6,
-			WindowWeight: 0.7,
+			Enabled:       true,
+			File:          "guardrails.json",
+			Threshold:     0.6,
+			WindowWeight:  0.7,
 			DensityWeight: 0.3,
 		},
 		Inject: injectConfig{
@@ -237,18 +268,31 @@ func defaultConfig() appConfig {
 			Enabled: true,
 		},
 		Zen: zenConfig{
-			Enabled:          true,
-			BlockedCountries: []string{"PK", "RU", "VE", "HK", "BY", "TJ", "IQ", "MM"},
-			MaxResponseMs:    400,
-			PoolSize:         400,
-			Lanes:            8,
-			LaneTTLMinutes:   30,
-			LaneCooldownSecs: 60,
-			SessionIdleMinutes: 6,
-			LaneMinGapMs:     1500,
-			LaneReleaseSecs:  90,
-			PoolRefresh429s:  2,
-			ExitBurnMinutes:  30,
+			Enabled:                true,
+			BlockedCountries:       []string{"PK", "RU", "VE", "HK", "BY", "TJ", "IQ", "MM"},
+			MaxResponseMs:          400,
+			PoolSize:               400,
+			Lanes:                  25,
+			LaneTTLMinutes:         30,
+			LaneCooldownSecs:       60,
+			SessionIdleMinutes:     6,
+			LaneMinGapMs:           1500,
+			LaneReleaseSecs:        90,
+			PoolRefresh429s:        2,
+			ExitBurnMinutes:        30,
+			MaxRetries:             4,
+			ProbeTimeoutMs:         1000,
+			RaceTimeoutMs:          3000,
+			LaneGateMaxSecs:        10,
+			LaneWaitMaxSecs:        3,
+			StalePoolSecs:          15,
+			ZenTimeoutSecs:         120,
+			ZenDirectTimeoutSecs:   300,
+			VerifyConcurrency:      40,
+			ErrorThreshold:         3,
+			RefreshIntervalMinutes: 60,
+			RetryBackoffMs:         150,
+			RetryBackoffMaxMs:      300,
 		},
 		Status: statusConfig{
 			ShowKeys:           true,
@@ -659,6 +703,9 @@ func watchConfig(p *Pool, path string) {
 			}
 			applyConfig(c)
 			added, removed := p.Reload(c.NvidiaKeys)
+			// keyless cap follows zen lanes, so a lanes edit takes
+			// effect here without a restart.
+			p.syncSemLimit(c.NvidiaKeys)
 			stat := p.Status()
 			ng := len(guardrailPrefixes)
 			if !c.Guardrails.Enabled {
@@ -744,6 +791,7 @@ func (p *Pool) StatusFor(authed bool) StatusResponse {
 	if !c.Status.ShowZen {
 		sr.ZenSession, sr.ZenProxy, sr.ZenAgo = "", "", ""
 		sr.ZenLanes = nil
+		sr.LaneCap = 0
 	} else {
 		sr.ZenSession = partialSession(sr.ZenSession)
 	}
@@ -760,6 +808,7 @@ func (p *Pool) StatusFor(authed bool) StatusResponse {
 		sr.Keys, sr.Locks = nil, nil
 		sr.ZenSession, sr.ZenProxy, sr.ZenAgo = "", "", ""
 		sr.ZenLanes = nil
+		sr.LaneCap = 0
 		sr.Usage = nil
 		sr.Pool = nil
 	}

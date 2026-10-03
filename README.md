@@ -1,4 +1,4 @@
-# nvidia-nim-proxy
+# NimRoute
 > THIS PROJECT WAS MADE PARTIALLY USING AGENTIC AI CODING TOOLS
 
 OpenAI-compatible proxy with two backends: **NVIDIA NIM** (key pool, needs keys) and **opencode zen free models** (`opencode/<model>`, works keyless).

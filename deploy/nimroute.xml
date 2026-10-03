@@ -3,8 +3,8 @@
 2. put this file next to it as nim-proxy-service.xml
 3. edit the paths below, then: nim-proxy-service.exe install && nim-proxy-service.exe start -->
 <service>
-  <id>nvidia-nim-proxy</id>
-  <name>NVIDIA NIM Proxy</name>
+  <id>nimroute</id>
+  <name>NimRoute</name>
   <description>OpenAI-compatible proxy: keyless opencode free models, optional NVIDIA NIM keys</description>
   <executable>REPLACE_WITH_PATH\nim-proxy.exe</executable>
   <workingdirectory>REPLACE_WITH_PATH</workingdirectory>

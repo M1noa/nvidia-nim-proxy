@@ -31,6 +31,10 @@ const (
 	burstCooldown = 5 * time.Second
 	bodyLimit     = 10 << 20
 	checkInterval = 5 * time.Second
+	// upstreamBodyLimit caps buffered upstream bodies: 300s of even a
+	// hostile exit stays well under this, and it bounds per-request ram
+	// (x16 concurrent slots) against memory exhaustion.
+	upstreamBodyLimit = 128 << 20
 )
 
 // versionStr is overridden at build time via -ldflags "-X main.versionStr=x.y.z".
@@ -93,11 +97,16 @@ func (m *ModelLock) lockedModels(key string) []string {
 }
 
 type Pool struct {
-	keys       []*Key
-	mu         sync.RWMutex
-	start      time.Time
-	locks      ModelLock
-	sem        chan struct{}
+	keys  []*Key
+	mu    sync.RWMutex
+	start time.Time
+	locks ModelLock
+	// sem caps in-flight requests. mutex+cond, not a chan, so a config
+	// reload can resize the cap without dropping in-flight slots.
+	semMu      sync.Mutex
+	semCond    sync.Cond
+	semUsed    int
+	semLimit   int
 	concurrent atomic.Int64
 	// lastKey pins a model to the key that last served it, so a conversation
 	// stays on one key and NIM's per-key prompt cache stays warm.
@@ -113,21 +122,73 @@ type Pool struct {
 
 func newPool(entries map[string]string) *Pool {
 	p := &Pool{start: time.Now(), lastKey: make(map[string]string)}
+	p.semCond.L = &p.semMu
 	for name, k := range entries {
 		p.keys = append(p.keys, &Key{Name: name, Key: k})
 	}
-	limit := (len(entries)*3 + 3) / 4 // ceil(75%)
+	p.semLimit = semLimitFor(entries)
+	limit := p.semLimit
 	if len(entries) == 0 {
-		limit = 16 // keyless: zen has no per-key limit
-	}
-	p.sem = make(chan struct{}, limit)
-	if len(entries) == 0 {
-		log.Printf("  Concurrency limit: %d (keyless, opencode/* only)", limit)
+		log.Printf("  Concurrency limit: %d (keyless, = zen lanes)", limit)
 	} else {
 		log.Printf("  Concurrency limit: %d (75%% of %d keys)", limit, len(entries))
 	}
 	sort.Slice(p.keys, func(i, j int) bool { return p.keys[i].Name < p.keys[j].Name })
 	return p
+}
+
+// semLimitFor resolves the in-flight cap: keyless follows zen lanes so the
+// two move together, keyed keeps the 75%-of-keys rule.
+func semLimitFor(entries map[string]string) int {
+	if len(entries) == 0 {
+		return laneCap()
+	}
+	return (len(entries)*3 + 3) / 4 // ceil(75%)
+}
+
+// syncSemLimit re-resolves the cap after a config reload. shrinking never
+// drops in-flight requests; new ones just queue until drain.
+func (p *Pool) syncSemLimit(entries map[string]string) {
+	n := semLimitFor(entries)
+	p.semMu.Lock()
+	old := p.semLimit
+	p.semLimit = n
+	p.semMu.Unlock()
+	if n != old {
+		p.semCond.Broadcast()
+		log.Printf("  Concurrency limit: %d -> %d", old, n)
+	}
+}
+
+// semAcquire blocks until an in-flight slot frees.
+func (p *Pool) semAcquire() {
+	p.semMu.Lock()
+	defer p.semMu.Unlock()
+	for p.semUsed >= p.semLimit {
+		p.semCond.Wait()
+	}
+	p.semUsed++
+}
+
+// semRelease frees a slot and wakes one waiter.
+func (p *Pool) semRelease() {
+	p.semMu.Lock()
+	p.semUsed--
+	p.semMu.Unlock()
+	p.semCond.Signal()
+}
+
+// semStats reports (used, limit) for the queue log and /status.
+func (p *Pool) semStats() (int, int) {
+	p.semMu.Lock()
+	defer p.semMu.Unlock()
+	return p.semUsed, p.semLimit
+}
+
+// semCap reports the limit alone.
+func (p *Pool) semCap() int {
+	_, n := p.semStats()
+	return n
 }
 
 func (p *Pool) Reload(entries map[string]string) (added, removed int) {
@@ -347,7 +408,7 @@ func (p *Pool) callUpstream(method, target string, body []byte, fwd http.Header,
 			continue
 		}
 
-		rb, _ := io.ReadAll(resp.Body)
+		rb, _ := io.ReadAll(io.LimitReader(resp.Body, upstreamBodyLimit))
 		resp.Body.Close()
 
 		bodyStr := string(rb)
@@ -407,6 +468,7 @@ type StatusResponse struct {
 	ZenProxy      string        `json:"zen_proxy,omitempty"`
 	ZenAgo        string        `json:"zen_ago,omitempty"`
 	ZenLanes      []laneStatus  `json:"zen_lanes,omitempty"`
+	LaneCap       int           `json:"lane_cap,omitempty"`
 	Pool          *poolSummary  `json:"pool,omitempty"`
 	Usage         *usageSummary `json:"usage,omitempty"`
 }
@@ -448,7 +510,7 @@ func (p *Pool) Status() StatusResponse {
 		Concurrent:    int(p.concurrent.Load()),
 		ConcurrentNV:  int(p.concurrentNV.Load()),
 		ConcurrentZen: int(p.concurrentZen.Load()),
-		SemLimit:      cap(p.sem),
+		SemLimit:      p.semCap(),
 	}
 	if len(p.keys) > 0 {
 		sr.Keys = make([]KeyStatus, len(p.keys))
@@ -486,6 +548,7 @@ func (p *Pool) Status() StatusResponse {
 	}
 	if zenEnabled() {
 		sr.ZenLanes = laneSnapshot()
+		sr.LaneCap = laneCap()
 	}
 	if zenEnabled() && cfg().Status.ShowPool {
 		ps := poolSnapshot()
@@ -1466,7 +1529,7 @@ func (p *Pool) nudgePostResponses(r *http.Request, target string, nb []byte, ses
 	var cl *http.Client
 	lastProxy := ""
 	rotating := true
-	for zenRetries := 0; zenRetries < 5; zenRetries++ {
+	for zenRetries := 0; zenRetries < zenMaxRetries(); zenRetries++ {
 		if !laneHealthy(lane) {
 			if nl := laneFailover(lane); nl != nil {
 				lane = nl
@@ -1509,9 +1572,8 @@ func (p *Pool) nudgePostResponses(r *http.Request, target string, nb []byte, ses
 		if err != nil {
 			dropProxy(proxy)
 			rotating = true
-			acclog.Printf("!! opencode zen error (retry %d/4) nudge country=%s proxy=%s %s: %v",
-				zenRetries, proxyCountry(proxy), proxy, target, err)
-			if zenRetries < 4 {
+			acclog.Printf("!! opencode zen error (retry %d/%d) nudge country=%s proxy=%s %s: %v", zenRetries, zenRetryLabel(), proxyCountry(proxy), redactProxyUserinfo(proxy), target, err)
+			if !zenLastRetry(zenRetries) {
 				zenBackoff(zenRetries)
 				continue
 			}
@@ -1529,26 +1591,26 @@ func (p *Pool) nudgePostResponses(r *http.Request, target string, nb []byte, ses
 			up.Body.Close()
 			if zenServiceOverloaded(eb) {
 				rotating = false
-				if zenRetries < 4 {
+				if !zenLastRetry(zenRetries) {
 					zenBackoff(zenRetries)
 					continue
 				}
 			}
 			if zenGeoBlocked(eb) {
 				acclog.Printf("  opencode nudge geo-blocked %d country=%s proxy=%s err=%q",
-					up.StatusCode, proxyCountry(proxy), proxy, errSnippet(eb, 160))
+					up.StatusCode, proxyCountry(proxy), redactProxyUserinfo(proxy), errSnippet(eb, 160))
 				dropProxy(proxy)
 				rotating = true
-				if zenRetries < 4 {
+				if !zenLastRetry(zenRetries) {
 					zenBackoff(zenRetries)
 					continue
 				}
 			}
 			acclog.Printf("!! opencode nudge upstream %d country=%s proxy=%s err=%q",
-				up.StatusCode, proxyCountry(proxy), proxy, errSnippet(eb, 160))
+				up.StatusCode, proxyCountry(proxy), redactProxyUserinfo(proxy), errSnippet(eb, 160))
 			return nil
 		}
-		nb2, _ := io.ReadAll(up.Body)
+		nb2, _ := io.ReadAll(io.LimitReader(up.Body, upstreamBodyLimit))
 		up.Body.Close()
 		p.noteZenSuccess(*sessionID, proxy)
 		return nb2
@@ -2460,14 +2522,14 @@ func (p *Pool) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if p.sem != nil && len(p.sem) == cap(p.sem) {
-		acclog.Printf("%s ... all %d slots busy, queueing", reqID, cap(p.sem))
+	if used, limit := p.semStats(); used >= limit {
+		acclog.Printf("%s ... all %d slots busy, queueing", reqID, limit)
 	}
-	p.sem <- struct{}{}
+	p.semAcquire()
 	p.concurrent.Add(1)
 	defer func() {
 		p.concurrent.Add(-1)
-		<-p.sem
+		p.semRelease()
 	}()
 
 	body, err := io.ReadAll(io.LimitReader(r.Body, bodyLimit))
@@ -2649,7 +2711,7 @@ func (p *Pool) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			continue
 		}
 
-		rb, _ := io.ReadAll(resp.Body)
+		rb, _ := io.ReadAll(io.LimitReader(resp.Body, upstreamBodyLimit))
 		resp.Body.Close()
 
 		bodyStr := string(rb)
@@ -2703,7 +2765,7 @@ func (p *Pool) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	var prompT, compT, totalT int
 	var recErr string
 	if lastResp.StatusCode != http.StatusOK {
-		rb2, _ := io.ReadAll(lastResp.Body)
+		rb2, _ := io.ReadAll(io.LimitReader(lastResp.Body, upstreamBodyLimit))
 		lastResp.Body.Close()
 		lastResp.Body = io.NopCloser(bytes.NewReader(rb2))
 		recErr = strings.TrimSpace(string(rb2))
@@ -2712,7 +2774,7 @@ func (p *Pool) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 		acclog.Printf("!! upstream %d [%s] model=%s err=%q", lastResp.StatusCode, used.Name, model, recErr)
 	} else {
-		bodyCopy, _ := io.ReadAll(lastResp.Body)
+		bodyCopy, _ := io.ReadAll(io.LimitReader(lastResp.Body, upstreamBodyLimit))
 		lastResp.Body.Close()
 		lastResp.Body = io.NopCloser(bytes.NewReader(bodyCopy))
 		if !isStream {
@@ -2881,7 +2943,7 @@ func (p *Pool) handleOpenCode(w http.ResponseWriter, r *http.Request, body []byt
 	sessionID := laneSession(lane)
 	var usedProxy string
 	rotating := true
-	for zenRetries := 0; zenRetries < 5; zenRetries++ {
+	for zenRetries := 0; zenRetries < zenMaxRetries(); zenRetries++ {
 		// lane failover: a cooling lane yields to the healthiest lane,
 		// keeping this request off a 429-backed exit. when every lane is
 		// cooling, wait out the shortest backoff instead of failing fast.
@@ -2894,7 +2956,7 @@ func (p *Pool) handleOpenCode(w http.ResponseWriter, r *http.Request, body []byt
 				if maybeRefreshStalePool() {
 					sessionID = laneSession(lane)
 				} else if wait := laneWait(); wait > 0 {
-					acclog.Printf("  opencode all lanes cooling, waiting %v (retry %d/4)", wait, zenRetries)
+					acclog.Printf("  opencode all lanes cooling, waiting %v (retry %d/%d)", wait, zenRetries, zenRetryLabel())
 					time.Sleep(wait)
 				}
 			}
@@ -2950,7 +3012,7 @@ func (p *Pool) handleOpenCode(w http.ResponseWriter, r *http.Request, body []byt
 		}
 		setZenHeaders(req, sessionID)
 		if zenRetries > 0 {
-			acclog.Printf("  opencode retry %d/4 session=%s proxy=%s lane=%s", zenRetries, sessionID, proxy, lane.id)
+			acclog.Printf("  opencode retry %d/%d session=%s proxy=%s lane=%s", zenRetries, zenRetryLabel(), sessionID, redactProxyUserinfo(proxy), lane.id)
 		}
 		for k, v := range r.Header {
 			if zenHeaderForwarded(k) {
@@ -2964,11 +3026,11 @@ func (p *Pool) handleOpenCode(w http.ResponseWriter, r *http.Request, body []byt
 			rotating = true
 			logZenNetErr(zenRetries, model, proxy, target, err)
 			if noteZenNetworkError() {
-				acclog.Printf("  3+ consecutive network errors, refreshing proxy pool")
+				acclog.Printf("  %d+ consecutive network errors, refreshing proxy pool", zenErrorThreshold())
 				refreshZenProxiesAsync()
 				resetZenNetworkErrors()
 			}
-			if zenRetries < 4 {
+			if !zenLastRetry(zenRetries) {
 				zenBackoff(zenRetries)
 				continue
 			}
@@ -2981,8 +3043,8 @@ func (p *Pool) handleOpenCode(w http.ResponseWriter, r *http.Request, body []byt
 
 		if resp.StatusCode == http.StatusTooManyRequests || resp.StatusCode == 529 {
 			resp.Body.Close()
-			acclog.Printf("  opencode rate-limited %d (retry %d/4) model=%s country=%s proxy=%s lane=%s, cooling lane",
-				resp.StatusCode, zenRetries, model, proxyCountry(proxy), proxy, lane.id)
+			acclog.Printf("  opencode rate-limited %d (retry %d/%d) model=%s country=%s proxy=%s lane=%s, cooling lane",
+				resp.StatusCode, zenRetries, zenRetryLabel(), model, proxyCountry(proxy), redactProxyUserinfo(proxy), lane.id)
 			if proxy == "" {
 				laneEscalate(lane, realModel) // direct got limited: give the lane an exit
 			}
@@ -3000,10 +3062,10 @@ func (p *Pool) handleOpenCode(w http.ResponseWriter, r *http.Request, body []byt
 			eb, _ := io.ReadAll(io.LimitReader(resp.Body, 16<<10))
 			resp.Body.Close()
 			if zenServiceOverloaded(eb) {
-				acclog.Printf("  opencode overloaded %d (retry %d/4) model=%s country=%s proxy=%s retrying same proxy+session err=%q",
-					resp.StatusCode, zenRetries, model, proxyCountry(proxy), proxy, errSnippet(eb, 160))
+				acclog.Printf("  opencode overloaded %d (retry %d/%d) model=%s country=%s proxy=%s retrying same proxy+session err=%q",
+					resp.StatusCode, zenRetries, zenRetryLabel(), model, proxyCountry(proxy), redactProxyUserinfo(proxy), errSnippet(eb, 160))
 				rotating = false
-				if zenRetries < 4 {
+				if !zenLastRetry(zenRetries) {
 					zenBackoff(zenRetries)
 					continue
 				}
@@ -3018,11 +3080,11 @@ func (p *Pool) handleOpenCode(w http.ResponseWriter, r *http.Request, body []byt
 				}
 				rotating = true
 				if noteZenGeoErr() {
-					acclog.Printf("  3+ geo-blocks, refreshing proxy pool")
+					acclog.Printf("  %d+ geo-blocks, refreshing proxy pool", zenErrorThreshold())
 					refreshZenProxiesAsync()
 					resetZenGeoErrs()
 				}
-				if zenRetries < 4 {
+				if !zenLastRetry(zenRetries) {
 					zenBackoff(zenRetries)
 					continue
 				}
@@ -3037,18 +3099,18 @@ func (p *Pool) handleOpenCode(w http.ResponseWriter, r *http.Request, body []byt
 				}
 				rotating = true
 				if noteZenBlockErr() {
-					acclog.Printf("  3+ user-blocks, refreshing proxy pool")
+					acclog.Printf("  %d+ user-blocks, refreshing proxy pool", zenErrorThreshold())
 					refreshZenProxiesAsync()
 					resetZenBlockErrs()
 				}
-				if zenRetries < 4 {
+				if !zenLastRetry(zenRetries) {
 					zenBackoff(zenRetries)
 					continue
 				}
 			}
 			if zenFreeTierBlocked(eb) {
-				acclog.Printf("  opencode free-tier-blocked %d (retry %d/4) model=%s country=%s proxy=%s lane=%s, switching lane",
-					resp.StatusCode, zenRetries, model, proxyCountry(proxy), proxy, lane.id)
+				acclog.Printf("  opencode free-tier-blocked %d (retry %d/%d) model=%s country=%s proxy=%s lane=%s, switching lane",
+					resp.StatusCode, zenRetries, zenRetryLabel(), model, proxyCountry(proxy), redactProxyUserinfo(proxy), lane.id)
 				dropProxy(proxy)
 				burnExit(proxy, realModel)
 				if proxy == "" {
@@ -3061,17 +3123,17 @@ func (p *Pool) handleOpenCode(w http.ResponseWriter, r *http.Request, body []byt
 				}
 				rotating = true
 				if noteZenFreeTierErr() {
-					acclog.Printf("  3+ free-tier blocks, refreshing proxy pool")
+					acclog.Printf("  %d+ free-tier blocks, refreshing proxy pool", zenErrorThreshold())
 					refreshZenProxiesAsync()
 					resetZenFreeTierErrs()
 				}
-				if zenRetries < 4 {
+				if !zenLastRetry(zenRetries) {
 					zenBackoff(zenRetries)
 					continue
 				}
 			}
-			acclog.Printf("!! opencode upstream %d (retry %d/4) model=%s country=%s proxy=%s err=%q",
-				resp.StatusCode, zenRetries, model, proxyCountry(proxy), proxy, errSnippet(eb, 160))
+			acclog.Printf("!! opencode upstream %d (retry %d/%d) model=%s country=%s proxy=%s err=%q",
+				resp.StatusCode, zenRetries, zenRetryLabel(), model, proxyCountry(proxy), redactProxyUserinfo(proxy), errSnippet(eb, 160))
 			if len(bytes.TrimSpace(eb)) == 0 {
 				// provider sometimes errors with no body; never hand the
 				// client a 0-byte error, synthesize a JSON one.
@@ -3098,13 +3160,13 @@ func (p *Pool) handleOpenCode(w http.ResponseWriter, r *http.Request, body []byt
 	}
 
 	if usedProxy != "" {
-		acclog.Printf("  opencode session=%s proxy=%s lane=%s", sessionID, usedProxy, lane.id)
+		acclog.Printf("  opencode session=%s proxy=%s lane=%s", sessionID, redactProxyUserinfo(usedProxy), lane.id)
 	}
 
 	if isStream && resp.StatusCode == http.StatusOK {
 		// true streaming — pipe through, no token capture
 	} else {
-		rb, _ := io.ReadAll(resp.Body)
+		rb, _ := io.ReadAll(io.LimitReader(resp.Body, upstreamBodyLimit))
 		resp.Body.Close()
 		if os.Getenv("ZEN_DUMP") != "" {
 			rp := fmt.Sprintf("/tmp/zenraw_%d.json", time.Now().UnixNano())
@@ -3173,7 +3235,7 @@ func (p *Pool) handleOpenCode(w http.ResponseWriter, r *http.Request, body []byt
 	var written int64
 	if isStream && resp.StatusCode == http.StatusOK {
 		if endpoint == "/responses" {
-			rb, _ := io.ReadAll(resp.Body)
+			rb, _ := io.ReadAll(io.LimitReader(resp.Body, upstreamBodyLimit))
 			resp.Body.Close()
 			if os.Getenv("ZEN_DUMP") != "" {
 				rp := fmt.Sprintf("/tmp/zenraw_%d.sse", time.Now().UnixNano())
@@ -3186,7 +3248,7 @@ func (p *Pool) handleOpenCode(w http.ResponseWriter, r *http.Request, body []byt
 			// responses client on a chat model with stream=true: fold the
 			// upstream chat SSE to one chat body, wrap to responses shape,
 			// and return it buffered (no true responses stream exists).
-			rb, _ := io.ReadAll(resp.Body)
+			rb, _ := io.ReadAll(io.LimitReader(resp.Body, upstreamBodyLimit))
 			resp.Body.Close()
 			folded := sseToNonStream(rb, realModel, tnames)
 			prompT, compT, _ = respTokens(folded)
@@ -3256,10 +3318,13 @@ func contains(s, substr string) bool {
 // zenHeaderForwarded reports whether a client header should be copied onto
 // the zen upstream request. auth-bearing headers are always dropped so the
 // proxy's own credentials never leak to the third-party upstream.
+// x-session-id selects pii/lane state and would link the client across
+// requests for the upstream; x-forwarded-host is client-claimed.
 func zenHeaderForwarded(k string) bool {
 	switch strings.ToLower(k) {
 	case "authorization", "host", "content-type", "accept", "accept-encoding",
 		"connection", "content-length", "user-agent", "cookie", "x-api-key",
+		"x-session-id", "x-forwarded-host",
 		"x-opencode-client", "x-opencode-session", "x-opencode-request", "x-opencode-project":
 		return false
 	}
@@ -3629,9 +3694,9 @@ func serverMain() {
 	}
 	sort.Strings(names)
 	if stat.Total == 0 {
-		log.Printf("NVIDIA NIM Proxy v%s — keyless (opencode/* free models only)", versionStr)
+		log.Printf("NimRoute v%s — keyless (opencode/* free models only)", versionStr)
 	} else {
-		log.Printf("NVIDIA NIM Proxy v%s — %d keys: %s", versionStr, stat.Total, strings.Join(names, ", "))
+		log.Printf("NimRoute v%s — %d keys: %s", versionStr, stat.Total, strings.Join(names, ", "))
 		log.Printf("  429 backoff=%v..%v (exp, reset on success), model-lockout=%v, burst-backoff=%v", cooldown429, maxBackoff, modelLockout, burstCooldown)
 		log.Printf("  weighted key pick: idle-preference + 50m failure window")
 		log.Printf("  Effective ~%d RPM (40 RPM/key × %d keys)", 40*stat.Total, stat.Total)
@@ -3776,7 +3841,7 @@ func runProbe() {
 			}
 			elapsed := time.Since(start).Milliseconds()
 
-			rb, _ := io.ReadAll(resp.Body)
+			rb, _ := io.ReadAll(io.LimitReader(resp.Body, upstreamBodyLimit))
 			resp.Body.Close()
 
 			rh := rlHeaders(resp.Header)

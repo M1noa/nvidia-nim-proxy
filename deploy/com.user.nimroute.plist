@@ -3,7 +3,7 @@
 <plist version="1.0">
 <dict>
   <key>Label</key>
-  <string>com.user.nvidia-nim-proxy</string>
+  <string>com.user.nimroute</string>
   <key>ProgramArguments</key>
   <array>
     <string>REPLACE_WITH_PATH/nim-proxy</string>

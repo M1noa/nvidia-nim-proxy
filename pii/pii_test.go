@@ -1,6 +1,7 @@
 package pii
 
 import (
+	"encoding/json"
 	"strings"
 	"testing"
 	"time"
@@ -196,3 +197,44 @@ func TestEntitiesWinOverTerms(t *testing.T) {
 		t.Fatalf("entity must win overlap, got %+v", spans[0])
 	}
 }
+
+func TestGuardMapBounded(t *testing.T) {
+	for i := 0; i < maxGuards+50; i++ {
+		ForRequest(Config{Enabled: true, DetectPII: true}, "flood-"+string(rune('a'+i%26))+itoa(i))
+	}
+	guardMu.Lock()
+	n := len(guards)
+	guardMu.Unlock()
+	if n > maxGuards {
+		t.Fatalf("guards map grew past cap: %d > %d", n, maxGuards)
+	}
+}
+
+func itoa(i int) string {
+	if i == 0 {
+		return "0"
+	}
+	var b []byte
+	for i > 0 {
+		b = append([]byte{byte('0' + i%10)}, b...)
+		i /= 10
+	}
+	return string(b)
+}
+
+func TestRestoreKeepsValidJSON(t *testing.T) {
+	g := build(Config{Enabled: true, DetectPII: true,
+		Entities: []CustomTerm{{Name: "minoa", Replacement: `a"b`}}}, "test-restore-json")
+	body := `{"model":"x","messages":[{"role":"user","content":"hi minoa"}]}`
+	masked := string(g.MaskBody([]byte(body)))
+	back := string(g.RestoreBody([]byte(masked)))
+	if back != body {
+		// restore of a quote-bearing replacement must not corrupt:
+		// either exact round trip or masked passthrough, never broken json.
+		if !jsonValid(back) {
+			t.Fatalf("restore broke json: %s", back)
+		}
+	}
+}
+
+func jsonValid(s string) bool { return json.Valid([]byte(s)) }

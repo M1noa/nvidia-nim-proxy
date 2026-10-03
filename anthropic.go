@@ -1404,14 +1404,14 @@ func (p *Pool) handleAnthropic(w http.ResponseWriter, r *http.Request, start tim
 		return
 	}
 
-	if p.sem != nil && len(p.sem) == cap(p.sem) {
-		acclog.Printf("%s ... all %d slots busy, queueing", reqID, cap(p.sem))
+	if used, limit := p.semStats(); used >= limit {
+		acclog.Printf("%s ... all %d slots busy, queueing", reqID, limit)
 	}
-	p.sem <- struct{}{}
+	p.semAcquire()
 	p.concurrent.Add(1)
 	defer func() {
 		p.concurrent.Add(-1)
-		<-p.sem
+		p.semRelease()
 	}()
 
 	oaiBody, clientModel, upstreamModel, tnames, isStream, err := anthropicRequestToOpenAI(body)
@@ -1790,7 +1790,7 @@ func (p *Pool) handleOpenCodeAnthropic(w http.ResponseWriter, r *http.Request, o
 		var cl *http.Client
 		lastProxy := ""
 		rotating := true
-		for zenRetries := 0; zenRetries < 5; zenRetries++ {
+		for zenRetries := 0; zenRetries < zenMaxRetries(); zenRetries++ {
 			if !laneHealthy(lane) {
 				if nl := laneFailover(lane); nl != nil {
 					lane = nl
@@ -1799,7 +1799,7 @@ func (p *Pool) handleOpenCodeAnthropic(w http.ResponseWriter, r *http.Request, o
 					if maybeRefreshStalePool() {
 						sessionID = laneSession(lane)
 					} else if wait := laneWait(); wait > 0 {
-						acclog.Printf("  opencode all lanes cooling, waiting %v (retry %d/4)", wait, zenRetries)
+						acclog.Printf("  opencode all lanes cooling, waiting %v (retry %d/%d)", wait, zenRetries, zenRetryLabel())
 						time.Sleep(wait)
 					}
 				}
@@ -1846,7 +1846,7 @@ func (p *Pool) handleOpenCodeAnthropic(w http.ResponseWriter, r *http.Request, o
 			}
 			setZenHeaders(req, sessionID)
 			if zenRetries > 0 {
-				acclog.Printf("  opencode retry %d/4 session=%s proxy=%s lane=%s", zenRetries, sessionID, proxy, lane.id)
+				acclog.Printf("  opencode retry %d/%d session=%s proxy=%s lane=%s", zenRetries, zenRetryLabel(), sessionID, redactProxyUserinfo(proxy), lane.id)
 			}
 
 			up, err := cl.Do(req)
@@ -1855,11 +1855,11 @@ func (p *Pool) handleOpenCodeAnthropic(w http.ResponseWriter, r *http.Request, o
 				rotating = true
 				logZenNetErr(zenRetries, clientModel, proxy, tag+" "+target, err)
 				if noteZenNetworkError() {
-					acclog.Printf("  3+ consecutive network errors, refreshing proxy pool")
+					acclog.Printf("  %d+ consecutive network errors, refreshing proxy pool", zenErrorThreshold())
 					refreshZenProxiesAsync()
 					resetZenNetworkErrors()
 				}
-				if zenRetries < 4 {
+				if !zenLastRetry(zenRetries) {
 					zenBackoff(zenRetries)
 					continue
 				}
@@ -1868,8 +1868,8 @@ func (p *Pool) handleOpenCodeAnthropic(w http.ResponseWriter, r *http.Request, o
 
 			if up.StatusCode == http.StatusTooManyRequests || up.StatusCode == 529 {
 				up.Body.Close()
-				acclog.Printf("  opencode rate-limited %d (retry %d/4) model=%s country=%s proxy=%s %s lane=%s, cooling lane",
-					up.StatusCode, zenRetries, clientModel, proxyCountry(proxy), proxy, tag, lane.id)
+				acclog.Printf("  opencode rate-limited %d (retry %d/%d) model=%s country=%s proxy=%s %s lane=%s, cooling lane",
+					up.StatusCode, zenRetries, zenRetryLabel(), clientModel, proxyCountry(proxy), redactProxyUserinfo(proxy), tag, lane.id)
 				if proxy == "" {
 					laneEscalate(lane, zenModel) // direct got limited: give the lane an exit
 				}
@@ -1887,10 +1887,10 @@ func (p *Pool) handleOpenCodeAnthropic(w http.ResponseWriter, r *http.Request, o
 				eb, _ := io.ReadAll(io.LimitReader(up.Body, 16<<10))
 				up.Body.Close()
 				if zenServiceOverloaded(eb) {
-					acclog.Printf("  opencode overloaded %d (retry %d/4) model=%s country=%s proxy=%s %s retrying same proxy+session err=%q",
-						up.StatusCode, zenRetries, clientModel, proxyCountry(proxy), proxy, tag, errSnippet(eb, 160))
+					acclog.Printf("  opencode overloaded %d (retry %d/%d) model=%s country=%s proxy=%s %s retrying same proxy+session err=%q",
+						up.StatusCode, zenRetries, zenRetryLabel(), clientModel, proxyCountry(proxy), redactProxyUserinfo(proxy), tag, errSnippet(eb, 160))
 					rotating = false
-					if zenRetries < 4 {
+					if !zenLastRetry(zenRetries) {
 						zenBackoff(zenRetries)
 						continue
 					}
@@ -1905,11 +1905,11 @@ func (p *Pool) handleOpenCodeAnthropic(w http.ResponseWriter, r *http.Request, o
 					}
 					rotating = true
 					if noteZenGeoErr() {
-						acclog.Printf("  3+ geo-blocks, refreshing proxy pool")
+						acclog.Printf("  %d+ geo-blocks, refreshing proxy pool", zenErrorThreshold())
 						refreshZenProxiesAsync()
 						resetZenGeoErrs()
 					}
-					if zenRetries < 4 {
+					if !zenLastRetry(zenRetries) {
 						zenBackoff(zenRetries)
 						continue
 					}
@@ -1924,18 +1924,18 @@ func (p *Pool) handleOpenCodeAnthropic(w http.ResponseWriter, r *http.Request, o
 					}
 					rotating = true
 					if noteZenBlockErr() {
-						acclog.Printf("  3+ user-blocks, refreshing proxy pool")
+						acclog.Printf("  %d+ user-blocks, refreshing proxy pool", zenErrorThreshold())
 						refreshZenProxiesAsync()
 						resetZenBlockErrs()
 					}
-					if zenRetries < 4 {
+					if !zenLastRetry(zenRetries) {
 						zenBackoff(zenRetries)
 						continue
 					}
 				}
 				if zenFreeTierBlocked(eb) {
-					acclog.Printf("  opencode free-tier-blocked %d (retry %d/4) model=%s country=%s proxy=%s %s lane=%s, switching lane",
-						up.StatusCode, zenRetries, clientModel, proxyCountry(proxy), proxy, tag, lane.id)
+					acclog.Printf("  opencode free-tier-blocked %d (retry %d/%d) model=%s country=%s proxy=%s %s lane=%s, switching lane",
+						up.StatusCode, zenRetries, zenRetryLabel(), clientModel, proxyCountry(proxy), redactProxyUserinfo(proxy), tag, lane.id)
 					dropProxy(proxy)
 					burnExit(proxy, zenModel)
 					if proxy == "" {
@@ -1948,17 +1948,17 @@ func (p *Pool) handleOpenCodeAnthropic(w http.ResponseWriter, r *http.Request, o
 					}
 					rotating = true
 					if noteZenFreeTierErr() {
-						acclog.Printf("  3+ free-tier blocks, refreshing proxy pool")
+						acclog.Printf("  %d+ free-tier blocks, refreshing proxy pool", zenErrorThreshold())
 						refreshZenProxiesAsync()
 						resetZenFreeTierErrs()
 					}
-					if zenRetries < 4 {
+					if !zenLastRetry(zenRetries) {
 						zenBackoff(zenRetries)
 						continue
 					}
 				}
-				acclog.Printf("!! opencode upstream %d (retry %d/4) model=%s country=%s proxy=%s %s err=%q",
-					up.StatusCode, zenRetries, clientModel, proxyCountry(proxy), proxy, tag, errSnippet(eb, 160))
+				acclog.Printf("!! opencode upstream %d (retry %d/%d) model=%s country=%s proxy=%s %s err=%q",
+					up.StatusCode, zenRetries, zenRetryLabel(), clientModel, proxyCountry(proxy), redactProxyUserinfo(proxy), tag, errSnippet(eb, 160))
 				up.Body = io.NopCloser(bytes.NewReader(eb))
 			}
 			resetZenNetworkErrors()
@@ -1981,7 +1981,7 @@ func (p *Pool) handleOpenCodeAnthropic(w http.ResponseWriter, r *http.Request, o
 	elapsed := time.Since(start)
 
 	if resp.StatusCode != http.StatusOK {
-		rb, _ := io.ReadAll(resp.Body)
+		rb, _ := io.ReadAll(io.LimitReader(resp.Body, upstreamBodyLimit))
 		if os.Getenv("ZEN_DUMP") != "" {
 			p := fmt.Sprintf("/tmp/zenresp_%d.json", time.Now().UnixNano())
 			os.WriteFile(p, rb, 0o644)
@@ -1994,7 +1994,7 @@ func (p *Pool) handleOpenCodeAnthropic(w http.ResponseWriter, r *http.Request, o
 	}
 
 	if isStream {
-		rb, _ := io.ReadAll(resp.Body)
+		rb, _ := io.ReadAll(io.LimitReader(resp.Body, upstreamBodyLimit))
 		w.Header().Set("Content-Type", "text/event-stream")
 		w.Header().Set("Cache-Control", "no-cache")
 		w.Header().Set("Connection", "keep-alive")
@@ -2016,7 +2016,7 @@ func (p *Pool) handleOpenCodeAnthropic(w http.ResponseWriter, r *http.Request, o
 				if nresp.StatusCode != http.StatusOK {
 					return nil
 				}
-				nb2, _ := io.ReadAll(nresp.Body)
+				nb2, _ := io.ReadAll(io.LimitReader(nresp.Body, upstreamBodyLimit))
 				return nb2
 			}
 			if retry := tryNudgeResponses(upstreamModel, oaiBody, rb, post); retry != nil {
@@ -2043,7 +2043,7 @@ func (p *Pool) handleOpenCodeAnthropic(w http.ResponseWriter, r *http.Request, o
 		})
 		acclog.Printf("<- 200 POST /v1/messages %v %d bytes [opencode] model=%s %s", elapsed.Round(time.Millisecond), written, clientModel, reqID)
 	} else {
-		rb, _ := io.ReadAll(resp.Body)
+		rb, _ := io.ReadAll(io.LimitReader(resp.Body, upstreamBodyLimit))
 		if os.Getenv("ZEN_DUMP") != "" {
 			p := fmt.Sprintf("/tmp/zenraw_%d.bin", time.Now().UnixNano())
 			os.WriteFile(p, rb, 0o644)
@@ -2061,7 +2061,7 @@ func (p *Pool) handleOpenCodeAnthropic(w http.ResponseWriter, r *http.Request, o
 				if nresp.StatusCode != http.StatusOK {
 					return nil
 				}
-				nb2, _ := io.ReadAll(nresp.Body)
+				nb2, _ := io.ReadAll(io.LimitReader(nresp.Body, upstreamBodyLimit))
 				return nb2
 			}
 			if retry := tryNudgeResponses(upstreamModel, oaiBody, rb, post); retry != nil {

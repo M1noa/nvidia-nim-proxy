@@ -60,7 +60,7 @@ freebuff:
 2. `GET /status` → freebuff block present, no ads text leak when `show_ads:false`.
 3. `GET /v1/models` → `freebuff/*` listed.
 4. openai: `POST :5420/v1/chat/completions {model: freebuff/z-ai/glm-5.3-flash, stream:true}` → 200 SSE, text flows.
-5. anthropic: `POST :5420/v1/messages {model: freebuff/deepseek/deepseek-v4-flash}` via cctest.py pattern → valid `message` SSE.
+5. anthropic: `POST :5420/v1/messages {model: freebuff/deepseek/deepseek-v4-flash}` via scripts/cctest.py pattern → valid `message` SSE.
 6. all-models sweep: loop catalog (script), record per-model ok/rate_limited/gated.
 7. idle check: no ad auction for 5 idle min (log grep); usage check: 3 turns → ≥1 impression logged.
 8. audit: `go vet`, race run, diff review (new file + config + status struct only).

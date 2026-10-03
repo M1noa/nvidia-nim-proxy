@@ -91,8 +91,13 @@ func (d *customDetector) detect(text string) []Span {
 			start = st + len(sp)
 		}
 	}
-	// fuzzy pass per line for near-miss spellings.
+	// fuzzy pass per line for near-miss spellings. lines past the cap
+	// skip it: fuzzFind is quadratic-ish per window and a 10MB single
+	// line would burn seconds of cpu per request.
 	for _, line := range strings.Split(text, "\n") {
+		if len(line) > 4096 {
+			continue
+		}
 		for _, sp := range d.spellings {
 			if !fuzzyEligible("", sp) {
 				continue

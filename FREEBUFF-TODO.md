@@ -3,7 +3,7 @@ order matters. check off only with log evidence. main 5419 restart is last.
 
 ## phase A — verify (no code)
 - [x] A1. backend live: www.codebuff.com canonical (codebuff.com 301/307s). healthz 200.
-- [x] A2. freebuff_login.py works: acc1 (baccusminoa@gmail.com), full tier, 100 Freebucks/day. NOTE: acc1 BANNED 2026-09-28 from probe burst (~20 admissions/30min). treat accounts as scarce.
+- [x] A2. scripts/freebuff_login.py works: acc1 (baccusminoa@gmail.com), full tier, 100 Freebucks/day. NOTE: acc1 BANNED 2026-09-28 from probe burst (~20 admissions/30min). treat accounts as scarce.
 - [x] A3. admission works (legacy path, server UUID instanceId). chat recipe cracked (agent-run + Buffy marker + cost_mode free) but ALL models 503 at provider lane. open: retry with backoff, real-binary comparison.
 - [x] A4. ads auction live (real gravity fill). impression shape confirmed (validates impUrl before auth). impression ack untested (no served turn to bill).
 - [x] A5. shapes in FREEBUFF-DOCS.md §9c. ban triggers documented.
@@ -21,7 +21,7 @@ order matters. check off only with log evidence. main 5419 restart is last.
 ## phase C — test sweep (port 5420)
 - [ ] C1. `/status` + `/v1/models` shape checks (both `show_ads` values)
 - [ ] C2. openai streaming turn on 3 models (1 standard, 1 premium, 1 Muse Spark)
-- [ ] C3. anthropic turn via cctest.py pattern
+- [ ] C3. anthropic turn via scripts/cctest.py pattern
 - [ ] C4. full catalog sweep script, per-model result table
 - [ ] C5. ad realism: idle 5min = 0 auctions; 3 turns = ≥1 impression; no dup impUrl ack
 - [ ] C6. failure paths: bad token 401, bad model 400, `model_locked` second-model turn, gate-code retry

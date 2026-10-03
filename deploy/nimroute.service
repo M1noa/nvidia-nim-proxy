@@ -1,5 +1,5 @@
 [Unit]
-Description=NVIDIA NIM Proxy (OpenAI-compatible, keyless opencode free models)
+Description=NimRoute (OpenAI-compatible, keyless opencode free models)
 After=network-online.target
 Wants=network-online.target
 

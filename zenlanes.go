@@ -10,7 +10,7 @@ import (
 	"sync"
 	"time"
 
-	"nvidia-nim-proxy/pii"
+	"nimroute/pii"
 )
 
 // zen lanes: pinned proxy+session pairs so concurrent conversations spread
@@ -102,7 +102,7 @@ func laneCap() int {
 	if n := cfg().Zen.Lanes; n > 0 {
 		return n
 	}
-	return 8
+	return 25
 }
 
 func laneTTL() time.Duration {
@@ -136,6 +136,37 @@ func laneRelease() time.Duration {
 	return time.Duration(cfg().Zen.LaneReleaseSecs) * time.Second
 }
 
+func probeTimeout() time.Duration {
+	if ms := cfg().Zen.ProbeTimeoutMs; ms > 0 {
+		return time.Duration(ms) * time.Millisecond
+	}
+	return time.Second
+}
+
+func raceTimeout() time.Duration {
+	if ms := cfg().Zen.RaceTimeoutMs; ms > 0 {
+		return time.Duration(ms) * time.Millisecond
+	}
+	return 3 * time.Second
+}
+
+// zenMaxRetries caps zen upstream attempts per request (loop bound is
+// attempts, log labels stay /N on retries).
+func zenMaxRetries() int {
+	if n := cfg().Zen.MaxRetries; n > 0 {
+		return n + 1
+	}
+	if cfg().Zen.MaxRetries < 0 {
+		return 1
+	}
+	return 5 // default: first try + 4 retries
+}
+
+func zenRetryLabel() int { return zenMaxRetries() - 1 }
+
+// zenLastRetry reports whether retry index is the final attempt.
+func zenLastRetry(retry int) bool { return retry+1 >= zenMaxRetries() }
+
 // laneGate blocks until the lane may send: pacing gap since its previous
 // send, plus any residual cooldown. the slot is claimed under the lane lock
 // before sleeping, so concurrent requests are spaced one gap apart instead
@@ -143,6 +174,10 @@ func laneRelease() time.Duration {
 // lane never stalls a request indefinitely.
 func laneGate(l *zenLane) time.Duration {
 	now := time.Now()
+	maxWait := 10 * time.Second
+	if s := cfg().Zen.LaneGateMaxSecs; s > 0 {
+		maxWait = time.Duration(s) * time.Second
+	}
 	lanesMu.Lock()
 	var wait time.Duration
 	if gap := laneMinGap(); gap > 0 && !l.lastSend.IsZero() {
@@ -153,8 +188,8 @@ func laneGate(l *zenLane) time.Duration {
 	if cd := l.cooldown.Sub(now); cd > wait {
 		wait = cd
 	}
-	if wait > 10*time.Second {
-		wait = 10 * time.Second
+	if wait > maxWait {
+		wait = maxWait
 	}
 	// claim: the next caller's gap is measured from this send's schedule,
 	// so two concurrent callers serialize one gap apart.
@@ -436,7 +471,7 @@ func pickLaneProxyFor(model string) string {
 		if len(free) == 0 {
 			return ""
 		}
-		if w := raceProbe(free, 3*time.Second); w != "" {
+		if w := raceProbe(free, raceTimeout()); w != "" {
 			return w
 		}
 		return free[rand.Intn(len(free))]
@@ -462,7 +497,7 @@ func pickLaneProxyFor(model string) string {
 		return ""
 	}
 	sort.Slice(cands, func(i, j int) bool { return proxyWeight(cands[i]) > proxyWeight(cands[j]) })
-	if w := raceProbe(sampleWeighted(cands, 3), 3*time.Second); w != "" {
+	if w := raceProbe(sampleWeighted(cands, 3), raceTimeout()); w != "" {
 		return w
 	}
 	return sampleWeighted(cands, 1)[0]
@@ -529,8 +564,12 @@ func laneWait() time.Duration {
 		return 0
 	}
 	d := soonest.Sub(now)
-	if d > 3*time.Second {
-		return 3 * time.Second
+	maxWait := 3 * time.Second
+	if s := cfg().Zen.LaneWaitMaxSecs; s > 0 {
+		maxWait = time.Duration(s) * time.Second
+	}
+	if d > maxWait {
+		return maxWait
 	}
 	return d
 }
@@ -562,7 +601,11 @@ func zenStaleSince() time.Duration {
 // lane has been cooling with no success for 15s: the pool/sessions are
 // stale, not just busy. returns true when it fired.
 func maybeRefreshStalePool() bool {
-	if zenStaleSince() < 15*time.Second {
+	stale := 15 * time.Second
+	if s := cfg().Zen.StalePoolSecs; s > 0 {
+		stale = time.Duration(s) * time.Second
+	}
+	if zenStaleSince() < stale {
 		return false
 	}
 	lanesMu.Lock()
@@ -752,7 +795,7 @@ func laneProxyFor(l *zenLane, model string) string {
 	escalated := l.escalated
 	lanesMu.Unlock()
 	if p != "" {
-		if !exitBurned(p, model) && probeProxyFull(p, time.Second) {
+		if !exitBurned(p, model) && probeProxyFull(p, probeTimeout()) {
 			return p
 		}
 		if exitBurned(p, model) {

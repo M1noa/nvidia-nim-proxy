@@ -4,9 +4,9 @@
 PROXY_DIR="$(cd "$(dirname "$0")" && pwd)"
 LOGFILE="$PROXY_DIR/nim-proxy.log"
 BINARY="$PROXY_DIR/nim-proxy"
-SVC="com.user.nvidia-nim-proxy"
+SVC="com.user.nimroute"
 PLIST="$HOME/Library/LaunchAgents/$SVC.plist"
-SYSTEMD="$HOME/.config/systemd/user/nvidia-nim-proxy.service"
+SYSTEMD="$HOME/.config/systemd/user/nimroute.service"
 OS="$(uname -s 2>/dev/null)"
 
 find_py() {
@@ -45,7 +45,7 @@ svc_start() {
       launchctl bootstrap "gui/$(id -u)" "$PLIST" || launchctl load "$PLIST" ;;
     systemd)
       mkdir -p "$(dirname "$SYSTEMD")"
-      sed "s|REPLACE_WITH_PATH|$PROXY_DIR|g" "$PROXY_DIR/deploy/nvidia-nim-proxy.service" > "$SYSTEMD"
+      sed "s|REPLACE_WITH_PATH|$PROXY_DIR|g" "$PROXY_DIR/deploy/nimroute.service" > "$SYSTEMD"
       systemctl --user daemon-reload && systemctl --user enable --now nvidia-nim-proxy ;;
     nohup)
       cd "$PROXY_DIR" && nohup "$BINARY" >>"$LOGFILE" 2>&1 &
@@ -103,6 +103,30 @@ try:
   if data.get('zen_session') or data.get('zen_proxy'):
     print()
     print(f"  Zen:        {data.get('zen_session','?')} via {data.get('zen_proxy') or 'direct'} ({data.get('zen_ago','?')} ago)")
+  zl = data.get('zen_lanes')
+  if zl is not None:
+    cap = data.get('lane_cap', len(zl))
+    print()
+    print(f"  Lanes:      {len(zl)}/{cap} live")
+    for l in zl:
+      icon = '❄' if l.get('cooldown_remaining') else '●'
+      bits = []
+      if l.get('proxy'): bits.append(f"{l['proxy']} [{l.get('country','?')}]")
+      else: bits.append('no exit')
+      if l.get('cooldown_remaining'): bits.append(f"cool {l['cooldown_remaining']}")
+      if l.get('last_used_ago'): bits.append(f"used {l['last_used_ago']} ago")
+      if l.get('requests'): bits.append(f"{l['requests']} req")
+      if l.get('rate_limited'): bits.append(f"{l['rate_limited']}x429")
+      print(f"    {icon}  {l.get('id','?'):14s} {' '.join(bits)}")
+  pl = data.get('pool')
+  if pl:
+    print()
+    print(f"  Pool:       {pl.get('verified',0)} verified of {pl.get('candidates',0)} cands, {pl.get('dropped_total',0)} dropped, refresh {pl.get('last_refresh_ago','?')} ago")
+    for e in (pl.get('exits') or [])[:10]:
+      pin = '📌' if e.get('pinned') else '  '
+      print(f"    {pin} {e.get('proxy','?'):32s} [{e.get('country','?')}] {e.get('latency_ms','?')}ms")
+    if len(pl.get('exits') or []) > 10:
+      print(f"    ... +{len(pl['exits'])-10} more")
   print()
 except Exception as e:
   print(f'  (status fetch failed: {e})')

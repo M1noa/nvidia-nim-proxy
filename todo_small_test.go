@@ -251,3 +251,19 @@ func TestMaybeRefreshStalePool(t *testing.T) {
 		}
 	}
 }
+
+// audit: proxy creds never reach logs or upstream headers.
+func TestProxyCredsRedacted(t *testing.T) {
+	if got := redactProxyUserinfo("http://user:pass@host:1"); got != "http://***@host:1" {
+		t.Fatalf("userinfo not redacted: %s", got)
+	}
+	if got := redactProxyUserinfo("socks5://host:1080"); got != "socks5://host:1080" {
+		t.Fatalf("clean url touched: %s", got)
+	}
+	// zen blocklist drops session + cred headers.
+	for _, h := range []string{"x-session-id", "X-Session-Id", "x-forwarded-host", "x-api-key", "authorization", "cookie"} {
+		if zenHeaderForwarded(h) {
+			t.Fatalf("%s must not forward upstream", h)
+		}
+	}
+}
